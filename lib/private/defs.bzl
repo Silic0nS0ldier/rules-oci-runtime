@@ -1,10 +1,10 @@
+load("@jq.bzl//jq/toolchain:toolchain.bzl", "TOOLCHAIN_TYPE")
 
-
-visibility(["//runc/..."])
+visibility(["//lib/..."])
 
 def _jq_binary_impl(ctx):
     # type: (ctx) -> None
-    toolchain_info = ctx.toolchains["@aspect_bazel_lib//lib:jq_toolchain_type"]
+    toolchain_info = ctx.toolchains[TOOLCHAIN_TYPE]
     jq_bin = toolchain_info.jqinfo.bin
     
     # Symlink for consistent rlocation path
@@ -24,7 +24,7 @@ def _jq_binary_impl(ctx):
 
 jq_binary = rule(
     implementation = _jq_binary_impl,
-    toolchains = ["@aspect_bazel_lib//lib:jq_toolchain_type"],
+    toolchains = [TOOLCHAIN_TYPE],
     executable = True,
 )
 

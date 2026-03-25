@@ -1,10 +1,10 @@
-# `rules_runc`
+# `rules_oci_runtime`
 
-**WIP**: Bazel rules for running containers with [`runc`](https://github.com/opencontainers/runc) container runtime.
+**WIP**: Bazel rules for running OCI container images (currently using [`runc`](https://github.com/opencontainers/runc)).
 
 ```starlark
 # BUILD.bazel
-load("@rules_runc//runc:defs.bzl", "runc_binary")
+load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
 
 runc_binary(
     name = "container",
@@ -34,7 +34,3 @@ Container has exited, cleaning up...
 
 - No dependencies on Docker/Podman.
 - Easy to use in devcontainers, only requiring `"privileged": true,`.
-
-## TODO
-
-- [ ] Wait for https://github.com/bazel-contrib/rules_oci/commit/1ff941af7c3d63f7f3610ddad5fe9020d764d5a4 to be released.

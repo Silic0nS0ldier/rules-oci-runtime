@@ -2,7 +2,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "runc/private/container_import"
+    "lib/private/container_import"
 ]
 
 [workspace.package]

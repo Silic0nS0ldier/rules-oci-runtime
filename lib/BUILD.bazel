@@ -1,0 +1,7 @@
+load("//lib:private/defs.bzl", "jq_binary")
+
+exports_files(["runc_binary.tmpl.sh"])
+
+jq_binary(
+    name = "jq",
+)

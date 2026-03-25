@@ -45,7 +45,7 @@ _runc_binary_template = rule(
             doc = "For label to rlocation conversion",
         ),
         "_template": attr.label(
-            default = "//runc:runc_binary.tmpl.sh",
+            default = "//lib:runc_binary.tmpl.sh",
             allow_single_file = True,
             cfg = config.target(),
         ),
@@ -72,7 +72,7 @@ def _runc_binary_macro_impl(name, image, visibility):
         name = name + "_oci_load",
         image = image,
         repo_tags = ["latest"],
-        loader = Label("//runc/private/container_import:container_import"),
+        loader = Label("//lib/private/container_import:container_import"),
     )
     _runc_binary_template(
         name = name + "_template",

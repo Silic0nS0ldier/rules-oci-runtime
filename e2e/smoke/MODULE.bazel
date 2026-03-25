@@ -1,12 +1,12 @@
-module(name = "rules_runc_e2e_smoke")
+module(name = "rules_oci_runtime_e2e_smoke")
 
-bazel_dep(name = "rules_runc")
+bazel_dep(name = "rules_oci_runtime")
 local_path_override(
-    module_name = "rules_runc",
+    module_name = "rules_oci_runtime",
     path = "../..",
 )
 
-bazel_dep(name = "rules_oci", version = "2.2.7")
+bazel_dep(name = "rules_oci", version = "2.3.0")
 
 oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
 oci.pull(

@@ -1,4 +1,4 @@
-load("@rules_runc//runc:defs.bzl", "runc_binary")
+load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
 
 runc_binary(
     name = "container",
