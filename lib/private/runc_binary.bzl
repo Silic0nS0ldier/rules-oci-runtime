@@ -24,10 +24,6 @@ Arguments after `--` replace the image `Cmd`, as with Docker and other OCI
 runtimes. Set `RULES_OCI_RUNTIME_VERBOSE=1` to log container setup to stderr.
 """
 
-def _shell_quote(value):
-    # type: (str) -> str
-    return "'" + value.replace("'", "'\\''") + "'"
-
 def _rlocation_path(ctx, file):
     # type: (ctx, File) -> str
     if file.short_path.startswith("../"):
@@ -64,20 +60,26 @@ def _runc_binary_impl(ctx):
     if ctx.attr.read_only:
         args.append("--read-only")
 
+    # The runtime doubles as its own launcher: it reads the sidecar config found
+    # next to `argv[0]`, so no shell wrapper is needed.
     launcher = ctx.actions.declare_file(ctx.label.name)
-    ctx.actions.expand_template(
-        template = ctx.file._template,
+    ctx.actions.symlink(
         output = launcher,
+        target_file = ctx.executable._oci_runtime,
         is_executable = True,
-        substitutions = {
-            "{{args}}": " ".join([_shell_quote(arg) for arg in args]),
-            "{{layout}}": _rlocation_path(ctx, layout),
-            "{{oci_runtime}}": _rlocation_path(ctx, ctx.executable._oci_runtime),
-            "{{runtime}}": _rlocation_path(ctx, ctx.executable._runc),
-        },
     )
 
-    runfiles = ctx.runfiles(files = [layout]).merge_all([
+    config = ctx.actions.declare_file(ctx.label.name + ".launch.json")
+    ctx.actions.write(
+        output = config,
+        content = json.encode({
+            "layout": _rlocation_path(ctx, layout),
+            "runtime": _rlocation_path(ctx, ctx.executable._runc),
+            "args": args,
+        }),
+    )
+
+    runfiles = ctx.runfiles(files = [layout, config, ctx.executable._oci_runtime]).merge_all([
         ctx.attr.image[DefaultInfo].default_runfiles,
         ctx.attr._oci_runtime[DefaultInfo].default_runfiles,
         ctx.attr._runc[DefaultInfo].default_runfiles,
@@ -86,7 +88,7 @@ def _runc_binary_impl(ctx):
     return [
         DefaultInfo(
             executable = launcher,
-            files = depset([launcher]),
+            files = depset([launcher, config]),
             runfiles = runfiles,
         ),
     ]
@@ -123,10 +125,6 @@ container starts, so `$BUILD_WORKSPACE_DIRECTORY:/src:ro` mounts the workspace.
         "data": attr.label_list(
             allow_files = True,
             doc = "Extra files to make available in the runfiles tree, for use with `mounts`.",
-        ),
-        "_template": attr.label(
-            default = "//lib/private:launcher.tmpl.sh",
-            allow_single_file = True,
         ),
         "_oci_runtime": attr.label(
             default = "//lib/private/oci_runtime",

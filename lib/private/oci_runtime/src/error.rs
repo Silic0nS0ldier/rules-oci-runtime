@@ -47,6 +47,8 @@ pub enum Error {
     },
     /// The container had no command: the image sets neither `Entrypoint` nor `Cmd`.
     NoCommand,
+    /// A launcher symlink could not find the runfiles tree holding its image.
+    MissingRunfiles(String),
     /// The runtime binary could not be started.
     RuntimeSpawn {
         program: String,
@@ -116,6 +118,10 @@ impl fmt::Display for Error {
             Error::NoCommand => write!(
                 f,
                 "no command to run: the image defines neither Entrypoint nor Cmd, and none was given"
+            ),
+            Error::MissingRunfiles(argv0) => write!(
+                f,
+                "cannot locate the runfiles tree for {argv0:?}, try setting RUNFILES_DIR"
             ),
             Error::RuntimeSpawn { program, source } => {
                 write!(f, "failed to start container runtime {program:?}: {source}")

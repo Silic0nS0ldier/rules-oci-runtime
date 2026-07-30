@@ -4,6 +4,7 @@ mod error;
 mod extract;
 mod fsutil;
 mod image;
+mod launcher;
 mod log;
 mod runtime;
 mod spec;
@@ -22,10 +23,15 @@ use crate::runtime::{ContainerRuntime, RunRequest, Runc};
 use crate::spec::{BindMount, Spec, SpecOptions};
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
-    let code = match cli.command {
-        Command::Run(args) => run(*args),
-    };
+    let code = launcher::command_line().and_then(|argv| {
+        let cli = match argv {
+            Some(argv) => Cli::parse_from(argv),
+            None => Cli::parse(),
+        };
+        match cli.command {
+            Command::Run(args) => run(*args),
+        }
+    });
     match code {
         Ok(code) => std::process::ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(err) => {
