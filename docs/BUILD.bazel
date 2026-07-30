@@ -1,0 +1,43 @@
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@stardoc//stardoc:stardoc.bzl", "stardoc")
+
+# Generated documentation is checked in so it can be read on the code host.
+# Run `bazel run //docs:update` after changing a rule.
+
+stardoc(
+    name = "defs",
+    out = "defs.gen.md",
+    input = "//lib:defs.bzl",
+    deps = ["//lib:defs"],
+)
+
+diff_test(
+    name = "defs_up_to_date",
+    failure_message = "Documentation is stale, run: bazel run //docs:update",
+    file1 = ":defs.gen.md",
+    file2 = "defs.md",
+    timeout = "short",
+)
+
+write_file(
+    name = "update_sh",
+    out = "update.sh",
+    content = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "runfiles=\"${RUNFILES_DIR:-$0.runfiles}\"",
+        "cd \"$BUILD_WORKSPACE_DIRECTORY\"",
+        "cp -f \"$runfiles/_main/docs/defs.gen.md\" docs/defs.md",
+        "chmod u+w docs/defs.md",
+        "echo 'Updated docs/defs.md'",
+    ],
+    is_executable = True,
+)
+
+sh_binary(
+    name = "update",
+    srcs = ["update.sh"],
+    data = [":defs.gen.md"],
+)

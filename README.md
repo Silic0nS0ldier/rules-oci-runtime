@@ -17,7 +17,6 @@ bazel --quiet run //:container -- /bin/sh -c 'echo "Hello, world!"'
 ```
 ```
 Target //:container up-to-date:
-  .bazel/bin/container_template
   .bazel/bin/container
 Hello, world!
 ```
@@ -31,19 +30,14 @@ RULES_OCI_RUNTIME_VERBOSE=1 bazel --quiet run //:container -- /bin/sh -c 'echo "
 ```
 ```
 Target //:container up-to-date:
-  .bazel/bin/container_template
   .bazel/bin/container
-Using /tmp/tmp.LRlx5DvoYw for runc instance
-Writing Docker/OCI image tarball to /tmp/tmp.LRlx5DvoYw/image.tar...
-Piping image from /dev/fd/63 to /tmp/tmp.LRlx5DvoYw/image.tar
-Done.
-Writing configuration to /tmp/tmp.LRlx5DvoYw/ctr/config.json...
-Adjusting container configuration...
-Creating rootfs...
-Extracting Docker/OCI image tarball to /tmp/tmp.LRlx5DvoYw/ctr/rootfs...
-Adding host DNS resolver configuration to container...
-Cleaning up Docker/OCI image tarball...
-Running container...
+Reading image .../alpine_linux_amd64/layout for linux/amd64
+Using /tmp/rules-oci-runtime-c575126f1cd80bad for the container bundle
+Extracting layer sha256:2d35ebdb57d9... (application/vnd.oci.image.layer.v1.tar+gzip)
+Copying host /etc/resolv.conf into the container
+Wrote /tmp/rules-oci-runtime-c575126f1cd80bad/config.json
+Handing bundle /tmp/rules-oci-runtime-c575126f1cd80bad to runc
+Running container rules-oci-runtime-c575126f1cd80bad
 Hello, world!
 Container has exited, cleaning up...
 ```
@@ -52,3 +46,74 @@ Container has exited, cleaning up...
 
 - No dependencies on Docker/Podman.
 - Easy to use in devcontainers, only requiring `"privileged": true,`.
+
+## How it works
+
+The image layout directory produced by `rules_oci` is consumed directly, so
+there is no image tarball round-trip and no container runtime daemon.
+
+A single Rust binary does all of the work:
+
+1. Reads `index.json`, walks nested indexes and selects the manifest matching
+   the requested platform (defaults to the host).
+2. Verifies every blob against its digest and size while streaming it.
+3. Extracts the layers into a private bundle directory, applying `.wh.`
+   whiteouts and rejecting entries that would escape the rootfs.
+4. Generates an OCI runtime `config.json` (rootless when run as an
+   unprivileged user, otherwise a plain privileged spec).
+5. Copies the host `/etc/resolv.conf` and writes `/etc/hosts` and
+   `/etc/hostname` so DNS works out of the box.
+6. Executes `runc` against a private state root, forwards signals to the
+   container, propagates its exit code and removes the bundle afterwards.
+
+Containers share the host network namespace, and each run gets a unique
+container ID, so concurrent runs of the same target do not interfere.
+
+## Rules
+
+See [docs/defs.md](docs/defs.md) for the generated API reference.
+
+```starlark
+runc_binary(
+    name = "container",
+    image = "@alpine",
+    env = {"GREETING": "hello"},
+    hostname = "my-host",
+    mounts = ["$BUILD_WORKSPACE_DIRECTORY:/src:ro"],
+    read_only = True,
+    workdir = "/src",
+)
+```
+
+`mounts` entries are `SOURCE:DESTINATION[:OPTIONS]`, where `OPTIONS` is a comma
+separated mount option list such as `ro` or `rw,noexec`. `$VAR` and `${VAR}` in
+`SOURCE` are expanded when the container starts.
+
+## Runtime flags
+
+Flags accepted before the container command override the rule attributes:
+
+| Flag | Description |
+| ---- | ----------- |
+| `-e`, `--env KEY=VALUE` | Add an environment variable. |
+| `-v`, `--mount SRC:DST[:OPTS]` | Add a bind mount. |
+| `--workdir DIR` | Working directory inside the container. |
+| `--hostname NAME` | Container hostname. |
+| `--platform OS/ARCH[/VARIANT]` | Select a manifest from a multi-platform image. |
+| `--tty auto\|true\|false` | Allocate a terminal. Defaults to `auto`. |
+| `--rootless auto\|true\|false` | Use a user namespace. Defaults to `auto`. |
+| `--read-only` | Mount the container root filesystem read-only. |
+| `--keep-bundle` | Leave the generated bundle on disk for inspection. |
+| `--verbose` | Same as `RULES_OCI_RUNTIME_VERBOSE=1`. |
+
+```sh
+bazel run //:container -- --env FOO=bar --workdir /tmp /bin/sh -c 'echo "$FOO"'
+```
+
+## Development
+
+```sh
+bazel test //...                    # unit tests and documentation freshness
+(cd e2e/smoke && bazel test //...)  # end to end tests
+bazel run //docs:update             # regenerate docs/defs.md
+```

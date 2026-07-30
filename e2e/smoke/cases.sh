@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+#
+# End to end cases for `runc_binary`. Each case is a separate `sh_test` target
+# so failures point at the behaviour that broke.
+
+set -uo pipefail
+
+runfiles="${RUNFILES_DIR:-${TEST_SRCDIR:-$0.runfiles}}"
+container="${runfiles}/${CONTAINER}"
+configured_container="${runfiles}/${CONFIGURED_CONTAINER}"
+read_only_container="${runfiles}/${READ_ONLY_CONTAINER}"
+mounting_container="${runfiles}/${MOUNTING_CONTAINER}"
+
+failures=0
+
+fail() {
+  echo "FAIL: $*" >&2
+  failures=$((failures + 1))
+}
+
+assert_equals() {
+  local expected="$1" actual="$2" what="$3"
+  if [[ "$expected" != "$actual" ]]; then
+    fail "${what}: expected '${expected}', got '${actual}'"
+  fi
+}
+
+assert_contains() {
+  local haystack="$1" needle="$2" what="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    fail "${what}: expected output to contain '${needle}', got '${haystack}'"
+  fi
+}
+
+assert_not_contains() {
+  local haystack="$1" needle="$2" what="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    fail "${what}: expected output not to contain '${needle}', got '${haystack}'"
+  fi
+}
+
+case_default_cmd() {
+  # The alpine image's Cmd is /bin/sh, which reads the script from stdin.
+  local output
+  output=$(echo 'echo from-image-cmd' | "$container")
+  assert_equals "from-image-cmd" "$output" "image Cmd"
+}
+
+case_command_override() {
+  local output
+  output=$("$container" /bin/echo command-override </dev/null)
+  assert_equals "command-override" "$output" "command override"
+}
+
+case_exit_code() {
+  "$container" /bin/sh -c 'exit 42' </dev/null
+  assert_equals "42" "$?" "exit code propagation"
+
+  "$container" /bin/true </dev/null
+  assert_equals "0" "$?" "successful exit code"
+}
+
+case_missing_command() {
+  local output status
+  output=$("$container" /definitely/not/a/binary </dev/null 2>&1)
+  status=$?
+  if [[ "$status" -eq 0 ]]; then
+    fail "running a missing binary should fail, got status 0 and output '${output}'"
+  fi
+}
+
+case_image_env() {
+  local output
+  output=$("$container" /bin/sh -c 'echo "$PATH"' </dev/null)
+  assert_equals "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$output" "image PATH"
+}
+
+case_rule_env_and_workdir() {
+  local output
+  output=$("$configured_container" /bin/busybox sh -c 'echo "$GREETING"; echo "$PATH"; pwd' </dev/null)
+  assert_contains "$output" "hello-from-the-rule" "rule env"
+  assert_contains "$output" "/rule/bin" "rule env overriding the image PATH"
+  assert_contains "$output" "/etc" "rule workdir"
+
+  # A command line --env must win over the rule attribute.
+  output=$("$configured_container" --env GREETING=from-the-command-line \
+    /bin/busybox sh -c 'echo "$GREETING"' </dev/null)
+  assert_equals "from-the-command-line" "$output" "command line env override"
+}
+
+case_runtime_mount() {
+  local source="${TEST_TMPDIR}/runtime-mount"
+  mkdir -p "$source"
+  echo "mounted-at-runtime" >"${source}/file.txt"
+
+  local output
+  output=$("$container" --mount "${source}:/data:ro" \
+    /bin/sh -c 'cat /data/file.txt; touch /data/new 2>&1 || echo read-only-enforced' </dev/null)
+  assert_contains "$output" "mounted-at-runtime" "runtime bind mount"
+  assert_contains "$output" "read-only-enforced" "read-only mount option"
+}
+
+case_rule_mounts() {
+  local source="${TEST_TMPDIR}/rule-mount"
+  mkdir -p "$source"
+  echo "mounted-by-the-rule" >"${source}/file.txt"
+
+  local output
+  output=$("$mounting_container" /bin/cat /rule-data/file.txt </dev/null)
+  assert_equals "mounted-by-the-rule" "$output" "rule bind mount with \$TEST_TMPDIR expansion"
+}
+
+case_read_only_rootfs() {
+  local output
+  output=$("$read_only_container" \
+    /bin/sh -c 'touch /should-fail 2>&1 || echo rootfs-is-read-only' </dev/null)
+  assert_contains "$output" "rootfs-is-read-only" "read-only root filesystem"
+
+  output=$("$container" /bin/sh -c 'touch /should-work && echo rootfs-is-writable' </dev/null)
+  assert_contains "$output" "rootfs-is-writable" "writable root filesystem by default"
+}
+
+case_dns_configuration() {
+  local output
+  output=$("$container" /bin/sh -c 'test -s /etc/resolv.conf && echo resolv-conf-present' </dev/null)
+  assert_contains "$output" "resolv-conf-present" "host resolver configuration"
+}
+
+case_hostname_and_hosts() {
+  local output
+  output=$("$configured_container" /bin/busybox sh -c '/bin/busybox hostname; /bin/busybox cat /etc/hostname /etc/hosts' </dev/null)
+  assert_contains "$output" "e2e-host" "configured hostname"
+  assert_contains "$output" "127.0.0.1" "generated /etc/hosts"
+
+  output=$("$container" /bin/sh -c 'hostname' </dev/null)
+  assert_equals "container" "$output" "default hostname"
+}
+
+case_rootfs_contents() {
+  local output
+  output=$("$container" /bin/sh -c 'cat /etc/alpine-release; test -L /bin/sh && echo sh-is-a-symlink' </dev/null)
+  assert_contains "$output" "3.22" "extracted image contents"
+  assert_contains "$output" "sh-is-a-symlink" "symlinks preserved during extraction"
+}
+
+case_stdin_is_piped() {
+  local output
+  output=$(printf 'line-one\nline-two\n' | "$container" /bin/cat)
+  assert_equals $'line-one\nline-two' "$output" "stdin forwarded to the container"
+}
+
+case_verbose_logging() {
+  local stdout stderr
+  stdout=$("$container" /bin/echo only-container-output </dev/null 2>"${TEST_TMPDIR}/quiet.err")
+  stderr=$(cat "${TEST_TMPDIR}/quiet.err")
+  assert_equals "only-container-output" "$stdout" "quiet stdout"
+  assert_equals "" "$stderr" "quiet stderr"
+
+  stdout=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" /bin/echo only-container-output \
+    </dev/null 2>"${TEST_TMPDIR}/verbose.err")
+  stderr=$(cat "${TEST_TMPDIR}/verbose.err")
+  assert_equals "only-container-output" "$stdout" "verbose stdout"
+  assert_contains "$stderr" "Extracting layer" "verbose setup logging"
+  assert_not_contains "$stdout" "Extracting layer" "setup logging kept off stdout"
+}
+
+case_signal_forwarding() {
+  "$container" /bin/sh -c 'trap "echo caught; exit 7" TERM; echo ready; while true; do sleep 0.1; done' \
+    </dev/null >"${TEST_TMPDIR}/signal.out" &
+  local pid=$!
+
+  local waited=0
+  while ! grep -q ready "${TEST_TMPDIR}/signal.out" 2>/dev/null; do
+    sleep 0.2
+    waited=$((waited + 1))
+    if [[ "$waited" -gt 150 ]]; then
+      kill -9 "$pid" 2>/dev/null
+      fail "container never started"
+      return
+    fi
+  done
+
+  kill -TERM "$pid"
+  wait "$pid"
+  assert_equals "7" "$?" "exit code after SIGTERM"
+  assert_contains "$(cat "${TEST_TMPDIR}/signal.out")" "caught" "SIGTERM forwarded to the container"
+}
+
+case_concurrent_runs() {
+  local pids=()
+  for i in 1 2 3 4; do
+    "$container" /bin/echo "run-${i}-ok" </dev/null >"${TEST_TMPDIR}/concurrent-${i}.out" &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || fail "a concurrent run failed"
+  done
+  for i in 1 2 3 4; do
+    assert_equals "run-${i}-ok" "$(cat "${TEST_TMPDIR}/concurrent-${i}.out")" "concurrent run ${i}"
+  done
+}
+
+case_cleanup() {
+  RULES_OCI_RUNTIME_VERBOSE=1 "$container" /bin/true </dev/null 2>"${TEST_TMPDIR}/cleanup.err" ||
+    fail "container failed"
+
+  local bundle
+  bundle=$(sed -n 's/^Using \(.*\) for the container bundle$/\1/p' "${TEST_TMPDIR}/cleanup.err")
+  if [[ -z "$bundle" ]]; then
+    fail "could not determine the bundle path from: $(cat "${TEST_TMPDIR}/cleanup.err")"
+    return
+  fi
+  if [[ -e "$bundle" ]]; then
+    fail "bundle ${bundle} still exists after the container exited"
+  fi
+}
+
+main() {
+  local case_name="${1:-}"
+  if [[ -z "$case_name" ]]; then
+    echo "usage: $0 <case>" >&2
+    exit 2
+  fi
+  if ! declare -F "case_${case_name}" >/dev/null; then
+    echo "unknown case: ${case_name}" >&2
+    exit 2
+  fi
+  "case_${case_name}"
+  if [[ "$failures" -gt 0 ]]; then
+    echo "${failures} assertion(s) failed in ${case_name}" >&2
+    exit 1
+  fi
+  echo "ok: ${case_name}"
+}
+
+main "$@"

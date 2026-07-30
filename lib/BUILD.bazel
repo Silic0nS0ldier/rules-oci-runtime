@@ -1,7 +1,9 @@
-load("//lib:private/defs.bzl", "jq_binary")
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 
-exports_files(["runc_binary.tmpl.sh"])
+package(default_visibility = ["//visibility:public"])
 
-jq_binary(
-    name = "jq",
+bzl_library(
+    name = "defs",
+    srcs = ["defs.bzl"],
+    deps = ["//lib/private:runc_binary"],
 )

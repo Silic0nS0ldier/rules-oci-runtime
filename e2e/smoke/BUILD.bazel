@@ -1,6 +1,83 @@
 load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 runc_binary(
     name = "container",
     image = "@alpine",
+)
+
+runc_binary(
+    name = "configured_container",
+    hostname = "e2e-host",
+    image = "@alpine",
+    env = {
+        "GREETING": "hello-from-the-rule",
+        "PATH": "/rule/bin",
+    },
+    workdir = "/etc",
+)
+
+runc_binary(
+    name = "read_only_container",
+    image = "@alpine",
+    read_only = True,
+)
+
+runc_binary(
+    name = "mounting_container",
+    image = "@alpine",
+    # Exercises `$VAR` expansion in mount sources.
+    mounts = ["$TEST_TMPDIR/rule-mount:/rule-data:ro"],
+)
+
+CASES = [
+    "cleanup",
+    "command_override",
+    "concurrent_runs",
+    "default_cmd",
+    "dns_configuration",
+    "exit_code",
+    "hostname_and_hosts",
+    "image_env",
+    "missing_command",
+    "read_only_rootfs",
+    "rootfs_contents",
+    "rule_env_and_workdir",
+    "rule_mounts",
+    "runtime_mount",
+    "signal_forwarding",
+    "stdin_is_piped",
+    "verbose_logging",
+]
+
+[
+    sh_test(
+        name = case,
+        srcs = ["cases.sh"],
+        args = [case],
+        data = [
+            ":configured_container",
+            ":container",
+            ":mounting_container",
+            ":read_only_container",
+        ],
+        env = {
+            "CONFIGURED_CONTAINER": "$(rlocationpath :configured_container)",
+            "CONTAINER": "$(rlocationpath :container)",
+            "MOUNTING_CONTAINER": "$(rlocationpath :mounting_container)",
+            "READ_ONLY_CONTAINER": "$(rlocationpath :read_only_container)",
+        },
+        # Containers need user namespaces, which the Bazel sandbox does not nest.
+        tags = [
+            "external",
+            "no-sandbox",
+        ],
+        timeout = "short",
+    )
+    for case in CASES
+]
+
+test_suite(
+    name = "smoke",
+    tests = CASES,
 )

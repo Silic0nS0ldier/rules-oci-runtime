@@ -2,7 +2,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "lib/private/container_import"
+    "lib/private/oci_runtime"
 ]
 
 [workspace.package]
@@ -10,4 +10,11 @@ edition = "2024"
 
 [workspace.dependencies]
 camino = "1.2.2"
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.5.54", features = ["derive"] }
+flate2 = "1.1.5"
+libc = "0.2.180"
+ruzstd = "0.8.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tar = "0.4.44"
