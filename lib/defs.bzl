@@ -50,7 +50,7 @@ _runc_binary_template = rule(
             cfg = config.target(),
         ),
         "_undocker": attr.label(
-            default = "@undocker//:undocker",
+            default = "//third_party/undocker",
             cfg = config.target(),
             doc = "For label to rlocation conversion",
         ),
@@ -83,7 +83,7 @@ def _runc_binary_macro_impl(name, image, visibility):
         srcs = [name + "_template"],
         data = [
             ":" + name + "_oci_load",
-            Label("@undocker//:undocker"),
+            Label("//third_party/undocker"),
             Label("@multitool//tools/runc"),
             Label(":jq"),
         ],

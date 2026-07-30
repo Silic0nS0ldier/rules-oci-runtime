@@ -43,10 +43,11 @@ image_config_json=$(tar -x --to-stdout -f "$image_tar_path" "$image_config_path"
 # IMPORTANT container config must be read in a separate call to avoid races that may produce an empty file
 ctr_config=$(cat "$ctr_dir/config.json")
 args_as_json=$($jq_path -c -n '$ARGS.positional' --args -- "$@")
+# As with Docker/OCI runtimes, user supplied arguments replace the image `Cmd`
 echo "$ctr_config" | $jq_path --argjson u "$image_config_json" --argjson a "$args_as_json" '
     .root.readonly = false |
     .process.env = $u.config.Env |
-    .process.args = $u.config.Entrypoint + ($u.config.Cmd // []) + $a |
+    .process.args = ($u.config.Entrypoint // []) + (if ($a | length) > 0 then $a else ($u.config.Cmd // []) end) |
     .process.cwd = $u.config.WorkingDir
 ' > "$ctr_dir/config.json"
 
