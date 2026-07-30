@@ -6,7 +6,7 @@
 		"./feature-bazel": {},
 		"ghcr.io/devcontainers/features/github-cli:1": {},
 		"ghcr.io/devcontainers/features/rust:1": {
-			"version": "1.89.0"
+			"version": "1.97.1"
 		}
 	},
 	"customizations": {
