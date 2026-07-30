@@ -6,8 +6,8 @@ module(
 
 # To fully update lockfile: bazel mod deps --lockfile_mode=refresh
 
-bazel_dep(name = "bazel_skylib", version = "1.9.0")
-bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "platforms", version = "1.1.0")
 
 runc = use_extension("//lib/private:extensions.bzl", "runc")
 use_repo(runc, "runc")
@@ -18,4 +18,4 @@ register_toolchains("@runc//:all")
 # Development only: documentation generation and end to end tests. The launcher
 # is built by the `rules_oci_runtime_source` module, which is tested separately.
 bazel_dep(name = "stardoc", version = "0.8.1", dev_dependency = True)
-bazel_dep(name = "rules_shell", version = "0.7.1", dev_dependency = True)
+bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)
