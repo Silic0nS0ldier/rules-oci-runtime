@@ -24,14 +24,16 @@ rust.toolchain(
 )
 
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+# Name must be globally unique, crate_universe repositories are not isolated.
 crate.from_cargo(
-    name = "crates",
+    name = "rules_oci_runtime_source_crates",
     cargo_lockfile = "//:Cargo.lock",
     # Required so downstream modules can consume the crates without repinning.
     lockfile = "//:Cargo.Bazel.lock",
     manifests = ["//:Cargo.toml"],
 )
-use_repo(crate, "crates")
+use_repo(crate, "rules_oci_runtime_source_crates")
 
 # Development only: a hermetic C toolchain for the Rust toolchain's linker.
 bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
