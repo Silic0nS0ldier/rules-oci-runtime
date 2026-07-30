@@ -1,14 +1,17 @@
 
 [workspace]
 resolver = "3"
-members = [
-    "lib/private/oci_runtime"
-]
 
-[workspace.package]
+[package]
+name = "oci_runtime"
+version = "0.1.0"
 edition = "2024"
 
-[workspace.dependencies]
+[[bin]]
+name = "oci_runtime"
+path = "src/main.rs"
+
+[dependencies]
 camino = "1.2.2"
 clap = { version = "4.5.54", features = ["derive"] }
 flate2 = "1.1.5"

@@ -5,5 +5,18 @@ package(default_visibility = ["//visibility:private"])
 bzl_library(
     name = "runc_binary",
     srcs = ["runc_binary.bzl"],
-    visibility = ["//lib:__subpackages__", "//docs:__subpackages__"],
+    visibility = [
+        "//docs:__subpackages__",
+        "//lib:__subpackages__",
+    ],
+    deps = [":toolchains"],
+)
+
+bzl_library(
+    name = "toolchains",
+    srcs = ["toolchains.bzl"],
+    visibility = [
+        "//docs:__subpackages__",
+        "//lib:__subpackages__",
+    ],
 )

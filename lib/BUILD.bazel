@@ -5,5 +5,12 @@ package(default_visibility = ["//visibility:public"])
 bzl_library(
     name = "defs",
     srcs = ["defs.bzl"],
-    deps = ["//lib/private:runc_binary"],
+    deps = [
+        "//lib/private:runc_binary",
+        "//lib/private:toolchains",
+    ],
 )
+
+toolchain_type(name = "launcher_toolchain_type")
+
+toolchain_type(name = "container_runtime_toolchain_type")

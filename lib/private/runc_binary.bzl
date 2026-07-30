@@ -1,5 +1,11 @@
 """Implementation of `runc_binary`."""
 
+load(
+    ":toolchains.bzl",
+    "CONTAINER_RUNTIME_TOOLCHAIN_TYPE",
+    "LAUNCHER_TOOLCHAIN_TYPE",
+)
+
 visibility(["//lib/...", "//docs/..."])
 
 _DOC = """Creates an executable that runs an OCI image with `runc`.
@@ -22,7 +28,18 @@ bazel run //:container -- /bin/sh -c 'echo "Hello, world!"'
 
 Arguments after `--` replace the image `Cmd`, as with Docker and other OCI
 runtimes. Set `RULES_OCI_RUNTIME_VERBOSE=1` to log container setup to stderr.
+
+A `launcher_toolchain` must be registered, which the `rules_oci_runtime_source`
+module does.
 """
+
+_NO_LAUNCHER = """{}: no launcher toolchain is registered.
+
+Add the module that builds the launcher from source to MODULE.bazel:
+
+    bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
+
+or register your own `launcher_toolchain`."""
 
 def _rlocation_path(ctx, file):
     # type: (ctx, File) -> str
@@ -46,6 +63,11 @@ def _image_layout(ctx):
 
 def _runc_binary_impl(ctx):
     # type: (ctx) -> list
+    launcher_toolchain = ctx.toolchains[LAUNCHER_TOOLCHAIN_TYPE]
+    if not launcher_toolchain:
+        fail(_NO_LAUNCHER.format(ctx.label))
+    runtime_toolchain = ctx.toolchains[CONTAINER_RUNTIME_TOOLCHAIN_TYPE]
+
     layout = _image_layout(ctx)
 
     args = []
@@ -60,12 +82,12 @@ def _runc_binary_impl(ctx):
     if ctx.attr.read_only:
         args.append("--read-only")
 
-    # The runtime doubles as its own launcher: it reads the sidecar config found
-    # next to `argv[0]`, so no shell wrapper is needed.
+    # The launcher is its own wrapper: it reads the sidecar config found next to
+    # `argv[0]`, so no shell script is needed.
     launcher = ctx.actions.declare_file(ctx.label.name)
     ctx.actions.symlink(
         output = launcher,
-        target_file = ctx.executable._oci_runtime,
+        target_file = launcher_toolchain.binary,
         is_executable = True,
     )
 
@@ -74,15 +96,20 @@ def _runc_binary_impl(ctx):
         output = config,
         content = json.encode({
             "layout": _rlocation_path(ctx, layout),
-            "runtime": _rlocation_path(ctx, ctx.executable._runc),
+            "runtime": _rlocation_path(ctx, runtime_toolchain.binary),
             "args": args,
         }),
     )
 
-    runfiles = ctx.runfiles(files = [layout, config, ctx.executable._oci_runtime]).merge_all([
+    runfiles = ctx.runfiles(files = [
+        layout,
+        config,
+        launcher_toolchain.binary,
+        runtime_toolchain.binary,
+    ]).merge_all([
+        launcher_toolchain.runfiles,
+        runtime_toolchain.runfiles,
         ctx.attr.image[DefaultInfo].default_runfiles,
-        ctx.attr._oci_runtime[DefaultInfo].default_runfiles,
-        ctx.attr._runc[DefaultInfo].default_runfiles,
     ] + [target[DefaultInfo].default_runfiles for target in ctx.attr.data])
 
     return [
@@ -126,15 +153,9 @@ container starts, so `$BUILD_WORKSPACE_DIRECTORY:/src:ro` mounts the workspace.
             allow_files = True,
             doc = "Extra files to make available in the runfiles tree, for use with `mounts`.",
         ),
-        "_oci_runtime": attr.label(
-            default = "//lib/private/oci_runtime",
-            executable = True,
-            cfg = "target",
-        ),
-        "_runc": attr.label(
-            default = "@multitool//tools/runc",
-            executable = True,
-            cfg = "target",
-        ),
     },
+    toolchains = [
+        config_common.toolchain_type(LAUNCHER_TOOLCHAIN_TYPE, mandatory = False),
+        CONTAINER_RUNTIME_TOOLCHAIN_TYPE,
+    ],
 )

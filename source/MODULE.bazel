@@ -1,0 +1,41 @@
+module(
+    name = "rules_oci_runtime_source",
+    version = "0.0.0",
+)
+
+# To fully update lockfile: bazel mod deps --lockfile_mode=refresh
+
+bazel_dep(name = "rules_oci_runtime", version = "0.0.0")
+bazel_dep(name = "rules_rust", version = "0.69.0")
+
+# Ignored when this module is not the root, where the enclosing repository is
+# already overridden.
+local_path_override(
+    module_name = "rules_oci_runtime",
+    path = "..",
+)
+
+register_toolchains("//:launcher_toolchain")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.92.0"],
+)
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")
+
+# Development only: a hermetic C toolchain for the Rust toolchain's linker.
+bazel_dep(name = "portable_cc_toolchain", version = "2025.12.16", dev_dependency = True)
+
+toolchain = use_extension(
+    "@portable_cc_toolchain//:extensions.bzl",
+    "toolchain",
+    dev_dependency = True,
+)

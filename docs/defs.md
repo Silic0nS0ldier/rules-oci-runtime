@@ -2,6 +2,79 @@
 
 Bazel rules for running OCI container images.
 
+<a id="container_runtime_toolchain"></a>
+
+## container_runtime_toolchain
+
+<pre>
+load("@rules_oci_runtime//lib:defs.bzl", "container_runtime_toolchain")
+
+container_runtime_toolchain(<a href="#container_runtime_toolchain-name">name</a>, <a href="#container_runtime_toolchain-binary">binary</a>)
+</pre>
+
+Declares the OCI runtime that executes a bundle, such as `runc`.
+
+A toolchain for a pinned `runc` release is registered by default. Register your
+own earlier in `MODULE.bazel` to take over the version:
+
+```starlark
+# BUILD.bazel
+load("@rules_oci_runtime//lib:defs.bzl", "container_runtime_toolchain")
+
+container_runtime_toolchain(
+    name = "runc",
+    binary = "@my_runc//file",
+)
+
+toolchain(
+    name = "runc_toolchain",
+    target_compatible_with = ["@platforms//os:linux"],
+    toolchain = ":runc",
+    toolchain_type = "@rules_oci_runtime//lib:container_runtime_toolchain_type",
+)
+```
+
+**ATTRIBUTES**
+
+
+| Name  | Description | Type | Mandatory | Default |
+| :------------- | :------------- | :------------- | :------------- | :------------- |
+| <a id="container_runtime_toolchain-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
+| <a id="container_runtime_toolchain-binary"></a>binary |  The container runtime executable.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
+
+
+<a id="launcher_toolchain"></a>
+
+## launcher_toolchain
+
+<pre>
+load("@rules_oci_runtime//lib:defs.bzl", "launcher_toolchain")
+
+launcher_toolchain(<a href="#launcher_toolchain-name">name</a>, <a href="#launcher_toolchain-binary">binary</a>)
+</pre>
+
+Declares the launcher that `runc_binary` targets execute.
+
+The launcher reads an OCI image layout, extracts it into a bundle and hands
+that bundle to the container runtime. It is not shipped with these rules, so
+that building it from source does not force `rules_rust` on every consumer:
+
+```starlark
+# MODULE.bazel
+bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
+```
+
+Register a `launcher_toolchain` to use a patched or prebuilt launcher instead.
+
+**ATTRIBUTES**
+
+
+| Name  | Description | Type | Mandatory | Default |
+| :------------- | :------------- | :------------- | :------------- | :------------- |
+| <a id="launcher_toolchain-name"></a>name |  A unique name for this target.   | <a href="https://bazel.build/concepts/labels#target-names">Name</a> | required |  |
+| <a id="launcher_toolchain-binary"></a>binary |  The launcher executable.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
+
+
 <a id="runc_binary"></a>
 
 ## runc_binary
@@ -32,6 +105,9 @@ bazel run //:container -- /bin/sh -c 'echo "Hello, world!"'
 
 Arguments after `--` replace the image `Cmd`, as with Docker and other OCI
 runtimes. Set `RULES_OCI_RUNTIME_VERBOSE=1` to log container setup to stderr.
+
+A `launcher_toolchain` must be registered, which the `rules_oci_runtime_source`
+module does.
 
 **ATTRIBUTES**
 

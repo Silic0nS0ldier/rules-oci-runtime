@@ -3,6 +3,14 @@
 **WIP**: Bazel rules for running OCI container images (currently using [`runc`](https://github.com/opencontainers/runc)).
 
 ```starlark
+# MODULE.bazel
+bazel_dep(name = "rules_oci_runtime", version = "0.0.0")
+
+# Builds the launcher from source. Without it, no launcher toolchain exists.
+bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
+```
+
+```starlark
 # BUILD.bazel
 load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
 
@@ -52,7 +60,7 @@ Container has exited, cleaning up...
 The image layout directory produced by `rules_oci` is consumed directly, so
 there is no image tarball round-trip and no container runtime daemon.
 
-A single Rust binary does all of the work:
+A single Rust binary, the launcher, does all of the work:
 
 1. Reads `index.json`, walks nested indexes and selects the manifest matching
    the requested platform (defaults to the host).
@@ -89,6 +97,44 @@ runc_binary(
 separated mount option list such as `ro` or `rw,noexec`. `$VAR` and `${VAR}` in
 `SOURCE` are expanded when the container starts.
 
+## Toolchains
+
+Both binaries a `runc_binary` needs are resolved through toolchains, so either
+can be replaced without forking these rules.
+
+| Toolchain type | Binary | Default |
+| -------------- | ------ | ------- |
+| `//lib:launcher_toolchain_type` | The launcher described above. | None, add `rules_oci_runtime_source`. |
+| `//lib:container_runtime_toolchain_type` | An OCI runtime such as `runc`. | A pinned `runc` release. |
+
+The launcher lives in the separate `rules_oci_runtime_source` module so that
+building it from source, and therefore depending on `rules_rust`, stays opt in.
+
+To use a patched launcher or a different `runc`, declare a toolchain and
+register it before the defaults:
+
+```starlark
+# BUILD.bazel
+load("@rules_oci_runtime//lib:defs.bzl", "container_runtime_toolchain")
+
+container_runtime_toolchain(
+    name = "runc",
+    binary = "@my_runc//file",
+)
+
+toolchain(
+    name = "runc_toolchain",
+    target_compatible_with = ["@platforms//os:linux"],
+    toolchain = ":runc",
+    toolchain_type = "@rules_oci_runtime//lib:container_runtime_toolchain_type",
+)
+```
+
+```starlark
+# MODULE.bazel
+register_toolchains("//:runc_toolchain")
+```
+
 ## Runtime flags
 
 Flags accepted before the container command override the rule attributes:
@@ -113,7 +159,8 @@ bazel run //:container -- --env FOO=bar --workdir /tmp /bin/sh -c 'echo "$FOO"'
 ## Development
 
 ```sh
-bazel test //...                    # unit tests and documentation freshness
+bazel test //...                    # rule tests and documentation freshness
+(cd source && bazel test //...)     # launcher unit tests
 (cd e2e/smoke && bazel test //...)  # end to end tests
 bazel run //docs:update             # regenerate docs/defs.md
 ```

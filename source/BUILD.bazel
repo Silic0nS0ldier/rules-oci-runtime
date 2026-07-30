@@ -1,0 +1,31 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_oci_runtime//lib:defs.bzl", "launcher_toolchain")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+rust_binary(
+    name = "oci_runtime",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "oci_runtime_test",
+    timeout = "short",
+    crate = ":oci_runtime",
+)
+
+launcher_toolchain(
+    name = "launcher",
+    binary = ":oci_runtime",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "launcher_toolchain",
+    toolchain = ":launcher",
+    toolchain_type = "@rules_oci_runtime//lib:launcher_toolchain_type",
+    visibility = ["//visibility:public"],
+)
