@@ -34,10 +34,6 @@ crate.from_cargo(
 use_repo(crate, "crates")
 
 # Development only: a hermetic C toolchain for the Rust toolchain's linker.
-bazel_dep(name = "portable_cc_toolchain", version = "2026.06.26", dev_dependency = True)
+bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
 
-toolchain = use_extension(
-    "@portable_cc_toolchain//:extensions.bzl",
-    "toolchain",
-    dev_dependency = True,
-)
+register_toolchains("@llvm//toolchain:all", dev_dependency = True)
