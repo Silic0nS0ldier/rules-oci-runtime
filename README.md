@@ -13,7 +13,21 @@ runc_binary(
 ```
 
 ```sh
-bazel --quiet run //:container -- -c 'echo "Hello, world!" ; exit'
+bazel --quiet run //:container -- /bin/sh -c 'echo "Hello, world!"'
+```
+```
+Target //:container up-to-date:
+  .bazel/bin/container_template
+  .bazel/bin/container
+Hello, world!
+```
+
+As with Docker/OCI runtimes, arguments passed after `--` replace the image `Cmd`.
+
+Set `RULES_OCI_RUNTIME_VERBOSE=1` to log container setup to stderr.
+
+```sh
+RULES_OCI_RUNTIME_VERBOSE=1 bazel --quiet run //:container -- /bin/sh -c 'echo "Hello, world!"'
 ```
 ```
 Target //:container up-to-date:
@@ -21,9 +35,13 @@ Target //:container up-to-date:
   .bazel/bin/container
 Using /tmp/tmp.LRlx5DvoYw for runc instance
 Writing Docker/OCI image tarball to /tmp/tmp.LRlx5DvoYw/image.tar...
+Piping image from /dev/fd/63 to /tmp/tmp.LRlx5DvoYw/image.tar
+Done.
 Writing configuration to /tmp/tmp.LRlx5DvoYw/ctr/config.json...
+Adjusting container configuration...
 Creating rootfs...
-Extracting docker compliant tarball...
+Extracting Docker/OCI image tarball to /tmp/tmp.LRlx5DvoYw/ctr/rootfs...
+Adding host DNS resolver configuration to container...
 Cleaning up Docker/OCI image tarball...
 Running container...
 Hello, world!

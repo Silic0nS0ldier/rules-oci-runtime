@@ -24,12 +24,17 @@ fn main() {
 
     match &cli.command {
         Commands::Load { input, output } => {
-            eprintln!("Piping image from {} to {}", input, output);
+            let verbose = std::env::var_os("RULES_OCI_RUNTIME_VERBOSE").is_some();
+            if verbose {
+                eprintln!("Piping image from {} to {}", input, output);
+            }
             // pipe data from input (file descriptor) to output (file path)
             let mut input_file = std::fs::File::open(input).expect("Failed to open input file");
             let mut output_file = std::fs::File::create(output).expect("Failed to create output file");
             std::io::copy(&mut input_file, &mut output_file).expect("Failed to copy data");
-            eprintln!("Done.");
+            if verbose {
+                eprintln!("Done.");
+            }
         }
     }
 }
