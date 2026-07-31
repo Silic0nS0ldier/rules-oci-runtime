@@ -35,7 +35,9 @@ module does.
 
 _NO_LAUNCHER = """{}: no launcher toolchain is registered.
 
-Add the module that builds the launcher from source to MODULE.bazel:
+The prebuilt launcher is disabled by
+`--@rules_oci_runtime//lib:prebuilt_launcher=false`. Either drop that flag, or
+add the module that builds the launcher from source to MODULE.bazel:
 
     bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
 

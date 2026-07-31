@@ -5,9 +5,6 @@
 ```starlark
 # MODULE.bazel
 bazel_dep(name = "rules_oci_runtime", version = "0.0.0")
-
-# Builds the launcher from source. Without it, no launcher toolchain exists.
-bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
 ```
 
 ```starlark
@@ -104,11 +101,22 @@ can be replaced without forking these rules.
 
 | Toolchain type | Binary | Default |
 | -------------- | ------ | ------- |
-| `//lib:launcher_toolchain_type` | The launcher described above. | None, add `rules_oci_runtime_source`. |
+| `//lib:launcher_toolchain_type` | The launcher described above. | A pinned launcher release. |
 | `//lib:container_runtime_toolchain_type` | An OCI runtime such as `runc`. | A pinned `runc` release. |
 
-The launcher lives in the separate `rules_oci_runtime_source` module so that
-building it from source, and therefore depending on `rules_rust`, stays opt in.
+The launcher is published as a statically linked binary with each release. To
+build it from source instead, and therefore depend on `rules_rust`, add the
+`rules_oci_runtime_source` module and stand the prebuilt toolchains down:
+
+```starlark
+# MODULE.bazel
+bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
+```
+
+```
+# .bazelrc
+build --@rules_oci_runtime//lib:prebuilt_launcher=false
+```
 
 To use a patched launcher or a different `runc`, declare a toolchain and
 register it before the defaults:

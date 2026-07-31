@@ -12,8 +12,16 @@ bazel_dep(name = "platforms", version = "1.1.0")
 runc = use_extension("//lib/private:extensions.bzl", "runc")
 use_repo(runc, "runc")
 
-# Toolchains registered by the root module take precedence over this default.
+launcher = use_extension("//lib/private:extensions.bzl", "launcher")
+use_repo(launcher, "launcher")
+
+# Toolchains registered by the root module take precedence over these defaults.
+# The launcher toolchains additionally require `//lib:prebuilt_launcher`, so that
+# a dependency such as `rules_oci_runtime_source` can supply the launcher without
+# having to outrank them.
 register_toolchains("@runc//:all")
+
+register_toolchains("@launcher//:all")
 
 # Development only: documentation generation and end to end tests. The launcher
 # is built by the `rules_oci_runtime_source` module, which is tested separately.

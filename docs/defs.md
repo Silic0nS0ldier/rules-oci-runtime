@@ -56,15 +56,23 @@ launcher_toolchain(<a href="#launcher_toolchain-name">name</a>, <a href="#launch
 Declares the launcher that `runc_binary` targets execute.
 
 The launcher reads an OCI image layout, extracts it into a bundle and hands
-that bundle to the container runtime. It is not shipped with these rules, so
-that building it from source does not force `rules_rust` on every consumer:
+that bundle to the container runtime. Toolchains for a pinned prebuilt release
+are registered by default.
+
+To build it from source instead, which pulls in `rules_rust`, take the prebuilt
+toolchains out of the running and add the module that provides it:
 
 ```starlark
 # MODULE.bazel
 bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
 ```
 
-Register a `launcher_toolchain` to use a patched or prebuilt launcher instead.
+```
+# .bazelrc
+build --@rules_oci_runtime//lib:prebuilt_launcher=false
+```
+
+Register a `launcher_toolchain` to use a patched launcher instead.
 
 **ATTRIBUTES**
 

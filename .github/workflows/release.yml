@@ -1,0 +1,51 @@
+name: "Release"
+on:
+  push:
+    tags:
+      - "v*"
+  # Builds the artifacts without publishing them, to validate changes to this
+  # workflow before tagging.
+  workflow_dispatch:
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: "${{ github.workflow }}-${{ matrix.arch }}"
+          repository-cache: true
+      - run: bazel build --config=release_linux_${{ matrix.arch }} //:oci_runtime
+        working-directory: source
+      - run: install -m 0755 source/.bazel/bin/oci_runtime oci_runtime.${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oci_runtime.${{ matrix.arch }}
+          path: oci_runtime.${{ matrix.arch }}
+          if-no-files-found: error
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+      # Hashes are pinned by the `launcher` module extension.
+      - run: sha256sum oci_runtime.* | tee oci_runtime.sha256sum
+        working-directory: artifacts
+      - run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag artifacts/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

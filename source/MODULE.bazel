@@ -20,8 +20,10 @@ register_toolchains("//:launcher_toolchain")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
+    extra_target_triples = [],
     versions = ["1.97.1"],
 )
+use_repo(rust, "rust_toolchains")
 
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 
@@ -37,5 +39,63 @@ use_repo(crate, "rules_oci_runtime_source_crates")
 
 # Development only: a hermetic C toolchain for the Rust toolchain's linker.
 bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
+bazel_dep(name = "platforms", version = "1.1.0", dev_dependency = True)
 
 register_toolchains("@llvm//toolchain:all", dev_dependency = True)
+
+# Development only: musl targets for the statically linked release artifacts,
+# see `--config=release` in `.bazelrc`.
+#
+# These replace the default `rust_linux_*` repository sets rather than adding to
+# them, because `rust.toolchain(extra_target_triples)` cannot attach constraints.
+# rules_rust emits no musl constraint of its own (the musl branch of
+# `abi_to_constraints` is commented out), so an unconstrained musl toolchain also
+# matches the glibc host and gets picked for exec configuration tools, which then
+# fail to link against the glibc C toolchain.
+rust_dev = use_extension(
+    "@rules_rust//rust:extensions.bzl",
+    "rust",
+    dev_dependency = True,
+)
+rust_dev.repository_set(
+    name = "rust_linux_x86_64",
+    edition = "2024",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "@llvm//constraints/libc:musl",
+    ],
+    target_triple = "x86_64-unknown-linux-musl",
+    versions = ["1.97.1"],
+)
+rust_dev.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "@llvm//constraints/libc:musl",
+    ],
+    target_triple = "aarch64-unknown-linux-musl",
+)
+rust_dev.repository_set(
+    name = "rust_linux_aarch64",
+    edition = "2024",
+    exec_triple = "aarch64-unknown-linux-gnu",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "@llvm//constraints/libc:musl",
+    ],
+    target_triple = "x86_64-unknown-linux-musl",
+    versions = ["1.97.1"],
+)
+rust_dev.repository_set(
+    name = "rust_linux_aarch64",
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "@llvm//constraints/libc:musl",
+    ],
+    target_triple = "aarch64-unknown-linux-musl",
+)
