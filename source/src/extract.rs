@@ -3,8 +3,9 @@
 
 use std::cell::RefCell;
 use std::fs;
-use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -86,6 +87,10 @@ impl RootfsExtractor {
             .entries()
             .io_context(|| format!("reading layer {layer}"))?;
 
+        // One buffer for the whole layer: allocating per file would cost more
+        // than the copy it serves.
+        let mut buffer = vec![0u8; CHUNK_BYTES];
+
         for entry in entries {
             let mut entry = entry.io_context(|| format!("reading layer {layer}"))?;
             let path = entry
@@ -145,6 +150,15 @@ impl RootfsExtractor {
                 entry.set_preserve_permissions(true);
             }
             entry.set_preserve_mtime(true);
+
+            // Regular files are the bulk of a layer, and tar copies them
+            // through a buffer of std's default size, which is one write
+            // syscall per 8 KiB. Ours is 32 times larger.
+            if matches!(entry_type, EntryType::Regular | EntryType::Continuous) {
+                unpack_regular(&mut entry, &dst, mode, &mut buffer)
+                    .io_context(|| format!("extracting {:?} from layer {layer}", path.display()))?;
+                continue;
+            }
 
             let unpacked = entry
                 .unpack_in(root)
@@ -211,6 +225,72 @@ fn is_supported(entry_type: EntryType) -> bool {
             | EntryType::Continuous
             | EntryType::GNUSparse
     )
+}
+
+/// Writes a regular file, replacing `tar`'s own unpacking so that the copy can
+/// use a buffer sized for the pipeline rather than std's default. The path has
+/// already been checked, so this only has to reproduce the parts of `unpack_in`
+/// that a regular file needs: the parent directory, the contents, the mode and
+/// the modification time.
+fn unpack_regular<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    dst: &Path,
+    mode: u32,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Creating with the final mode avoids a window in which the file is more
+    // permissive than the layer asked for. Permissions are checked when the
+    // file is opened, so a read-only mode does not stop the writes below.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(dst)?;
+
+    let mut filled = 0;
+    loop {
+        match entry.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                filled += read;
+                // Only flush full buffers, so that a stream handing over small
+                // reads still turns into large writes.
+                if filled == buffer.len() {
+                    file.write_all(buffer)?;
+                    filled = 0;
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if filled > 0 {
+        file.write_all(&buffer[..filled])?;
+    }
+
+    // The file may have existed with a different mode before it was truncated.
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    if let Ok(mtime) = entry.header().mtime() {
+        set_mtime(&file, mtime);
+    }
+    Ok(())
+}
+
+/// `tar` reaches for the `filetime` crate to do this; `futimens` on the open
+/// file is the same call without the dependency. Timestamps are cosmetic, so a
+/// failure is not worth failing the run over.
+fn set_mtime(file: &fs::File, mtime: u64) {
+    let time = libc::timespec {
+        tv_sec: mtime as libc::time_t,
+        tv_nsec: 0,
+    };
+    let times = [time, time];
+    let _ = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
 }
 
 /// Keeps existing directories (including symlinks to directories) intact so
@@ -559,6 +639,55 @@ mod tests {
             );
             let _ = fsutil::force_remove_dir_all(root.as_std_path());
         }
+    }
+
+    #[test]
+    fn file_modes_and_timestamps_survive_extraction() {
+        // Unpacking regular files no longer goes through tar, so the parts of
+        // its behaviour we still rely on are pinned here. A read-only mode is
+        // the interesting case: the file is created with it and written after.
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, mode, mtime, contents) in [
+            ("readonly", 0o400u32, 1_000_000_000u64, "secret"),
+            ("program", 0o755, 1_234_567_890, "#!/bin/sh\n"),
+            ("data", 0o644, 7, "plain"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(mode);
+            header.set_mtime(mtime);
+            header.set_size(contents.len() as u64);
+            builder
+                .append_data(&mut header, name, contents.as_bytes())
+                .expect("entry");
+        }
+        let blob = builder.into_inner().expect("tar");
+
+        let root = scratch("modes");
+        let descriptor = install_blob(&root, PLAIN_LAYER, &blob);
+        let rootfs = extract(&root, &descriptor).expect("extract");
+
+        for (name, mode, mtime, contents) in [
+            ("readonly", 0o400u32, 1_000_000_000u64, "secret"),
+            ("program", 0o755, 1_234_567_890, "#!/bin/sh\n"),
+            ("data", 0o644, 7, "plain"),
+        ] {
+            let path = rootfs.join(name);
+            assert_eq!(
+                fs::read_to_string(&path).expect(name),
+                contents,
+                "{name}: contents"
+            );
+            let metadata = fs::metadata(&path).expect(name);
+            assert_eq!(metadata.permissions().mode() & 0o7777, mode, "{name}: mode");
+            let modified = metadata
+                .modified()
+                .expect(name)
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect(name)
+                .as_secs();
+            assert_eq!(modified, mtime, "{name}: mtime");
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
     }
 
     #[test]
