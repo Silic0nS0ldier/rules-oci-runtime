@@ -28,7 +28,7 @@ jobs:
   # Publishes the same assets a release does, as workflow artifacts, so a change
   # can be tried out before it is released.
   artifacts:
-    uses: ./.github/workflows/artifacts.yml
+    uses: $/.github/workflows/artifacts.yml
   devcontainer:
     strategy:
       matrix:

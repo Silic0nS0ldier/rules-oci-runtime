@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 jobs:
   artifacts:
-    uses: ./.github/workflows/artifacts.yml
+    uses: $/.github/workflows/artifacts.yml
   publish:
     needs: artifacts
     if: github.event_name == 'release'
