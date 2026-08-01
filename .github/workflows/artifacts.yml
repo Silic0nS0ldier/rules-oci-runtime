@@ -1,6 +1,6 @@
 name: "Artifacts"
 # Release assets, assembled the same way for a release as for any other commit,
-# so that a change can be tried out before it is tagged. The workflow that
+# so that a change can be tried out before it is released. The workflow that
 # invoked this one decides whether the assets are published.
 on:
   workflow_call:
@@ -50,15 +50,15 @@ jobs:
       - name: Assemble release assets
         id: assemble
         run: |
-          # A tag is about to publish the launcher binaries, so its archive can
-          # pin them. Anything else has nowhere to pin to, and bakes them in so
-          # the archive can be tried out as-is.
+          # A release is about to carry the launcher binaries, so its archive
+          # can pin them. Anything else has nowhere to pin to, and bakes them in
+          # so the archive can be tried out as-is.
           version="0.0.0-ci"
           launcher=(
             --bake-amd64 artifacts/oci_runtime.amd64
             --bake-arm64 artifacts/oci_runtime.arm64
           )
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
             version="${GITHUB_REF_NAME#v}"
             launcher=(
               --pin-amd64 "$(sha256sum artifacts/oci_runtime.amd64 | cut -d " " -f 1)"
@@ -76,8 +76,8 @@ jobs:
       # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: |
-          # A pinned archive cannot run a container until its release exists,
-          # which the `verify` job covers once it does.
+          # A pinned archive cannot run a container until its assets are up,
+          # which the `verify` job covers once they are.
           container=(--run-container)
           if [[ "${{ steps.assemble.outputs.pinned }}" == "true" ]]; then
             container=()

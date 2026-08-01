@@ -1,30 +1,43 @@
 name: "Release"
 on:
-  push:
-    tags:
-      - "v*"
-  # Builds the artifacts without publishing them, to validate changes to this
-  # workflow before tagging.
+  # Assets are attached to a release someone has already created, so that the
+  # tag and the notes can be authored in the GitHub UI.
+  release:
+    types: [published]
+  # Builds the assets without attaching them, to validate changes to this
+  # workflow before releasing.
   workflow_dispatch:
 jobs:
   artifacts:
     uses: ./.github/workflows/artifacts.yml
   publish:
     needs: artifacts
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'release'
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
           path: artifacts
-      - name: Write installation instructions
+      # The archive pins the launcher binaries, so they go up alongside it.
+      - run: gh release upload "${GITHUB_REF_NAME}" --clobber artifacts/*
+      - name: Append installation instructions
         run: |
           version="${GITHUB_REF_NAME#v}"
           archive="rules_oci_runtime-${version}.tar.gz"
+          body="$(gh release view "${GITHUB_REF_NAME}" --json body --jq .body)"
+          # Appended once, so a re-run leaves the authored notes alone.
+          if [[ "${body}" == *archive_override* ]]; then
+            exit 0
+          fi
           cat >notes.md <<EOF
+          ${body}
+
           \`\`\`starlark
           # MODULE.bazel
           bazel_dep(name = "rules_oci_runtime", version = "${version}")
@@ -36,14 +49,9 @@ jobs:
           )
           \`\`\`
           EOF
-      # The published archive pins the launcher binaries, so they are published
-      # alongside it.
-      - run: gh release create "${GITHUB_REF_NAME}" --generate-notes --notes-file notes.md --verify-tag artifacts/*
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-  # Only a published release can be checked end to end, as that is when the
-  # launcher binaries the archive pins become downloadable.
+          gh release edit "${GITHUB_REF_NAME}" --notes-file notes.md
+  # The archive can only be checked end to end once its assets are up, as that
+  # is when the launcher binaries it pins become downloadable.
   verify:
     needs: publish
     strategy:

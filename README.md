@@ -187,16 +187,16 @@ bazel run //docs:update             # regenerate docs/defs.md
 
 ## Releasing
 
-Pushing a `vX.Y.Z` tag builds a statically linked launcher for Linux amd64 and
-arm64, stamps their hashes and the version into a generated ruleset archive,
-publishes the three together, then runs a container from the published archive
-to prove the pins are good. Running the workflow by hand does everything except
-publish.
+Publishing a release tagged `vX.Y.Z`, notes and all, builds a statically linked
+launcher for Linux amd64 and arm64, stamps their hashes and the version into a
+generated ruleset archive, attaches the three to that release along with an
+installation snippet, then runs a container from them to prove the pins are
+good. Running the workflow by hand does everything except attach.
 
 Every other CI run builds the same archive with the launchers baked in rather
 than pinned, since there is no release for them to be pinned to, and uploads it
 as a workflow artifact versioned `0.0.0-ci`. Such an archive stands alone, so
-trying a change out before it is tagged takes nothing but a download:
+trying a change out before it is released takes nothing but a download:
 
 ```starlark
 # MODULE.bazel
