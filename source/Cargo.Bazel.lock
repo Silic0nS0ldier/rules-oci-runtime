@@ -1,5 +1,5 @@
 {
-  "checksum": "d60eeb927eb90489b0a18910befd6c295722c22fb0d71337c9bd3fc903bbd7d3",
+  "checksum": "b6c5c8648f57596a0d92004fe1d542b93049b715a89a4b8643e2dac16d1e643a",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -926,90 +926,6 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "crc32fast 1.5.0": {
-      "name": "crc32fast",
-      "version": "1.5.0",
-      "package_url": "https://github.com/srijs/rust-crc32fast",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/crc32fast/1.5.0/download",
-          "sha256": "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "crc32fast",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        },
-        {
-          "BuildScript": {
-            "crate_name": "build_script_build",
-            "crate_root": "build.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "crc32fast",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
-        "deps": {
-          "common": [
-            {
-              "id": "cfg-if 1.0.4",
-              "target": "cfg_if"
-            }
-          ],
-          "selects": {}
-        },
-        "extra_deps": {
-          "common": [
-            ":build_script_build"
-          ],
-          "selects": {}
-        },
-        "edition": "2021",
-        "version": "1.5.0"
-      },
-      "build_script_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "compile_data_glob_excludes": [
-          "**/*.rs"
-        ],
-        "data_glob": [
-          "**"
-        ]
-      },
-      "license": "MIT OR Apache-2.0",
-      "license_ids": [
-        "Apache-2.0",
-        "MIT"
-      ],
-      "license_file": "LICENSE-APACHE"
-    },
     "crypto-common 0.2.2": {
       "name": "crypto-common",
       "version": "0.2.2",
@@ -1285,24 +1201,26 @@
         "crate_features": {
           "common": [
             "any_impl",
-            "default",
-            "miniz_oxide",
-            "rust_backend"
+            "any_zlib",
+            "zlib-rs"
           ],
           "selects": {}
         },
         "deps": {
           "common": [
             {
-              "id": "crc32fast 1.5.0",
-              "target": "crc32fast"
-            },
-            {
-              "id": "miniz_oxide 0.8.9",
-              "target": "miniz_oxide"
+              "id": "zlib-rs 0.6.6",
+              "target": "zlib_rs"
             }
           ],
-          "selects": {}
+          "selects": {
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"emscripten\")))": [
+              {
+                "id": "miniz_oxide 0.8.9",
+                "target": "miniz_oxide"
+              }
+            ]
+          }
         },
         "edition": "2018",
         "version": "1.1.9"
@@ -3152,6 +3070,51 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "zlib-rs 0.6.6": {
+      "name": "zlib-rs",
+      "version": "0.6.6",
+      "package_url": "https://github.com/trifectatechfoundation/zlib-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/zlib-rs/0.6.6/download",
+          "sha256": "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "zlib_rs",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "zlib_rs",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "rust-allocator",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.6.6"
+      },
+      "license": "Zlib",
+      "license_ids": [
+        "Zlib"
+      ],
+      "license_file": "LICENSE"
+    },
     "zmij 1.0.23": {
       "name": "zmij",
       "version": "1.0.23",
@@ -3250,6 +3213,10 @@
       "aarch64-apple-darwin"
     ],
     "cfg(all(target_arch = \"loongarch64\", target_os = \"linux\"))": [],
+    "cfg(all(target_arch = \"wasm32\", not(target_os = \"emscripten\")))": [
+      "wasm32-unknown-unknown",
+      "wasm32-wasip1"
+    ],
     "cfg(any())": [],
     "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))": [
       "aarch64-apple-darwin",
