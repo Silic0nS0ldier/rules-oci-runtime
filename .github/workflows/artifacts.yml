@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@3
+      - uses: bazel-contrib/setup-bazel@v3
         with:
           bazelisk-cache: true
           disk-cache: "artifacts-${{ matrix.arch }}"
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@3
+      - uses: bazel-contrib/setup-bazel@v3
         with:
           bazelisk-cache: true
           disk-cache: "artifacts-archive"
