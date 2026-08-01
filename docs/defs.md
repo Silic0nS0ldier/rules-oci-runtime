@@ -56,8 +56,9 @@ launcher_toolchain(<a href="#launcher_toolchain-name">name</a>, <a href="#launch
 Declares the launcher that `runc_binary` targets execute.
 
 The launcher reads an OCI image layout, extracts it into a bundle and hands
-that bundle to the container runtime. Toolchains for a pinned prebuilt release
-are registered by default.
+that bundle to the container runtime. Toolchains for the launcher published
+with each release are registered by default. A source checkout has no release
+to draw on, so it must supply the launcher by one of the means below.
 
 To build it from source instead, which pulls in `rules_rust`, take the prebuilt
 toolchains out of the running and add the module that provides it:
@@ -114,8 +115,8 @@ bazel run //:container -- /bin/sh -c 'echo "Hello, world!"'
 Arguments after `--` replace the image `Cmd`, as with Docker and other OCI
 runtimes. Set `RULES_OCI_RUNTIME_VERBOSE=1` to log container setup to stderr.
 
-A `launcher_toolchain` must be registered, which the `rules_oci_runtime_source`
-module does.
+Toolchains for a prebuilt launcher and `runc` are registered by default, so
+adding the module is all the setup needed on Linux amd64 and arm64.
 
 **ATTRIBUTES**
 

@@ -1,6 +1,7 @@
 """Module extensions providing the default launcher and container runtime toolchains."""
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+load(":versions.bzl", "LAUNCHER_SHA256", "LAUNCHER_VERSION")
 
 _CONSTRAINTS = {
     "linux_amd64": ["@platforms//os:linux", "@platforms//cpu:x86_64"],
@@ -21,19 +22,11 @@ _RUNC_PLATFORMS = {
     ),
 }
 
-# Tracks the release of these rules, hashes are published as
-# `oci_runtime.sha256sum` with each one.
-_LAUNCHER_VERSION = "0.0.0"
-
-_LAUNCHER_PLATFORMS = {
-    "linux_amd64": struct(
-        asset = "oci_runtime.amd64",
-        sha256 = "",
-    ),
-    "linux_arm64": struct(
-        asset = "oci_runtime.arm64",
-        sha256 = "",
-    ),
+# Hashes are baked into `versions.bzl` when the release archive is built, and
+# published as `sha256sums.txt` with each release.
+_LAUNCHER_ASSETS = {
+    "linux_amd64": "oci_runtime.amd64",
+    "linux_arm64": "oci_runtime.arm64",
 }
 
 _HUB_HEADER = """\
@@ -56,7 +49,9 @@ toolchain(
 """
 
 def _hub_impl(repository_ctx):
-    content = [_HUB_HEADER.format(rule = repository_ctx.attr.toolchain_rule)]
+    content = []
+    if repository_ctx.attr.platforms:
+        content.append(_HUB_HEADER.format(rule = repository_ctx.attr.toolchain_rule))
     for platform in repository_ctx.attr.platforms:
         content.append(_HUB_PLATFORM.format(
             constraints = repr(_CONSTRAINTS[platform]),
@@ -106,20 +101,24 @@ runc = module_extension(
 )
 
 def _launcher_impl(module_ctx):
-    for platform, info in _LAUNCHER_PLATFORMS.items():
+    # An unreleased checkout has no binaries to point at, so no toolchains are
+    # declared and resolution reports the `no_match_error` for the type.
+    released = all(LAUNCHER_SHA256.values())
+    platforms = _LAUNCHER_ASSETS.keys() if released else []
+    for platform in platforms:
         http_file(
             name = "launcher_{}".format(platform),
             executable = True,
-            sha256 = info.sha256,
+            sha256 = LAUNCHER_SHA256[platform],
             url = "https://github.com/Silic0nS0ldier/rules-oci-runtime/releases/download/v{}/{}".format(
-                _LAUNCHER_VERSION,
-                info.asset,
+                LAUNCHER_VERSION,
+                _LAUNCHER_ASSETS[platform],
             ),
         )
     _hub(
         name = "launcher",
         hub = "launcher",
-        platforms = _LAUNCHER_PLATFORMS.keys(),
+        platforms = platforms,
         # Opt out with `--@rules_oci_runtime//lib:prebuilt_launcher=false`, which
         # is how `rules_oci_runtime_source` gets to provide the launcher instead.
         target_settings = ["@rules_oci_runtime//lib:prebuilt_launcher_enabled"],

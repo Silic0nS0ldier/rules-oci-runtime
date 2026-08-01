@@ -29,19 +29,9 @@ bazel run //:container -- /bin/sh -c 'echo "Hello, world!"'
 Arguments after `--` replace the image `Cmd`, as with Docker and other OCI
 runtimes. Set `RULES_OCI_RUNTIME_VERBOSE=1` to log container setup to stderr.
 
-A `launcher_toolchain` must be registered, which the `rules_oci_runtime_source`
-module does.
+Toolchains for a prebuilt launcher and `runc` are registered by default, so
+adding the module is all the setup needed on Linux amd64 and arm64.
 """
-
-_NO_LAUNCHER = """{}: no launcher toolchain is registered.
-
-The prebuilt launcher is disabled by
-`--@rules_oci_runtime//lib:prebuilt_launcher=false`. Either drop that flag, or
-add the module that builds the launcher from source to MODULE.bazel:
-
-    bazel_dep(name = "rules_oci_runtime_source", version = "0.0.0")
-
-or register your own `launcher_toolchain`."""
 
 def _rlocation_path(ctx, file):
     # type: (ctx, File) -> str
@@ -66,8 +56,6 @@ def _image_layout(ctx):
 def _runc_binary_impl(ctx):
     # type: (ctx) -> list
     launcher_toolchain = ctx.toolchains[LAUNCHER_TOOLCHAIN_TYPE]
-    if not launcher_toolchain:
-        fail(_NO_LAUNCHER.format(ctx.label))
     runtime_toolchain = ctx.toolchains[CONTAINER_RUNTIME_TOOLCHAIN_TYPE]
 
     layout = _image_layout(ctx)
@@ -157,7 +145,7 @@ container starts, so `$BUILD_WORKSPACE_DIRECTORY:/src:ro` mounts the workspace.
         ),
     },
     toolchains = [
-        config_common.toolchain_type(LAUNCHER_TOOLCHAIN_TYPE, mandatory = False),
+        LAUNCHER_TOOLCHAIN_TYPE,
         CONTAINER_RUNTIME_TOOLCHAIN_TYPE,
     ],
 )

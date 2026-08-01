@@ -25,6 +25,10 @@ jobs:
           repository-cache: true
       - run: bazel test //...
         working-directory: ${{ matrix.module }}
+  # Publishes the same assets a release does, as workflow artifacts, so a change
+  # can be tried out before it is tagged.
+  artifacts:
+    uses: ./.github/workflows/artifacts.yml
   devcontainer:
     strategy:
       matrix:

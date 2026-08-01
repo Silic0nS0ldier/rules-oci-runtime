@@ -2,9 +2,19 @@
 
 **WIP**: Bazel rules for running OCI container images (currently using [`runc`](https://github.com/opencontainers/runc)).
 
+The API is still being refined, so releases are published to GitHub rather than
+to the Bazel Central Registry. Each release quotes the snippet to copy, with the
+version and hash filled in:
+
 ```starlark
 # MODULE.bazel
 bazel_dep(name = "rules_oci_runtime", version = "0.0.0")
+archive_override(
+    module_name = "rules_oci_runtime",
+    integrity = "sha256-...",
+    strip_prefix = "rules_oci_runtime-0.0.0",
+    urls = ["https://github.com/Silic0nS0ldier/rules-oci-runtime/releases/download/v0.0.0/rules_oci_runtime-0.0.0.tar.gz"],
+)
 ```
 
 ```starlark
@@ -104,9 +114,10 @@ can be replaced without forking these rules.
 | `//lib:launcher_toolchain_type` | The launcher described above. | A pinned launcher release. |
 | `//lib:container_runtime_toolchain_type` | An OCI runtime such as `runc`. | A pinned `runc` release. |
 
-The launcher is published as a statically linked binary with each release. To
-build it from source instead, and therefore depend on `rules_rust`, add the
-`rules_oci_runtime_source` module and stand the prebuilt toolchains down:
+The launcher is published as a statically linked binary with each release, and
+the archive above pins the pair. A source checkout has no release to draw on, so
+it must build the launcher from source, which pulls in `rules_rust`: add the
+`rules_oci_runtime_source` module and stand the prebuilt toolchains down.
 
 ```starlark
 # MODULE.bazel
@@ -172,3 +183,27 @@ bazel test //...                    # rule tests and documentation freshness
 (cd e2e/smoke && bazel test //...)  # end to end tests
 bazel run //docs:update             # regenerate docs/defs.md
 ```
+
+## Releasing
+
+Pushing a `vX.Y.Z` tag builds a statically linked launcher for Linux amd64 and
+arm64, bakes their hashes and the version into `lib/private/versions.bzl` within
+a generated ruleset archive, publishes both, then runs a container from the
+published archive to prove the pins are good. Running the workflow by hand does
+everything except publish.
+
+Every CI run uploads those same assets as a `release-assets` workflow artifact,
+versioned `0.0.0-ci`, so a change can be tried out before it is tagged. The
+launcher such an archive pins cannot be downloaded until the release exists, so
+point the check at the binary that came with it:
+
+```sh
+.github/workflows/check_release_archive.sh \
+    --version 0.0.0-ci \
+    --archive rules_oci_runtime-0.0.0-ci.tar.gz \
+    --launcher oci_runtime.amd64 \
+    --run-container
+```
+
+The module it assembles to run that check is the shape a consumer needs to try
+the archive out in their own repository.

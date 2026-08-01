@@ -7,45 +7,57 @@ on:
   # workflow before tagging.
   workflow_dispatch:
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.15.0
-        with:
-          bazelisk-cache: true
-          disk-cache: "${{ github.workflow }}-${{ matrix.arch }}"
-          repository-cache: true
-      - run: bazel build --config=release_linux_${{ matrix.arch }} //:oci_runtime
-        working-directory: source
-      - run: install -m 0755 source/.bazel/bin/oci_runtime oci_runtime.${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: oci_runtime.${{ matrix.arch }}
-          path: oci_runtime.${{ matrix.arch }}
-          if-no-files-found: error
+  artifacts:
+    uses: ./.github/workflows/artifacts.yml
   publish:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: artifacts
+    if: github.ref_type == 'tag'
     permissions:
       contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
+          name: release-assets
           path: artifacts
-      # Hashes are pinned by the `launcher` module extension.
-      - run: sha256sum oci_runtime.* | tee oci_runtime.sha256sum
-        working-directory: artifacts
-      - run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag artifacts/*
+      - name: Write installation instructions
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="rules_oci_runtime-${version}.tar.gz"
+          cat >notes.md <<EOF
+          \`\`\`starlark
+          # MODULE.bazel
+          bazel_dep(name = "rules_oci_runtime", version = "${version}")
+          archive_override(
+              module_name = "rules_oci_runtime",
+              integrity = "sha256-$(openssl dgst -binary -sha256 "artifacts/${archive}" | base64)",
+              strip_prefix = "rules_oci_runtime-${version}",
+              urls = ["https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${archive}"],
+          )
+          \`\`\`
+          EOF
+      - run: gh release create "${GITHUB_REF_NAME}" --generate-notes --notes-file notes.md --verify-tag artifacts/*
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+  # Only a published release can be checked end to end, as that is when the
+  # launcher binaries the archive pins become downloadable.
+  verify:
+    needs: publish
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: "${{ github.workflow }}-verify"
+          repository-cache: true
+      - run: |
+          version="${GITHUB_REF_NAME#v}"
+          .github/workflows/check_release_archive.sh \
+            --version "${version}" \
+            --archive "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/rules_oci_runtime-${version}.tar.gz" \
+            --run-container

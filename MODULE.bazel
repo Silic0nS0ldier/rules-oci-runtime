@@ -1,7 +1,7 @@
 module(
     name = "rules_oci_runtime",
     version = "0.0.0",
-    compatibility_level = 1,
+    bazel_compatibility = [">=8.1.0"],
 )
 
 # To fully update lockfile: bazel mod deps --lockfile_mode=refresh

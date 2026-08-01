@@ -12,7 +12,16 @@ bzl_library(
     ],
 )
 
-toolchain_type(name = "launcher_toolchain_type")
+toolchain_type(
+    name = "launcher_toolchain_type",
+    no_match_error = """No OCI launcher toolchain could be resolved.
+
+- The target platform may not be linux_amd64 or linux_arm64.
+- The ruleset may not have been sourced from a release archive, which includes prebuilt launchers.
+- You may have set `--@rules_oci_runtime//lib:prebuilt_launcher=false` to build the launcher from source instead, without adding a dependency on the `rules_oci_runtime_source` module.
+    
+See https://github.com/Silic0nS0ldier/rules-oci-runtime#toolchains""",
+)
 
 toolchain_type(name = "container_runtime_toolchain_type")
 

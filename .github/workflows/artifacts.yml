@@ -1,0 +1,76 @@
+name: "Artifacts"
+# Release assets, assembled the same way for a release as for any other commit,
+# so that a change can be tried out before it is tagged. The workflow that
+# invoked this one decides whether the assets are published.
+on:
+  workflow_call:
+jobs:
+  launcher:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: "artifacts-${{ matrix.arch }}"
+          repository-cache: true
+      - run: bazel build --config=release_linux_${{ matrix.arch }} //:oci_runtime
+        working-directory: source
+      - run: install -m 0755 source/.bazel/bin/oci_runtime oci_runtime.${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oci_runtime.${{ matrix.arch }}
+          path: oci_runtime.${{ matrix.arch }}
+          if-no-files-found: error
+  # The ruleset archive carries the launcher version and hashes, so it can only
+  # be built once both binaries exist.
+  archive:
+    needs: launcher
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: "artifacts-archive"
+          repository-cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+      - name: Assemble release assets
+        id: assemble
+        run: |
+          version="0.0.0-ci"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+          .github/workflows/make_release_archive.sh \
+            --version "${version}" \
+            --amd64 "$(sha256sum artifacts/oci_runtime.amd64 | cut -d " " -f 1)" \
+            --arm64 "$(sha256sum artifacts/oci_runtime.arm64 | cut -d " " -f 1)" \
+            --output "artifacts/rules_oci_runtime-${version}.tar.gz"
+          # Hashes for the launcher binaries are pinned by the `launcher` module
+          # extension, the archive hash is quoted in the release notes.
+          (cd artifacts && sha256sum oci_runtime.* rules_oci_runtime-*.tar.gz | tee sha256sums.txt)
+      # The launcher the archive pins is only downloadable once released, so the
+      # container runs against the binary built above instead.
+      - run: |
+          .github/workflows/check_release_archive.sh \
+            --version "${{ steps.assemble.outputs.version }}" \
+            --archive "artifacts/rules_oci_runtime-${{ steps.assemble.outputs.version }}.tar.gz" \
+            --launcher artifacts/oci_runtime.amd64 \
+            --run-container
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: artifacts
+          if-no-files-found: error

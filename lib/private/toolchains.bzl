@@ -9,8 +9,9 @@ CONTAINER_RUNTIME_TOOLCHAIN_TYPE = Label("//lib:container_runtime_toolchain_type
 _LAUNCHER_DOC = """Declares the launcher that `runc_binary` targets execute.
 
 The launcher reads an OCI image layout, extracts it into a bundle and hands
-that bundle to the container runtime. Toolchains for a pinned prebuilt release
-are registered by default.
+that bundle to the container runtime. Toolchains for the launcher published
+with each release are registered by default. A source checkout has no release
+to draw on, so it must supply the launcher by one of the means below.
 
 To build it from source instead, which pulls in `rules_rust`, take the prebuilt
 toolchains out of the running and add the module that provides it:
