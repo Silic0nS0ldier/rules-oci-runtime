@@ -61,6 +61,9 @@ jobs:
           # Hashes for the launcher binaries are pinned by the `launcher` module
           # extension, the archive hash is quoted in the release notes.
           (cd artifacts && sha256sum oci_runtime.* rules_oci_runtime-*.tar.gz | tee sha256sums.txt)
+      # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, which
+      # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # The launcher the archive pins is only downloadable once released, so the
       # container runs against the binary built above instead.
       - run: |

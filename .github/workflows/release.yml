@@ -55,6 +55,9 @@ jobs:
           bazelisk-cache: true
           disk-cache: "${{ github.workflow }}-verify"
           repository-cache: true
+      # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, which
+      # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: |
           version="${GITHUB_REF_NAME#v}"
           .github/workflows/check_release_archive.sh \
