@@ -69,7 +69,7 @@ oci.pull(
     image = "docker.io/library/alpine",
     platforms = [
         "linux/amd64",
-        "linux/arm64",
+        "linux/arm64/v8",
     ],
     tag = "3.22.2",
 )
