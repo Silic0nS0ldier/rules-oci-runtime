@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.15.0
+      - uses: bazel-contrib/setup-bazel@3
         with:
           bazelisk-cache: true
           disk-cache: "artifacts-${{ matrix.arch }}"
@@ -24,11 +24,13 @@ jobs:
       - run: bazel build --config=release_linux_${{ matrix.arch }} //:oci_runtime
         working-directory: source
       - run: install -m 0755 source/.bazel/bin/oci_runtime oci_runtime.${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      # Unarchived, so the asset can be downloaded as-is. The file name becomes
+      # the artifact name.
+      - uses: actions/upload-artifact@v7
         with:
-          name: oci_runtime.${{ matrix.arch }}
           path: oci_runtime.${{ matrix.arch }}
           if-no-files-found: error
+          archive: false
   # The ruleset archive carries the launcher version and hashes, so it can only
   # be built once both binaries exist.
   archive:
@@ -36,12 +38,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.15.0
+      - uses: bazel-contrib/setup-bazel@3
         with:
           bazelisk-cache: true
           disk-cache: "artifacts-archive"
           repository-cache: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
           path: artifacts
@@ -72,8 +74,14 @@ jobs:
             --archive "artifacts/rules_oci_runtime-${{ steps.assemble.outputs.version }}.tar.gz" \
             --launcher artifacts/oci_runtime.amd64 \
             --run-container
-      - uses: actions/upload-artifact@v4
+      # The launcher binaries are already up, one artifact per asset.
+      - uses: actions/upload-artifact@v7
         with:
-          name: release-assets
-          path: artifacts
+          path: artifacts/rules_oci_runtime-${{ steps.assemble.outputs.version }}.tar.gz
           if-no-files-found: error
+          archive: false
+      - uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/sha256sums.txt
+          if-no-files-found: error
+          archive: false

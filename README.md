@@ -192,10 +192,11 @@ a generated ruleset archive, publishes both, then runs a container from the
 published archive to prove the pins are good. Running the workflow by hand does
 everything except publish.
 
-Every CI run uploads those same assets as a `release-assets` workflow artifact,
-versioned `0.0.0-ci`, so a change can be tried out before it is tagged. The
-launcher such an archive pins cannot be downloaded until the release exists, so
-point the check at the binary that came with it:
+Every CI run uploads those same assets as workflow artifacts, one per asset and
+unarchived, versioned `0.0.0-ci`, so a change can be tried out before it is
+tagged. Artifact downloads need a GitHub login, so the archive still pins the
+release URLs it will be published under. Those are dead until the release
+exists, which is why the check takes the launcher that came alongside it:
 
 ```sh
 .github/workflows/check_release_archive.sh \

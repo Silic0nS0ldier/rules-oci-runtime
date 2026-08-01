@@ -16,9 +16,9 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          name: release-assets
+          merge-multiple: true
           path: artifacts
       - name: Write installation instructions
         run: |
@@ -50,7 +50,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.15.0
+      - uses: bazel-contrib/setup-bazel@3
         with:
           bazelisk-cache: true
           disk-cache: "${{ github.workflow }}-verify"

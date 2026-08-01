@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.15.0
+      - uses: bazel-contrib/setup-bazel@3
         with:
           bazelisk-cache: true
           disk-cache: "${{ github.workflow }}-test-${{ matrix.module }}"
@@ -39,3 +39,4 @@ jobs:
       - uses: devcontainers/ci@v0.3
         with:
           runCmd: echo "Built successfully"
+          push: never
