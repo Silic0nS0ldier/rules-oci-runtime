@@ -1,13 +1,11 @@
 //! Unpacking image layers into a root filesystem, replacing the previous
 //! `undocker | tar -x` pipeline.
 
-use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
@@ -317,38 +315,49 @@ struct HashState {
     bytes: u64,
 }
 
-struct HashingReader<R> {
-    inner: R,
-    state: Rc<RefCell<HashState>>,
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        if read > 0 {
-            let mut state = self.state.borrow_mut();
-            state.hasher.update(&buf[..read]);
-            state.bytes += read as u64;
+/// Reads the blob and hashes it, handing each buffer to the decompressor by
+/// move. With decompression on the critical path, sha256 of the compressed
+/// bytes is time the inflater is not inflating, and the read it accompanies is
+/// nearly free, so the two belong together on a thread of their own.
+///
+/// The hash covers exactly the bytes the decompressor is given, so the digest
+/// still describes what was extracted rather than a second read of the file.
+fn read_and_hash(mut file: fs::File, sender: SyncSender<io::Result<Vec<u8>>>) -> HashState {
+    let mut state = HashState::default();
+    loop {
+        let mut chunk = vec![0u8; CHUNK_BYTES];
+        match file.read(&mut chunk) {
+            Ok(0) => return state,
+            Ok(read) => {
+                chunk.truncate(read);
+                state.hasher.update(&chunk);
+                state.bytes += read as u64;
+                // The consumer has stopped, and has an error of its own to report.
+                if sender.send(Ok(chunk)).is_err() {
+                    return state;
+                }
+            }
+            Err(err) => {
+                let _ = sender.send(Err(err));
+                return state;
+            }
         }
-        Ok(read)
     }
 }
 
-/// Runs on the decompression thread: reads the blob, hashes what it reads,
-/// inflates it into `sender` and finally checks the blob against its
-/// descriptor. Reaching the end of the blob is what makes the digest
-/// meaningful, so the size and digest are only reported when the consumer took
-/// everything; a consumer that stopped early has an error of its own to report.
+/// Runs on the decompression thread: inflates the blob into `sender` and checks
+/// it against its descriptor, while a third thread reads and hashes it.
+/// Reaching the end of the blob is what makes the digest meaningful, so the
+/// size and digest are only reported when the consumer took everything; a
+/// consumer that stopped early has an error of its own to report.
 fn inflate_blob(
     file: fs::File,
     descriptor: &Descriptor,
     sender: SyncSender<io::Result<Vec<u8>>>,
 ) -> Result<()> {
-    let state = Rc::new(RefCell::new(HashState::default()));
-    let counted = HashingReader {
-        inner: file,
-        state: Rc::clone(&state),
-    };
+    let (raw_sender, raw_receiver) = sync_channel(PIPELINE_DEPTH);
+    let hashing = thread::spawn(move || read_and_hash(file, raw_sender));
+    let counted = ChunkReader::new(raw_receiver);
     let mut decoder = match decompressor(&descriptor.media_type, counted) {
         Ok(decoder) => decoder,
         Err(err) => {
@@ -376,9 +385,10 @@ fn inflate_blob(
             return Ok(());
         }
     }
+    // The reader thread may still be blocked handing over a buffer, so the
+    // decoder, and with it the receiving end, has to go before this joins.
     drop(decoder);
-
-    let state = state.borrow();
+    let state = hashing.join().unwrap_or_default();
     if descriptor.size != 0 && descriptor.size != state.bytes {
         return Err(Error::SizeMismatch {
             digest: descriptor.digest.clone(),
@@ -386,7 +396,7 @@ fn inflate_blob(
             actual: state.bytes,
         });
     }
-    let actual = hex_encode(&state.hasher.clone().finalize());
+    let actual = hex_encode(&state.hasher.finalize());
     if actual != parse_digest(&descriptor.digest)?.hex {
         return Err(Error::DigestMismatch {
             digest: descriptor.digest.clone(),
@@ -502,18 +512,22 @@ mod tests {
     }
 
     #[test]
-    fn hashing_reader_tracks_bytes_and_digest() {
-        let state = Rc::new(RefCell::new(HashState::default()));
-        let mut reader = HashingReader {
-            inner: &b"hello"[..],
-            state: Rc::clone(&state),
-        };
-        let mut out = Vec::new();
-        reader.read_to_end(&mut out).expect("read");
-        let state = state.borrow();
+    fn the_hashing_thread_sees_every_byte_it_hands_on() {
+        let mut blob = scratch("hashing");
+        blob.push("blob");
+        fs::write(&blob, b"hello").expect("blob");
+
+        let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
+        let state = read_and_hash(fs::File::open(&blob).expect("open"), sender);
+
+        let mut passed_on = Vec::new();
+        ChunkReader::new(receiver)
+            .read_to_end(&mut passed_on)
+            .expect("read");
+        assert_eq!(passed_on, b"hello");
         assert_eq!(state.bytes, 5);
         assert_eq!(
-            hex_encode(&state.hasher.clone().finalize()),
+            hex_encode(&state.hasher.finalize()),
             hex_encode(&Sha256::digest(b"hello"))
         );
     }
