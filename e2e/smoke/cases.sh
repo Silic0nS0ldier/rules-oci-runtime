@@ -214,6 +214,17 @@ case_cleanup() {
   if [[ -e "$bundle" ]]; then
     fail "bundle ${bundle} still exists after the container exited"
   fi
+
+  # Removal is handed to a detached process, so the staged copy goes shortly after.
+  local waited=0
+  while [[ -e "${bundle}.removing" ]]; do
+    sleep 0.2
+    waited=$((waited + 1))
+    if [[ "$waited" -gt 150 ]]; then
+      fail "staged bundle ${bundle}.removing was never removed"
+      return
+    fi
+  done
 }
 
 main() {
