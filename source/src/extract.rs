@@ -7,6 +7,8 @@ use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
@@ -19,6 +21,12 @@ use crate::log::{log, warning};
 
 const WHITEOUT_PREFIX: &str = ".wh.";
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+
+/// Size of each buffer handed from the decompressor to the writer.
+const CHUNK_BYTES: usize = 256 * 1024;
+
+/// How many chunks may be in flight, bounding the pipeline to 2 MiB.
+const PIPELINE_DEPTH: usize = 8;
 
 /// Applies layers in order, deferring directory permissions so that read-only
 /// directories in one layer do not block writes from the next.
@@ -36,39 +44,38 @@ impl RootfsExtractor {
         })
     }
 
+    /// Decompression is CPU bound and writing the rootfs is IO bound, so a
+    /// second thread inflates the blob while this one writes the entries. The
+    /// two overlap rather than run back to back, which on a large layer is
+    /// worth roughly the whole decompression time.
     pub fn apply_layer(&mut self, layout: &Layout, descriptor: &Descriptor) -> Result<()> {
         log!("Extracting layer {} ({})", descriptor.digest, descriptor.media_type);
 
         let file = layout.open_blob(descriptor)?;
-        let state = Rc::new(RefCell::new(HashState::default()));
-        let counted = HashingReader {
-            inner: file,
-            state: Rc::clone(&state),
-        };
-        let mut decoder = decompressor(&descriptor.media_type, counted)?;
-        self.unpack(&mut decoder, &descriptor.digest)?;
+        let digest = descriptor.digest.clone();
+        let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
+        let owned = descriptor.clone();
+        let inflate = thread::spawn(move || inflate_blob(file, &owned, sender));
 
-        // Drain so the digest covers the whole blob, not just what tar consumed.
-        io::copy(&mut decoder, &mut io::sink())
-            .io_context(|| format!("reading layer {}", descriptor.digest))?;
-        drop(decoder);
+        let mut reader = ChunkReader::new(receiver);
+        let mut unpacked = self.unpack(&mut reader, &digest);
+        if unpacked.is_ok() {
+            // The tar stream ends at its marker, but the digest covers the blob.
+            unpacked = io::copy(&mut reader, &mut io::sink())
+                .map(|_| ())
+                .io_context(|| format!("reading layer {digest}"));
+        }
+        // Releasing the receiver lets the inflater stop early when unpacking failed.
+        drop(reader);
 
-        let state = state.borrow();
-        if descriptor.size != 0 && descriptor.size != state.bytes {
-            return Err(Error::SizeMismatch {
-                digest: descriptor.digest.clone(),
-                expected: descriptor.size,
-                actual: state.bytes,
-            });
+        match inflate.join() {
+            // An unverified blob explains any unpacking failure, so it wins.
+            Ok(inflated) => inflated.and(unpacked),
+            Err(_) => Err(Error::io(
+                "decompressing a layer",
+                io::Error::other("the decompression thread panicked"),
+            )),
         }
-        let actual = hex_encode(&state.hasher.clone().finalize());
-        if actual != parse_digest(&descriptor.digest)?.hex {
-            return Err(Error::DigestMismatch {
-                digest: descriptor.digest.clone(),
-                actual,
-            });
-        }
-        Ok(())
     }
 
     fn unpack(&mut self, reader: &mut dyn Read, layer: &str) -> Result<()> {
@@ -247,6 +254,100 @@ impl<R: Read> Read for HashingReader<R> {
     }
 }
 
+/// Runs on the decompression thread: reads the blob, hashes what it reads,
+/// inflates it into `sender` and finally checks the blob against its
+/// descriptor. Reaching the end of the blob is what makes the digest
+/// meaningful, so the size and digest are only reported when the consumer took
+/// everything; a consumer that stopped early has an error of its own to report.
+fn inflate_blob(
+    file: fs::File,
+    descriptor: &Descriptor,
+    sender: SyncSender<io::Result<Vec<u8>>>,
+) -> Result<()> {
+    let state = Rc::new(RefCell::new(HashState::default()));
+    let counted = HashingReader {
+        inner: file,
+        state: Rc::clone(&state),
+    };
+    let mut decoder = match decompressor(&descriptor.media_type, counted) {
+        Ok(decoder) => decoder,
+        Err(err) => {
+            let _ = sender.send(Err(io::Error::other(err.to_string())));
+            return Err(err);
+        }
+    };
+
+    loop {
+        let mut chunk = vec![0u8; CHUNK_BYTES];
+        let read = match decoder.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) => {
+                let message = err.to_string();
+                let _ = sender.send(Err(err));
+                return Err(Error::io(
+                    format!("reading layer {}", descriptor.digest),
+                    io::Error::other(message),
+                ));
+            }
+        };
+        chunk.truncate(read);
+        if sender.send(Ok(chunk)).is_err() {
+            return Ok(());
+        }
+    }
+    drop(decoder);
+
+    let state = state.borrow();
+    if descriptor.size != 0 && descriptor.size != state.bytes {
+        return Err(Error::SizeMismatch {
+            digest: descriptor.digest.clone(),
+            expected: descriptor.size,
+            actual: state.bytes,
+        });
+    }
+    let actual = hex_encode(&state.hasher.clone().finalize());
+    if actual != parse_digest(&descriptor.digest)?.hex {
+        return Err(Error::DigestMismatch {
+            digest: descriptor.digest.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Presents the inflated chunks as a stream for `tar` to walk.
+struct ChunkReader {
+    chunks: Receiver<io::Result<Vec<u8>>>,
+    current: io::Cursor<Vec<u8>>,
+}
+
+impl ChunkReader {
+    fn new(chunks: Receiver<io::Result<Vec<u8>>>) -> Self {
+        ChunkReader {
+            chunks,
+            current: io::Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let read = self.current.read(buf)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            match self.chunks.recv() {
+                Ok(Ok(chunk)) => self.current = io::Cursor::new(chunk),
+                Ok(Err(err)) => return Err(err),
+                // The sender is gone, so the blob has been read in full.
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
 fn decompressor<'a, R: Read + 'a>(media_type: &str, reader: R) -> Result<Box<dyn Read + 'a>> {
     match compression_of(media_type) {
         Some(Compression::None) => Ok(Box::new(reader)),
@@ -342,5 +443,201 @@ mod tests {
         assert!(OPAQUE_WHITEOUT.starts_with(WHITEOUT_PREFIX));
         assert_eq!(".wh.foo".strip_prefix(WHITEOUT_PREFIX), Some("foo"));
         assert_eq!("foo".strip_prefix(WHITEOUT_PREFIX), None);
+    }
+
+    const GZIP_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+    const PLAIN_LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
+
+    fn scratch(name: &str) -> Utf8PathBuf {
+        let dir = Utf8PathBuf::from(std::env::temp_dir().to_string_lossy().into_owned())
+            .join(format!("oci-runtime-extract-{name}-{}", std::process::id()));
+        let _ = fsutil::force_remove_dir_all(dir.as_std_path());
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A tar holding a directory, a file spanning several pipeline chunks, a
+    /// small file and a symlink.
+    fn sample_tar() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, "dir/", io::empty())
+            .expect("dir");
+
+        let large = vec![b'a'; CHUNK_BYTES * 2 + 17];
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(large.len() as u64);
+        builder
+            .append_data(&mut header, "dir/large", &large[..])
+            .expect("large");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o600);
+        header.set_size(5);
+        builder
+            .append_data(&mut header, "dir/small", &b"hello"[..])
+            .expect("small");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "link", "dir/small")
+            .expect("link");
+
+        builder.into_inner().expect("tar")
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).expect("compress");
+        encoder.finish().expect("compress")
+    }
+
+    /// Writes a blob and returns a descriptor that matches it.
+    fn install_blob(root: &Utf8Path, media_type: &str, blob: &[u8]) -> Descriptor {
+        let hex = hex_encode(&Sha256::digest(blob));
+        let blobs = root.join("blobs").join("sha256");
+        fs::create_dir_all(&blobs).expect("blobs");
+        fs::write(blobs.join(&hex), blob).expect("blob");
+        fs::write(
+            root.join("oci-layout"),
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .expect("layout");
+        fs::write(root.join("index.json"), br#"{"manifests":[]}"#).expect("index");
+        Descriptor {
+            media_type: media_type.to_string(),
+            digest: format!("sha256:{hex}"),
+            size: blob.len() as u64,
+            platform: None,
+        }
+    }
+
+    fn extract(root: &Utf8Path, descriptor: &Descriptor) -> Result<Utf8PathBuf> {
+        let layout = Layout::open(root)?;
+        let rootfs = root.join("rootfs");
+        let mut extractor = RootfsExtractor::new(&rootfs)?;
+        extractor.apply_layer(&layout, descriptor)?;
+        extractor.finish()?;
+        Ok(rootfs)
+    }
+
+    #[test]
+    fn layers_are_unpacked_while_they_are_inflated() {
+        for (name, media_type, blob) in [
+            ("gzip", GZIP_LAYER, gzip(&sample_tar())),
+            ("plain", PLAIN_LAYER, sample_tar()),
+        ] {
+            let root = scratch(&format!("pipeline-{name}"));
+            let descriptor = install_blob(&root, media_type, &blob);
+            let rootfs = extract(&root, &descriptor).expect("extract");
+
+            assert!(rootfs.join("dir").is_dir(), "{name}: directory");
+            assert_eq!(
+                fs::read(rootfs.join("dir/large")).expect("large").len(),
+                CHUNK_BYTES * 2 + 17,
+                "{name}: file spanning chunk boundaries"
+            );
+            assert_eq!(
+                fs::read_to_string(rootfs.join("dir/small")).expect("small"),
+                "hello",
+                "{name}: small file"
+            );
+            assert_eq!(
+                fs::read_link(rootfs.join("link")).expect("link"),
+                Path::new("dir/small"),
+                "{name}: symlink"
+            );
+            let _ = fsutil::force_remove_dir_all(root.as_std_path());
+        }
+    }
+
+    #[test]
+    fn padding_after_the_tar_marker_is_still_verified() {
+        // More padding than the pipeline can hold, so the blob is only read to
+        // the end, and therefore only checked, because unpacking drains it.
+        let mut tar = sample_tar();
+        tar.extend_from_slice(&vec![0u8; PIPELINE_DEPTH * CHUNK_BYTES * 2]);
+        let blob = gzip(&tar);
+
+        let root = scratch("drain-ok");
+        let descriptor = install_blob(&root, GZIP_LAYER, &blob);
+        extract(&root, &descriptor).expect("a padded blob extracts");
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+
+        let root = scratch("drain-short");
+        let mut descriptor = install_blob(&root, GZIP_LAYER, &blob);
+        descriptor.size -= 1;
+        match extract(&root, &descriptor) {
+            Err(Error::SizeMismatch { .. }) => {}
+            other => panic!("expected a size mismatch, got {other:?}"),
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_blob_that_does_not_match_its_digest_is_rejected() {
+        let root = scratch("digest");
+        let mut descriptor = install_blob(&root, GZIP_LAYER, &gzip(&sample_tar()));
+
+        // Leave the blob where the descriptor says it is, but change what is in it.
+        let mut altered = sample_tar();
+        altered.extend_from_slice(&[0u8; 1024]);
+        let altered = gzip(&altered);
+        let path = Layout::open(&root)
+            .expect("layout")
+            .blob_path(&descriptor.digest)
+            .expect("blob path");
+        fs::write(&path, &altered).expect("blob");
+        descriptor.size = altered.len() as u64;
+
+        match extract(&root, &descriptor) {
+            Err(Error::DigestMismatch { .. }) => {}
+            other => panic!("expected a digest mismatch, got {other:?}"),
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_blob_that_does_not_match_its_size_is_rejected() {
+        let root = scratch("size");
+        let mut descriptor = install_blob(&root, GZIP_LAYER, &gzip(&sample_tar()));
+        descriptor.size += 1;
+        match extract(&root, &descriptor) {
+            Err(Error::SizeMismatch { .. }) => {}
+            other => panic!("expected a size mismatch, got {other:?}"),
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_corrupt_blob_is_reported_rather_than_hanging() {
+        let root = scratch("corrupt");
+        let mut blob = gzip(&sample_tar());
+        let tail = blob.len() - 64;
+        blob[tail..].fill(0xff);
+        let descriptor = install_blob(&root, GZIP_LAYER, &blob);
+        assert!(extract(&root, &descriptor).is_err());
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn an_unsupported_media_type_is_reported() {
+        let root = scratch("media-type");
+        let descriptor = install_blob(&root, "application/x-nonsense", &sample_tar());
+        match extract(&root, &descriptor) {
+            Err(Error::UnsupportedMediaType(_)) => {}
+            other => panic!("expected an unsupported media type, got {other:?}"),
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
     }
 }
