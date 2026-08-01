@@ -3,6 +3,9 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -10,6 +13,22 @@ use crate::error::{Error, IoContext, Result};
 use crate::fsutil;
 use crate::log::{log, warning};
 use crate::spec::Spec;
+
+/// Hidden first argument of the detached process that removes a bundle.
+const REMOVE_ARG: &str = "__remove";
+
+/// Suffix given to a bundle once it has been renamed out of the way.
+const REMOVE_SUFFIX: &str = ".removing";
+
+/// The bundle a detached remover was asked to delete, or `None` for an ordinary
+/// invocation. Checked before the launcher sidecar so a bundle path can never
+/// be mistaken for a command line.
+pub fn remover_target(argv: &[String]) -> Option<&str> {
+    match argv {
+        [_, flag, path] if flag == REMOVE_ARG => Some(path.as_str()),
+        _ => None,
+    }
+}
 
 /// A temporary directory holding the bundle and the runtime's state, removed
 /// when this value is dropped.
@@ -60,10 +79,69 @@ impl Drop for Bundle {
             crate::log::warn(format!("keeping bundle at {}", self.root));
             return;
         }
-        if let Err(err) = fsutil::force_remove_dir_all(self.root.as_std_path()) {
-            warning!("could not clean up {}: {err}", self.root);
+        // Renaming first means the bundle is gone the moment this returns, even
+        // though deleting a large rootfs takes far longer than the run itself.
+        let staged = match self.stage_for_removal() {
+            Some(staged) => staged,
+            None => self.root.clone(),
+        };
+        if spawn_remover(&staged) {
+            return;
+        }
+        if let Err(err) = fsutil::force_remove_dir_all(staged.as_std_path()) {
+            warning!("could not clean up {staged}: {err}");
         }
     }
+}
+
+impl Bundle {
+    /// The bundle identifier is random, so the staged name cannot collide.
+    fn stage_for_removal(&self) -> Option<Utf8PathBuf> {
+        let staged = Utf8PathBuf::from(format!("{}{REMOVE_SUFFIX}", self.root));
+        match fs::rename(&self.root, &staged) {
+            Ok(()) => Some(staged),
+            Err(err) => {
+                log!("Could not stage {} for removal: {err}", self.root);
+                None
+            }
+        }
+    }
+}
+
+/// Hands the tree to a copy of this binary that outlives it. Detaching from the
+/// session keeps a terminal signal from orphaning a half deleted tree, and null
+/// standard streams keep the child from holding a caller's pipe open.
+fn spawn_remover(path: &Utf8Path) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut command = Command::new(exe);
+    command
+        .arg(REMOVE_ARG)
+        .arg(path.as_std_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe and touches nothing this process owns.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    match command.spawn() {
+        Ok(_) => true,
+        Err(err) => {
+            log!("Could not spawn a background remover for {path}: {err}");
+            false
+        }
+    }
+}
+
+/// Deletes a staged bundle. The exit code is ignored by the parent, so failures
+/// are silent by design: the tree lives under a temporary directory either way.
+pub fn remove_staged(path: &str) {
+    let _ = fsutil::force_remove_dir_all(Path::new(path));
 }
 
 /// Copies the host resolver configuration and writes `/etc/hosts` and
@@ -178,6 +256,37 @@ mod tests {
             bundle.dir().to_owned()
         };
         assert!(!path.exists());
+        // Under `cargo test` the spawned remover is the test binary, which
+        // deletes nothing, so the staged tree is cleared here instead.
+        let _ = fsutil::force_remove_dir_all(parent.as_std_path());
+    }
+
+    #[test]
+    fn removers_are_recognised_by_their_argument_list() {
+        let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            remover_target(&argv(&["oci_runtime", REMOVE_ARG, "/tmp/bundle"])),
+            Some("/tmp/bundle")
+        );
+        assert_eq!(remover_target(&argv(&["oci_runtime", REMOVE_ARG])), None);
+        assert_eq!(
+            remover_target(&argv(&["oci_runtime", "run", "--layout"])),
+            None
+        );
+        assert_eq!(
+            remover_target(&argv(&["oci_runtime", REMOVE_ARG, "/tmp/bundle", "extra"])),
+            None
+        );
+    }
+
+    #[test]
+    fn staging_moves_the_bundle_aside() {
+        let parent = scratch("bundle-stage");
+        let bundle = Bundle::create(&parent, "abc", true).expect("bundle");
+        let staged = bundle.stage_for_removal().expect("staged");
+        assert_eq!(staged, parent.join(format!("abc{REMOVE_SUFFIX}")));
+        assert!(!bundle.dir().exists());
+        assert!(staged.is_dir());
         let _ = fsutil::force_remove_dir_all(parent.as_std_path());
     }
 

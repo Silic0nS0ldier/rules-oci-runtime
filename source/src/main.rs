@@ -23,6 +23,12 @@ use crate::runtime::{ContainerRuntime, RunRequest, Runc};
 use crate::spec::{BindMount, Spec, SpecOptions};
 
 fn main() -> std::process::ExitCode {
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(path) = bundle::remover_target(&argv) {
+        bundle::remove_staged(path);
+        return std::process::ExitCode::SUCCESS;
+    }
+
     let code = launcher::command_line().and_then(|argv| {
         let cli = match argv {
             Some(argv) => Cli::parse_from(argv),
