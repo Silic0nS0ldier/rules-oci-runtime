@@ -1,31 +1,25 @@
 #!/usr/bin/env bash
 # Checks that a release archive works as a Bazel module: that it is
-# self-contained, and optionally that a container runs with the launcher it pins
-# or with one supplied locally. The archive may be a local path or a URL.
+# self-contained, and optionally that a container runs with the launcher baked
+# into it. The archive may be a local path or a URL.
 set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
 Usage: check_release_archive.sh --version VERSION --archive PATH_OR_URL \
-                               [--run-container] [--launcher PATH]
-
-`--run-container` uses the launcher the archive pins, which is only downloadable
-once released. Pass `--launcher` to register a locally built one instead, as the
-release assets of an untagged commit do.
+                               [--run-container]
 EOF
     exit 2
 }
 
 version=""
 archive=""
-launcher=""
 run_container=false
 
 while (($#)); do
     case "$1" in
     --version) version="${2:-}" && shift 2 ;;
     --archive) archive="${2:-}" && shift 2 ;;
-    --launcher) launcher="${2:-}" && shift 2 ;;
     --run-container) run_container=true && shift ;;
     *) usage ;;
     esac
@@ -88,33 +82,6 @@ load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
 runc_binary(
     name = "container",
     image = "@alpine",
-)
-EOF
-fi
-
-if [[ -n "${launcher}" ]]; then
-    mkdir "${consumer}/launcher"
-    install -m 0755 "${launcher}" "${consumer}/launcher/oci_runtime"
-
-    # Toolchains registered by the root module win, so the pinned launcher is
-    # never downloaded.
-    cat >>"${consumer}/MODULE.bazel" <<'EOF'
-
-register_toolchains("//launcher:toolchain")
-EOF
-
-    cat >"${consumer}/launcher/BUILD.bazel" <<'EOF'
-load("@rules_oci_runtime//lib:defs.bzl", "launcher_toolchain")
-
-launcher_toolchain(
-    name = "launcher",
-    binary = "oci_runtime",
-)
-
-toolchain(
-    name = "toolchain",
-    toolchain = ":launcher",
-    toolchain_type = "@rules_oci_runtime//lib:launcher_toolchain_type",
 )
 EOF
 fi

@@ -56,9 +56,9 @@ launcher_toolchain(<a href="#launcher_toolchain-name">name</a>, <a href="#launch
 Declares the launcher that `runc_binary` targets execute.
 
 The launcher reads an OCI image layout, extracts it into a bundle and hands
-that bundle to the container runtime. Toolchains for the launcher published
-with each release are registered by default. A source checkout has no release
-to draw on, so it must supply the launcher by one of the means below.
+that bundle to the container runtime. Every release archive comes with a
+prebuilt launcher toolchain for Linux amd64 and arm64. A source checkout comes
+with none, so it must supply the launcher by one of the means below.
 
 To build it from source instead, which pulls in `rules_rust`, take the prebuilt
 toolchains out of the running and add the module that provides it:

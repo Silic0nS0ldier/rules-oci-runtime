@@ -111,13 +111,14 @@ can be replaced without forking these rules.
 
 | Toolchain type | Binary | Default |
 | -------------- | ------ | ------- |
-| `//lib:launcher_toolchain_type` | The launcher described above. | A pinned launcher release. |
+| `//lib:launcher_toolchain_type` | The launcher described above. | A prebuilt launcher release. |
 | `//lib:container_runtime_toolchain_type` | An OCI runtime such as `runc`. | A pinned `runc` release. |
 
-The launcher is published as a statically linked binary with each release, and
-the archive above pins the pair. A source checkout has no release to draw on, so
-it must build the launcher from source, which pulls in `rules_rust`: add the
-`rules_oci_runtime_source` module and stand the prebuilt toolchains down.
+The launcher is published as a statically linked binary for Linux amd64 and
+arm64 with each release, and the archive above pins the pair. A source checkout
+has no release to draw on, so it must build the launcher from source, which
+pulls in `rules_rust`: add the `rules_oci_runtime_source` module and stand the
+prebuilt toolchains down.
 
 ```starlark
 # MODULE.bazel
@@ -187,24 +188,31 @@ bazel run //docs:update             # regenerate docs/defs.md
 ## Releasing
 
 Pushing a `vX.Y.Z` tag builds a statically linked launcher for Linux amd64 and
-arm64, bakes their hashes and the version into `lib/private/versions.bzl` within
-a generated ruleset archive, publishes both, then runs a container from the
-published archive to prove the pins are good. Running the workflow by hand does
-everything except publish.
+arm64, stamps their hashes and the version into a generated ruleset archive,
+publishes the three together, then runs a container from the published archive
+to prove the pins are good. Running the workflow by hand does everything except
+publish.
 
-Every CI run uploads those same assets as workflow artifacts, one per asset and
-unarchived, versioned `0.0.0-ci`, so a change can be tried out before it is
-tagged. Artifact downloads need a GitHub login, so the archive still pins the
-release URLs it will be published under. Those are dead until the release
-exists, which is why the check takes the launcher that came alongside it:
+Every other CI run builds the same archive with the launchers baked in rather
+than pinned, since there is no release for them to be pinned to, and uploads it
+as a workflow artifact versioned `0.0.0-ci`. Such an archive stands alone, so
+trying a change out before it is tagged takes nothing but a download:
+
+```starlark
+# MODULE.bazel
+bazel_dep(name = "rules_oci_runtime", version = "0.0.0-ci")
+archive_override(
+    module_name = "rules_oci_runtime",
+    strip_prefix = "rules_oci_runtime-0.0.0-ci",
+    urls = ["file:///tmp/rules_oci_runtime-0.0.0-ci.tar.gz"],
+)
+```
+
+That is what the check every archive goes through sets up:
 
 ```sh
 .github/workflows/check_release_archive.sh \
     --version 0.0.0-ci \
     --archive rules_oci_runtime-0.0.0-ci.tar.gz \
-    --launcher oci_runtime.amd64 \
     --run-container
 ```
-
-The module it assembles to run that check is the shape a consumer needs to try
-the archive out in their own repository.

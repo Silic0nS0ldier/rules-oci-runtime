@@ -3,3 +3,6 @@
 
 # Cargo
 target/
+
+# Baked into release archives, never committed
+launcher/oci_runtime.*

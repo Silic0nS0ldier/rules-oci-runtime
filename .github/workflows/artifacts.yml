@@ -50,30 +50,42 @@ jobs:
       - name: Assemble release assets
         id: assemble
         run: |
+          # A tag is about to publish the launcher binaries, so its archive can
+          # pin them. Anything else has nowhere to pin to, and bakes them in so
+          # the archive can be tried out as-is.
           version="0.0.0-ci"
+          launcher=(
+            --bake-amd64 artifacts/oci_runtime.amd64
+            --bake-arm64 artifacts/oci_runtime.arm64
+          )
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
+            launcher=(
+              --pin-amd64 "$(sha256sum artifacts/oci_runtime.amd64 | cut -d " " -f 1)"
+              --pin-arm64 "$(sha256sum artifacts/oci_runtime.arm64 | cut -d " " -f 1)"
+            )
+            echo "pinned=true" >>"${GITHUB_OUTPUT}"
           fi
           echo "version=${version}" >>"${GITHUB_OUTPUT}"
           .github/workflows/make_release_archive.sh \
             --version "${version}" \
-            --amd64 "$(sha256sum artifacts/oci_runtime.amd64 | cut -d " " -f 1)" \
-            --arm64 "$(sha256sum artifacts/oci_runtime.arm64 | cut -d " " -f 1)" \
+            "${launcher[@]}" \
             --output "artifacts/rules_oci_runtime-${version}.tar.gz"
-          # Hashes for the launcher binaries are pinned by the `launcher` module
-          # extension, the archive hash is quoted in the release notes.
           (cd artifacts && sha256sum oci_runtime.* rules_oci_runtime-*.tar.gz | tee sha256sums.txt)
       # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, which
       # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # The launcher the archive pins is only downloadable once released, so the
-      # container runs against the binary built above instead.
       - run: |
+          # A pinned archive cannot run a container until its release exists,
+          # which the `verify` job covers once it does.
+          container=(--run-container)
+          if [[ "${{ steps.assemble.outputs.pinned }}" == "true" ]]; then
+            container=()
+          fi
           .github/workflows/check_release_archive.sh \
             --version "${{ steps.assemble.outputs.version }}" \
             --archive "artifacts/rules_oci_runtime-${{ steps.assemble.outputs.version }}.tar.gz" \
-            --launcher artifacts/oci_runtime.amd64 \
-            --run-container
+            "${container[@]}"
       # The launcher binaries are already up, one artifact per asset.
       - uses: actions/upload-artifact@v7
         with:

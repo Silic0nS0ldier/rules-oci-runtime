@@ -1,0 +1,12 @@
+load("//lib/private:prebuilt.bzl", "prebuilt_launcher_toolchains")
+
+# A self-contained archive bakes a launcher binary per platform in here. A
+# pinned release archive downloads them instead, and a source checkout has
+# neither, so resolution reports the `no_match_error` of
+# `//lib:launcher_toolchain_type`.
+prebuilt_launcher_toolchains(
+    binaries = glob(
+        ["oci_runtime.*"],
+        allow_empty = True,
+    ),
+)

@@ -22,8 +22,8 @@ _RUNC_PLATFORMS = {
     ),
 }
 
-# Hashes are baked into `versions.bzl` when the release archive is built, and
-# published as `sha256sums.txt` with each release.
+# Hashes are baked into `versions.bzl` when a pinned release archive is built,
+# and published as `sha256sums.txt` with each release.
 _LAUNCHER_ASSETS = {
     "linux_amd64": "oci_runtime.amd64",
     "linux_arm64": "oci_runtime.arm64",
@@ -101,10 +101,10 @@ runc = module_extension(
 )
 
 def _launcher_impl(module_ctx):
-    # An unreleased checkout has no binaries to point at, so no toolchains are
-    # declared and resolution reports the `no_match_error` for the type.
-    released = all(LAUNCHER_SHA256.values())
-    platforms = _LAUNCHER_ASSETS.keys() if released else []
+    # Nothing to download unless the archive was stamped with a release to draw
+    # on. A self-contained archive bakes the binaries into `//launcher` instead.
+    pinned = all(LAUNCHER_SHA256.values())
+    platforms = _LAUNCHER_ASSETS.keys() if pinned else []
     for platform in platforms:
         http_file(
             name = "launcher_{}".format(platform),
@@ -129,5 +129,5 @@ def _launcher_impl(module_ctx):
 
 launcher = module_extension(
     implementation = _launcher_impl,
-    doc = "Downloads a pinned launcher release and declares a toolchain for each platform.",
+    doc = "Downloads the launcher release a pinned archive was stamped with, and declares a toolchain for each platform.",
 )

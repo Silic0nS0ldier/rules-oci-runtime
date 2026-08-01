@@ -21,7 +21,11 @@ use_repo(launcher, "launcher")
 # having to outrank them.
 register_toolchains("@runc//:all")
 
+# A release archive pins launcher downloads, a CI archive bakes the binaries in,
+# and a source checkout has neither, so at most one of these is ever populated.
 register_toolchains("@launcher//:all")
+
+register_toolchains("//launcher:all")
 
 # Development only: documentation generation and end to end tests. The launcher
 # is built by the `rules_oci_runtime_source` module, which is tested separately.
