@@ -99,7 +99,100 @@ pub fn remove_any(path: &Path) -> Result<()> {
     }
 }
 
-/// True when `path`'s parent directory resolves to somewhere inside `root`.
+/// True when `path`'s parent directory resolves to somewhere inside `root`,
+/// creating it when it does not exist yet.
+///
+/// The parent has to be created here rather than by the caller. A layer may
+/// ship a symlink such as `lnk -> /etc` and then an entry `lnk/sub/file`, whose
+/// parent `lnk/sub` does not exist and cannot be resolved; creating it with
+/// `create_dir_all` would follow the symlink and put it outside the root. So
+/// the deepest ancestor that does exist is resolved and checked first, and
+/// everything below it is created one component at a time, which cannot
+/// traverse a symlink that is not there.
+pub fn prepare_parent(root: &Path, path: &Path) -> Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let canonical_root = root
+        .canonicalize()
+        .io_context(|| format!("resolving {}", root.display()))?;
+    prepare_directory_within(&canonical_root, parent)
+}
+
+/// Resolves `dir`, creating it if needed, and reports whether it ended up
+/// inside `canonical_root`.
+fn prepare_directory_within(canonical_root: &Path, dir: &Path) -> Result<bool> {
+    let mut missing = Vec::new();
+    let mut existing = dir;
+    let canonical = loop {
+        match existing.canonicalize() {
+            Ok(canonical) => break canonical,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+                    return Ok(false);
+                };
+                missing.push(name.to_owned());
+                existing = parent;
+            }
+            Err(err) => {
+                return Err(crate::error::Error::io(
+                    format!("resolving {}", existing.display()),
+                    err,
+                ));
+            }
+        }
+    };
+    if !canonical.starts_with(canonical_root) {
+        return Ok(false);
+    }
+
+    // Everything below here is created rather than resolved, so each component
+    // is a real directory and the chain cannot leave the root.
+    let mut path = existing.to_path_buf();
+    for name in missing.iter().rev() {
+        path.push(name);
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            // Something is already there that `canonicalize` could not resolve,
+            // a dangling symlink among other things, so check where it points.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let canonical = path
+                    .canonicalize()
+                    .io_context(|| format!("resolving {}", path.display()))?;
+                if !canonical.starts_with(canonical_root) {
+                    return Ok(false);
+                }
+            }
+            Err(err) => {
+                return Err(crate::error::Error::io(
+                    format!("creating {}", path.display()),
+                    err,
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// True when `path` itself resolves to somewhere inside `root`. A path that is
+/// not there counts as outside: there is nothing at it to act on.
+pub fn is_within(root: &Path, path: &Path) -> Result<bool> {
+    let canonical_root = root
+        .canonicalize()
+        .io_context(|| format!("resolving {}", root.display()))?;
+    match path.canonicalize() {
+        Ok(canonical) => Ok(canonical.starts_with(&canonical_root)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(crate::error::Error::io(
+            format!("resolving {}", path.display()),
+            err,
+        )),
+    }
+}
+
+/// True when `path`'s parent directory resolves to somewhere inside `root`, for
+/// callers that must not create anything. A parent that does not exist cannot
+/// be escaped through, so it counts as within.
 pub fn parent_is_within(root: &Path, path: &Path) -> Result<bool> {
     let Some(parent) = path.parent() else {
         return Ok(false);
