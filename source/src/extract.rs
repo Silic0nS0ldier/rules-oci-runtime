@@ -131,7 +131,7 @@ impl RootfsExtractor {
                 continue;
             }
 
-            if !fsutil::parent_is_within(root, &dst)? {
+            if !fsutil::prepare_parent(root, &dst)? {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),
                     path: path.display().to_string(),
@@ -173,7 +173,18 @@ impl RootfsExtractor {
 
     /// `.wh..wh..opq` hides everything the lower layers put in this directory.
     fn apply_opaque_whiteout(&self, root: &Path, dir: &Path) -> Result<()> {
-        if !fsutil::parent_is_within(root, dir)? {
+        // The marker applies to a directory, and only to one inside the
+        // rootfs. Reading through a symlink here would clear whatever it points
+        // at, which a layer is free to aim anywhere on the host.
+        match fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(Error::io(format!("inspecting {}", dir.display()), err)),
+        }
+        // A directory can still sit outside the rootfs when one of its parents
+        // is a symlink, so the resolved path has to be checked as well.
+        if !fsutil::is_within(root, dir)? {
             return Ok(());
         }
         let entries = match fs::read_dir(dir) {
@@ -226,20 +237,16 @@ fn is_supported(entry_type: EntryType) -> bool {
 }
 
 /// Writes a regular file, replacing `tar`'s own unpacking so that the copy can
-/// use a buffer sized for the pipeline rather than std's default. The path has
-/// already been checked, so this only has to reproduce the parts of `unpack_in`
-/// that a regular file needs: the parent directory, the contents, the mode and
-/// the modification time.
+/// use a buffer sized for the pipeline rather than std's default. The path and
+/// its parent have already been checked and created, so this only has to
+/// reproduce the parts of `unpack_in` that a regular file needs: the contents,
+/// the mode and the modification time.
 fn unpack_regular<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     dst: &Path,
     mode: u32,
     buffer: &mut [u8],
 ) -> io::Result<()> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     // Creating with the final mode avoids a window in which the file is more
     // permissive than the layer asked for. Permissions are checked when the
     // file is opened, so a read-only mode does not stop the writes below.
@@ -653,6 +660,88 @@ mod tests {
             );
             let _ = fsutil::force_remove_dir_all(root.as_std_path());
         }
+    }
+
+    #[test]
+    fn an_entry_cannot_escape_through_a_symlinked_parent() {
+        // A layer can ship a symlink out of the rootfs and then an entry
+        // underneath it. The parent of that entry does not exist and cannot be
+        // resolved, which used to count as safe, so creating it followed the
+        // symlink and wrote the file outside the rootfs.
+        let root = scratch("escape");
+        let outside = scratch("escape-outside");
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "lnk", outside.as_std_path())
+            .expect("link");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(7);
+        builder
+            .append_data(&mut header, "lnk/sub/file", &b"escaped"[..])
+            .expect("file");
+        let blob = builder.into_inner().expect("tar");
+
+        let descriptor = install_blob(&root, PLAIN_LAYER, &blob);
+        let err = extract(&root, &descriptor).expect_err("the entry must be refused");
+        assert!(
+            matches!(err, Error::UnsafeEntry { .. }),
+            "expected an unsafe entry, got {err:?}"
+        );
+        assert!(
+            fs::read_dir(outside.as_std_path())
+                .expect("outside")
+                .next()
+                .is_none(),
+            "nothing may be written outside the rootfs"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+        let _ = fsutil::force_remove_dir_all(outside.as_std_path());
+    }
+
+    #[test]
+    fn an_opaque_whiteout_cannot_clear_a_directory_outside_the_rootfs() {
+        // The marker names the directory it applies to, and a layer can point
+        // that name at a symlink leading out of the rootfs. Reading through it
+        // deleted everything at the far end.
+        let root = scratch("opaque-escape");
+        let outside = scratch("opaque-escape-outside");
+        fs::write(outside.join("keep"), b"important").expect("keep");
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "lnk", outside.as_std_path())
+            .expect("link");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, "lnk/.wh..wh..opq", &b""[..])
+            .expect("opaque");
+        let blob = builder.into_inner().expect("tar");
+
+        let descriptor = install_blob(&root, PLAIN_LAYER, &blob);
+        extract(&root, &descriptor).expect("extract");
+        assert_eq!(
+            fs::read(outside.join("keep")).expect("keep"),
+            b"important",
+            "files outside the rootfs may not be removed"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+        let _ = fsutil::force_remove_dir_all(outside.as_std_path());
     }
 
     #[test]
