@@ -1,5 +1,6 @@
 //! Filesystem helpers shared by extraction and cleanup.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -99,28 +100,87 @@ pub fn remove_any(path: &Path) -> Result<()> {
     }
 }
 
-/// True when `path`'s parent directory resolves to somewhere inside `root`,
-/// creating it when it does not exist yet.
+/// Resolves entry parents against the rootfs, remembering the ones already
+/// checked.
 ///
-/// The parent has to be created here rather than by the caller. A layer may
-/// ship a symlink such as `lnk -> /etc` and then an entry `lnk/sub/file`, whose
-/// parent `lnk/sub` does not exist and cannot be resolved; creating it with
-/// `create_dir_all` would follow the symlink and put it outside the root. So
-/// the deepest ancestor that does exist is resolved and checked first, and
-/// everything below it is created one component at a time, which cannot
-/// traverse a symlink that is not there.
-pub fn prepare_parent(root: &Path, path: &Path) -> Result<bool> {
-    let Some(parent) = path.parent() else {
-        return Ok(false);
-    };
-    let canonical_root = root
-        .canonicalize()
-        .io_context(|| format!("resolving {}", root.display()))?;
-    prepare_directory_within(&canonical_root, parent)
+/// Checking a parent means resolving it with `canonicalize`, which reads every
+/// symlink along the way: about sixteen `readlink` calls per entry on a distro
+/// base image, all of them failing, and the root itself is resolved again each
+/// time. A layer names the same few hundred directories over and over, so
+/// remembering which ones have been found to resolve inside the root turns
+/// nearly all of that into a hash lookup.
+pub struct ParentCache {
+    canonical_root: PathBuf,
+    verified: HashSet<PathBuf>,
+}
+
+impl ParentCache {
+    pub fn new(root: &Path) -> Result<Self> {
+        let canonical_root = root
+            .canonicalize()
+            .io_context(|| format!("resolving {}", root.display()))?;
+        let mut verified = HashSet::new();
+        verified.insert(root.to_owned());
+        verified.insert(canonical_root.clone());
+        Ok(ParentCache {
+            canonical_root,
+            verified,
+        })
+    }
+
+    /// True when `path`'s parent resolves to somewhere inside the root, having
+    /// created it if needed. See [`prepare_directory_within`] for why creating
+    /// it is part of the check rather than left to the caller.
+    pub fn prepare(&mut self, path: &Path) -> Result<bool> {
+        let Some(parent) = path.parent() else {
+            return Ok(false);
+        };
+        if self.verified.contains(parent) {
+            return Ok(true);
+        }
+        if !prepare_directory_within(&self.canonical_root, parent)? {
+            return Ok(false);
+        }
+        self.verified.insert(parent.to_owned());
+        Ok(true)
+    }
+
+    /// True when `path` itself resolves to somewhere inside the root. A path
+    /// that is not there counts as outside: there is nothing at it to act on.
+    pub fn contains(&self, path: &Path) -> Result<bool> {
+        match path.canonicalize() {
+            Ok(canonical) => Ok(canonical.starts_with(&self.canonical_root)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(crate::error::Error::io(
+                format!("resolving {}", path.display()),
+                err,
+            )),
+        }
+    }
+
+    /// True when `path`'s parent resolves to somewhere inside the root, for
+    /// callers that must not create anything.
+    pub fn contains_parent_of(&self, path: &Path) -> Result<bool> {
+        parent_is_within(&self.canonical_root, path)
+    }
+
+    /// Forgets `path` and everything under it, because what was verified there
+    /// has been removed and a later layer may put a symlink in its place.
+    pub fn forget(&mut self, path: &Path) {
+        self.verified.retain(|verified| !verified.starts_with(path));
+    }
 }
 
 /// Resolves `dir`, creating it if needed, and reports whether it ended up
 /// inside `canonical_root`.
+///
+/// Creating the directory is part of the check rather than the caller's job. A
+/// layer may ship a symlink such as `lnk -> /etc` and then an entry
+/// `lnk/sub/file`, whose parent `lnk/sub` does not exist and so cannot be
+/// resolved; creating it with `create_dir_all` would follow the symlink and put
+/// it outside the root. So the deepest ancestor that does exist is resolved and
+/// checked first, and everything below it is created one component at a time,
+/// which cannot traverse a symlink that is not there.
 fn prepare_directory_within(canonical_root: &Path, dir: &Path) -> Result<bool> {
     let mut missing = Vec::new();
     let mut existing = dir;
@@ -174,32 +234,14 @@ fn prepare_directory_within(canonical_root: &Path, dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// True when `path` itself resolves to somewhere inside `root`. A path that is
-/// not there counts as outside: there is nothing at it to act on.
-pub fn is_within(root: &Path, path: &Path) -> Result<bool> {
-    let canonical_root = root
-        .canonicalize()
-        .io_context(|| format!("resolving {}", root.display()))?;
-    match path.canonicalize() {
-        Ok(canonical) => Ok(canonical.starts_with(&canonical_root)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(crate::error::Error::io(
-            format!("resolving {}", path.display()),
-            err,
-        )),
-    }
-}
-
 /// True when `path`'s parent directory resolves to somewhere inside `root`, for
 /// callers that must not create anything. A parent that does not exist cannot
-/// be escaped through, so it counts as within.
-pub fn parent_is_within(root: &Path, path: &Path) -> Result<bool> {
+/// be escaped through, so it counts as within: there is nothing at the far end
+/// to act on either way.
+fn parent_is_within(canonical_root: &Path, path: &Path) -> Result<bool> {
     let Some(parent) = path.parent() else {
         return Ok(false);
     };
-    let canonical_root = root
-        .canonicalize()
-        .io_context(|| format!("resolving {}", root.display()))?;
     let canonical_parent = match parent.canonicalize() {
         Ok(canonical_parent) => canonical_parent,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
@@ -210,7 +252,7 @@ pub fn parent_is_within(root: &Path, path: &Path) -> Result<bool> {
             ));
         }
     };
-    Ok(canonical_parent.starts_with(&canonical_root))
+    Ok(canonical_parent.starts_with(canonical_root))
 }
 
 pub fn join_components(root: &Path, parts: &[std::ffi::OsString]) -> PathBuf {

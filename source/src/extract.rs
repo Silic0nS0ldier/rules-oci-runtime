@@ -32,12 +32,14 @@ const PIPELINE_DEPTH: usize = 8;
 pub struct RootfsExtractor {
     rootfs: Utf8PathBuf,
     deferred_modes: Vec<(PathBuf, u32)>,
+    parents: fsutil::ParentCache,
 }
 
 impl RootfsExtractor {
     pub fn new(rootfs: &Utf8Path) -> Result<Self> {
         fs::create_dir_all(rootfs).io_context(|| format!("creating {rootfs}"))?;
         Ok(RootfsExtractor {
+            parents: fsutil::ParentCache::new(rootfs.as_std_path())?,
             rootfs: rootfs.to_owned(),
             deferred_modes: Vec::new(),
         })
@@ -78,7 +80,8 @@ impl RootfsExtractor {
     }
 
     fn unpack(&mut self, reader: &mut dyn Read, layer: &str) -> Result<()> {
-        let root = Path::new(self.rootfs.as_std_path());
+        let rootfs = self.rootfs.clone();
+        let root = rootfs.as_std_path();
         let mut archive = tar::Archive::new(reader);
         archive.set_overwrite(true);
         let entries = archive
@@ -113,9 +116,10 @@ impl RootfsExtractor {
                 let mut whiteout = parts[..parts.len() - 1].to_vec();
                 whiteout.push(target.into());
                 let dst = fsutil::join_components(root, &whiteout);
-                if fsutil::parent_is_within(root, &dst)? {
+                if self.parents.contains_parent_of(&dst)? {
                     log!("Whiteout: removing /{}", relative_display(root, &dst));
                     fsutil::remove_any(&dst)?;
+                    self.parents.forget(&dst);
                 }
                 continue;
             }
@@ -131,7 +135,7 @@ impl RootfsExtractor {
                 continue;
             }
 
-            if !fsutil::prepare_parent(root, &dst)? {
+            if !self.parents.prepare(&dst)? {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),
                     path: path.display().to_string(),
@@ -139,24 +143,32 @@ impl RootfsExtractor {
             }
 
             let mode = entry.header().mode().unwrap_or(0o755) & 0o7777;
-            if entry_type.is_dir() {
-                prepare_directory(&dst)?;
-                self.deferred_modes.push((dst.clone(), mode));
-                entry.set_preserve_permissions(false);
-            } else {
-                fsutil::remove_any(&dst)?;
-                entry.set_preserve_permissions(true);
-            }
-            entry.set_preserve_mtime(true);
 
             // Regular files are the bulk of a layer, and tar copies them
             // through a buffer of std's default size, which is one write
             // syscall per 8 KiB. Ours is 32 times larger.
             if matches!(entry_type, EntryType::Regular | EntryType::Continuous) {
-                unpack_regular(&mut entry, &dst, mode, &mut buffer)
+                entry.set_preserve_mtime(true);
+                let replaced = unpack_regular(&mut entry, &dst, mode, &mut buffer)
                     .io_context(|| format!("extracting {:?} from layer {layer}", path.display()))?;
+                if replaced {
+                    self.parents.forget(&dst);
+                }
                 continue;
             }
+
+            if entry_type.is_dir() {
+                if prepare_directory(&dst)? {
+                    self.parents.forget(&dst);
+                }
+                self.deferred_modes.push((dst.clone(), mode));
+                entry.set_preserve_permissions(false);
+            } else {
+                fsutil::remove_any(&dst)?;
+                self.parents.forget(&dst);
+                entry.set_preserve_permissions(true);
+            }
+            entry.set_preserve_mtime(true);
 
             let unpacked = entry
                 .unpack_in(root)
@@ -172,7 +184,7 @@ impl RootfsExtractor {
     }
 
     /// `.wh..wh..opq` hides everything the lower layers put in this directory.
-    fn apply_opaque_whiteout(&self, root: &Path, dir: &Path) -> Result<()> {
+    fn apply_opaque_whiteout(&mut self, root: &Path, dir: &Path) -> Result<()> {
         // The marker applies to a directory, and only to one inside the
         // rootfs. Reading through a symlink here would clear whatever it points
         // at, which a layer is free to aim anywhere on the host.
@@ -184,7 +196,7 @@ impl RootfsExtractor {
         }
         // A directory can still sit outside the rootfs when one of its parents
         // is a symlink, so the resolved path has to be checked as well.
-        if !fsutil::is_within(root, dir)? {
+        if !self.parents.contains(dir)? {
             return Ok(());
         }
         let entries = match fs::read_dir(dir) {
@@ -197,6 +209,7 @@ impl RootfsExtractor {
             let entry = entry.io_context(|| format!("listing {}", dir.display()))?;
             fsutil::remove_any(&entry.path())?;
         }
+        self.parents.forget(dir);
         Ok(())
     }
 
@@ -241,21 +254,33 @@ fn is_supported(entry_type: EntryType) -> bool {
 /// its parent have already been checked and created, so this only has to
 /// reproduce the parts of `unpack_in` that a regular file needs: the contents,
 /// the mode and the modification time.
+///
+/// Returns whether something already at `dst` had to be removed first.
 fn unpack_regular<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     dst: &Path,
     mode: u32,
     buffer: &mut [u8],
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // Creating with the final mode avoids a window in which the file is more
     // permissive than the layer asked for. Permissions are checked when the
     // file is opened, so a read-only mode does not stop the writes below.
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(dst)?;
+    //
+    // The first attempt is exclusive, which costs nothing when the path is
+    // free, as it is for every file in the first and largest layer. It also
+    // refuses to follow a symlink already sitting there, so the path only has
+    // to be cleared on the rare occasion a later layer replaces something,
+    // rather than being stat'd and unlinked for every file in the image.
+    let mut replaced = false;
+    let mut file = match open_exclusive(dst, mode) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            fsutil::remove_any(dst).map_err(io::Error::other)?;
+            replaced = true;
+            open_exclusive(dst, mode)?
+        }
+        Err(err) => return Err(err),
+    };
 
     let mut filled = 0;
     loop {
@@ -278,12 +303,21 @@ fn unpack_regular<R: Read>(
         file.write_all(&buffer[..filled])?;
     }
 
-    // The file may have existed with a different mode before it was truncated.
+    // `mode` is what the file was created with, but the umask applies to
+    // creation and not to this, so it is still needed to get the mode asked for.
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     if let Ok(mtime) = entry.header().mtime() {
         set_mtime(&file, mtime);
     }
-    Ok(())
+    Ok(replaced)
+}
+
+fn open_exclusive(dst: &Path, mode: u32) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(dst)
 }
 
 /// `tar` reaches for the `filetime` crate to do this; `futimens` on the open
@@ -299,19 +333,21 @@ fn set_mtime(file: &fs::File, mtime: u64) {
 }
 
 /// Keeps existing directories (including symlinks to directories) intact so
-/// that layouts such as `/lib -> /usr/lib` survive later layers.
-fn prepare_directory(dst: &Path) -> Result<()> {
+/// that layouts such as `/lib -> /usr/lib` survive later layers. Returns
+/// whether something that was not a directory had to be removed.
+fn prepare_directory(dst: &Path) -> Result<bool> {
     match fs::symlink_metadata(dst) {
         Ok(metadata) => {
             let resolves_to_dir = metadata.is_dir()
                 || (metadata.file_type().is_symlink()
                     && fs::metadata(dst).map(|m| m.is_dir()).unwrap_or(false));
             if resolves_to_dir {
-                return Ok(());
+                return Ok(false);
             }
-            fsutil::remove_any(dst)
+            fsutil::remove_any(dst)?;
+            Ok(true)
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(Error::io(format!("inspecting {}", dst.display()), err)),
     }
 }
@@ -738,6 +774,55 @@ mod tests {
             fs::read(outside.join("keep")).expect("keep"),
             b"important",
             "files outside the rootfs may not be removed"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+        let _ = fsutil::force_remove_dir_all(outside.as_std_path());
+    }
+
+    #[test]
+    fn a_verified_directory_replaced_by_a_symlink_is_checked_again() {
+        // Parents are remembered once they have been checked, so a layer that
+        // swaps a directory it has already used for a symlink out of the rootfs
+        // must drop that memory again, or the entries after it are waved
+        // through on the strength of a check that no longer holds.
+        let root = scratch("stale");
+        let outside = scratch("stale-outside");
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(5);
+        builder
+            .append_data(&mut header, "a/b/first", &b"first"[..])
+            .expect("first");
+
+        // `a/b` is now a checked parent. Replace it with a way out.
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "a/b", outside.as_std_path())
+            .expect("link");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(6);
+        builder
+            .append_data(&mut header, "a/b/second", &b"second"[..])
+            .expect("second");
+        let blob = builder.into_inner().expect("tar");
+
+        let descriptor = install_blob(&root, PLAIN_LAYER, &blob);
+        let err = extract(&root, &descriptor).expect_err("the entry must be refused");
+        assert!(
+            matches!(err, Error::UnsafeEntry { .. }),
+            "expected an unsafe entry, got {err:?}"
+        );
+        assert!(
+            !outside.join("second").exists(),
+            "nothing may be written outside the rootfs"
         );
 
         let _ = fsutil::force_remove_dir_all(root.as_std_path());
