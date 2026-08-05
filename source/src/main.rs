@@ -9,12 +9,13 @@ mod log;
 mod runtime;
 mod spec;
 mod sys;
+mod zinfo;
 
 use camino::Utf8PathBuf;
 use clap::Parser;
 
 use crate::bundle::Bundle;
-use crate::cli::{Cli, Command, RunArgs};
+use crate::cli::{Cli, Command, IndexArgs, RunArgs};
 use crate::error::{Error, Result};
 use crate::extract::RootfsExtractor;
 use crate::image::{Layout, Platform};
@@ -36,6 +37,7 @@ fn main() -> std::process::ExitCode {
         };
         match cli.command {
             Command::Run(args) => run(*args),
+            Command::Index(args) => index(args),
         }
     });
     match code {
@@ -130,6 +132,18 @@ fn run(args: RunArgs) -> Result<i32> {
     runc.delete(&request);
     log!("Container has exited, cleaning up...");
     result
+}
+
+fn index(args: IndexArgs) -> Result<i32> {
+    let blob = std::fs::read(&args.blob)
+        .map_err(|source| Error::io(format!("reading {}", args.blob), source))?;
+    let index = zinfo::Index::build(&blob, args.span)?;
+    let file = std::fs::File::create(&args.output)
+        .map_err(|source| Error::io(format!("creating {}", args.output), source))?;
+    index
+        .write_to(std::io::BufWriter::new(file))
+        .map_err(|source| Error::io(format!("writing {}", args.output), source))?;
+    Ok(0)
 }
 
 fn parse_platform(value: Option<&str>) -> Result<Platform> {

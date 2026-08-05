@@ -1,5 +1,5 @@
 {
-  "checksum": "b6c5c8648f57596a0d92004fe1d542b93049b715a89a4b8643e2dac16d1e643a",
+  "checksum": "e71783b6fd9b18f1bb5f2f0fd524d11f6747ed8c9c1cfe5b0b6de4e801c0dd6f",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -1209,7 +1209,7 @@
         "deps": {
           "common": [
             {
-              "id": "zlib-rs 0.6.6",
+              "id": "zlib-rs 0.6.7",
               "target": "zlib_rs"
             }
           ],
@@ -1478,6 +1478,60 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "libz-rs-sys 0.6.7": {
+      "name": "libz-rs-sys",
+      "version": "0.6.7",
+      "package_url": "https://github.com/trifectatechfoundation/zlib-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/libz-rs-sys/0.6.7/download",
+          "sha256": "03dcace986b149f29509af6ca70e6182bccce916b644424ecf484faa8ddc899a"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "libz_rs_sys",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "libz_rs_sys",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "rust-allocator",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "zlib-rs 0.6.7",
+              "target": "zlib_rs"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.6.7"
+      },
+      "license": "Zlib",
+      "license_ids": [
+        "Zlib"
+      ],
+      "license_file": "LICENSE"
+    },
     "linux-raw-sys 0.12.1": {
       "name": "linux-raw-sys",
       "version": "0.12.1",
@@ -1663,6 +1717,10 @@
             {
               "id": "libc 0.2.189",
               "target": "libc"
+            },
+            {
+              "id": "libz-rs-sys 0.6.7",
+              "target": "libz_rs_sys"
             },
             {
               "id": "ruzstd 0.9.0",
@@ -3070,14 +3128,14 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "zlib-rs 0.6.6": {
+    "zlib-rs 0.6.7": {
       "name": "zlib-rs",
-      "version": "0.6.6",
+      "version": "0.6.7",
       "package_url": "https://github.com/trifectatechfoundation/zlib-rs",
       "repository": {
         "Http": {
-          "url": "https://static.crates.io/crates/zlib-rs/0.6.6/download",
-          "sha256": "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
+          "url": "https://static.crates.io/crates/zlib-rs/0.6.7/download",
+          "sha256": "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
         }
       },
       "targets": [
@@ -3101,13 +3159,14 @@
         ],
         "crate_features": {
           "common": [
+            "__internal-api",
             "rust-allocator",
             "std"
           ],
           "selects": {}
         },
         "edition": "2021",
-        "version": "0.6.6"
+        "version": "0.6.7"
       },
       "license": "Zlib",
       "license_ids": [
@@ -3267,6 +3326,7 @@
     "clap 4.6.4",
     "flate2 1.1.9",
     "libc 0.2.189",
+    "libz-rs-sys 0.6.7",
     "ruzstd 0.9.0",
     "serde 1.0.229",
     "serde_json 1.0.151",
