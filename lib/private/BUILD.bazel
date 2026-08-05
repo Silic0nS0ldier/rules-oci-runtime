@@ -4,8 +4,12 @@ load(":toolchains.bzl", "current_launcher")
 package(default_visibility = ["//visibility:private"])
 
 # The launcher for the execution platform, used as the layer indexer in
-# `runc_binary` build actions.
-current_launcher(name = "current_launcher")
+# `runc_binary` build actions. Manual: a bare source checkout has no launcher
+# toolchain, so this must only be built on demand as a `runc_binary` dependency.
+current_launcher(
+    name = "current_launcher",
+    tags = ["manual"],
+)
 
 bzl_library(
     name = "runc_binary",
