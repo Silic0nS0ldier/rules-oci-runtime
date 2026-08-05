@@ -81,14 +81,30 @@ def _runc_binary_impl(ctx):
         is_executable = True,
     )
 
+    content = {
+        "layout": _rlocation_path(ctx, layout),
+        "runtime": _rlocation_path(ctx, runtime_toolchain.binary),
+        "args": args,
+    }
+
+    indexes = []
+    if ctx.attr.index:
+        index_dir = ctx.actions.declare_directory(ctx.label.name + ".zinfo")
+        ctx.actions.run(
+            executable = ctx.attr._indexer[DefaultInfo].files_to_run,
+            arguments = ["index", "--layout", layout.path, "--output", index_dir.path],
+            inputs = [layout],
+            outputs = [index_dir],
+            mnemonic = "OciLayerIndex",
+            progress_message = "Indexing gzip layers of %{label}",
+        )
+        content["index"] = _rlocation_path(ctx, index_dir)
+        indexes.append(index_dir)
+
     config = ctx.actions.declare_file(ctx.label.name + ".launch.json")
     ctx.actions.write(
         output = config,
-        content = json.encode({
-            "layout": _rlocation_path(ctx, layout),
-            "runtime": _rlocation_path(ctx, runtime_toolchain.binary),
-            "args": args,
-        }),
+        content = json.encode(content),
     )
 
     runfiles = ctx.runfiles(files = [
@@ -96,7 +112,7 @@ def _runc_binary_impl(ctx):
         config,
         launcher_toolchain.binary,
         runtime_toolchain.binary,
-    ]).merge_all([
+    ] + indexes).merge_all([
         launcher_toolchain.runfiles,
         runtime_toolchain.runfiles,
         ctx.attr.image[DefaultInfo].default_runfiles,
@@ -105,7 +121,7 @@ def _runc_binary_impl(ctx):
     return [
         DefaultInfo(
             executable = launcher,
-            files = depset([launcher, config]),
+            files = depset([launcher, config] + indexes),
             runfiles = runfiles,
         ),
     ]
@@ -139,9 +155,24 @@ container starts, so `$BUILD_WORKSPACE_DIRECTORY:/src:ro` mounts the workspace.
         "read_only": attr.bool(
             doc = "Mount the container root filesystem read-only.",
         ),
+        "index": attr.bool(
+            default = True,
+            doc = """Index the gzip layers at build time so extraction can run in parallel.
+
+Each checkpoint index is a small sidecar in the runfiles tree; the image
+layout and its digests are unchanged. Indexing decompresses every layer once
+per build of the image, so switch it off if build time matters more than
+startup time.
+""",
+        ),
         "data": attr.label_list(
             allow_files = True,
             doc = "Extra files to make available in the runfiles tree, for use with `mounts`.",
+        ),
+        "_indexer": attr.label(
+            default = ":current_launcher",
+            executable = True,
+            cfg = "exec",
         ),
     },
     toolchains = [

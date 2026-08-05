@@ -19,17 +19,27 @@ pub struct Cli {
 pub enum Command {
     /// Unpack an image layout into a bundle and run it.
     Run(Box<RunArgs>),
-    /// Build a parallel-decompression checkpoint index for a gzip blob.
+    /// Build parallel-decompression checkpoint indexes for gzip blobs.
     Index(IndexArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct IndexArgs {
     /// Gzip layer blob to index.
-    #[arg(long, value_name = "PATH")]
-    pub blob: Utf8PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "layout",
+        required_unless_present = "layout"
+    )]
+    pub blob: Option<Utf8PathBuf>,
 
-    /// Where to write the index.
+    /// Image layout whose gzip layers are all indexed, across every platform.
+    #[arg(long, value_name = "DIR")]
+    pub layout: Option<Utf8PathBuf>,
+
+    /// Index file to write for `--blob`, or a directory of `<hex>.zinfo`
+    /// files for `--layout`.
     #[arg(long, value_name = "PATH")]
     pub output: Utf8PathBuf,
 
@@ -47,6 +57,10 @@ pub struct RunArgs {
     /// Path to the OCI runtime binary (runc).
     #[arg(long, value_name = "PATH")]
     pub runtime: Utf8PathBuf,
+
+    /// Directory of layer decompression indexes, one `<hex>.zinfo` per gzip layer.
+    #[arg(long, value_name = "DIR")]
+    pub index: Option<Utf8PathBuf>,
 
     /// Additional environment variables, overriding the image.
     #[arg(long = "env", short = 'e', value_name = "NAME=VALUE")]
@@ -201,6 +215,30 @@ mod tests {
         let args = parse(&["--env", "A=1", "-e", "B=2", "--mount", "/a:/b", "-v", "/c:/d:ro"]);
         assert_eq!(args.env, vec!["A=1", "B=2"]);
         assert_eq!(args.mounts, vec!["/a:/b", "/c:/d:ro"]);
+    }
+
+    #[test]
+    fn index_takes_a_blob_or_a_layout_but_not_both() {
+        let blob = ["oci_runtime", "index", "--blob", "/b", "--output", "/o"];
+        assert!(Cli::try_parse_from(blob).is_ok());
+
+        let layout = ["oci_runtime", "index", "--layout", "/l", "--output", "/o"];
+        assert!(Cli::try_parse_from(layout).is_ok());
+
+        let neither = ["oci_runtime", "index", "--output", "/o"];
+        assert!(Cli::try_parse_from(neither).is_err());
+
+        let both = [
+            "oci_runtime",
+            "index",
+            "--blob",
+            "/b",
+            "--layout",
+            "/l",
+            "--output",
+            "/o",
+        ];
+        assert!(Cli::try_parse_from(both).is_err());
     }
 
     #[test]

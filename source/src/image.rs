@@ -233,6 +233,42 @@ impl Layout {
             .json_context(|| format!("parsing manifest {}", descriptor.digest))
     }
 
+    /// Every manifest reachable from `index.json`, regardless of platform.
+    pub fn all_manifests(&self) -> Result<Vec<Manifest>> {
+        let mut queue = vec![self.read_index()?.manifests];
+        let mut manifests = Vec::new();
+        let mut depth = 0usize;
+
+        while let Some(descriptors) = queue.pop() {
+            depth += 1;
+            if depth > 8 {
+                return Err(Error::Layout("image index nested too deeply".to_string()));
+            }
+            for descriptor in descriptors {
+                match descriptor.media_type.as_str() {
+                    MEDIA_TYPE_OCI_INDEX | MEDIA_TYPE_DOCKER_LIST => {
+                        let bytes = self.read_metadata_blob(&descriptor)?;
+                        let index: Index = serde_json::from_slice(&bytes)
+                            .json_context(|| format!("parsing index {}", descriptor.digest))?;
+                        queue.push(index.manifests);
+                    }
+                    MEDIA_TYPE_OCI_MANIFEST | MEDIA_TYPE_DOCKER_MANIFEST | "" => {
+                        let bytes = self.read_metadata_blob(&descriptor)?;
+                        manifests.push(
+                            serde_json::from_slice(&bytes).json_context(|| {
+                                format!("parsing manifest {}", descriptor.digest)
+                            })?,
+                        );
+                    }
+                    other => {
+                        crate::log::log!("ignoring descriptor with media type {other}");
+                    }
+                }
+            }
+        }
+        Ok(manifests)
+    }
+
     fn resolve_manifest_descriptor(&self, platform: &Platform) -> Result<Descriptor> {
         let mut queue = vec![self.read_index()?.manifests];
         let mut available = Vec::new();
