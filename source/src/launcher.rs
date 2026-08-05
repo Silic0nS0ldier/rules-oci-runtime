@@ -16,6 +16,8 @@ struct Config {
     layout: String,
     runtime: String,
     #[serde(default)]
+    index: Option<String>,
+    #[serde(default)]
     args: Vec<String>,
 }
 
@@ -72,6 +74,10 @@ impl Config {
             "--runtime".to_string(),
             runfiles.join(&self.runtime).into_string(),
         ];
+        if let Some(index) = &self.index {
+            argv.push("--index".to_string());
+            argv.push(runfiles.join(index).into_string());
+        }
         argv.extend(self.args.iter().cloned());
         argv.extend(user.iter().cloned());
         argv
@@ -110,6 +116,19 @@ mod tests {
                 "/tmp/rf/tools/runc",
                 "--read-only",
             ]
+        );
+    }
+
+    #[test]
+    fn an_index_directory_is_resolved_and_passed_through() {
+        let config: Config = serde_json::from_str(
+            r#"{"layout": "l", "runtime": "r", "index": "ws/pkg/container.zinfo"}"#,
+        )
+        .expect("config");
+        let argv = config.command_line("launcher", Utf8Path::new("/tmp/rf"), &[]);
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            ["--index", "/tmp/rf/ws/pkg/container.zinfo"]
         );
     }
 

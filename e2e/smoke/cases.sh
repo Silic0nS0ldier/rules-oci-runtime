@@ -137,6 +137,38 @@ case_hostname_and_hosts() {
   assert_equals "container" "$output" "default hostname"
 }
 
+case_layer_indexes() {
+  local config="${container}.launch.json"
+  local index_path
+  index_path=$(sed -n 's/.*"index":"\([^"]*\)".*/\1/p' "$config")
+  if [[ -z "$index_path" ]]; then
+    fail "no index entry in $(cat "$config")"
+    return
+  fi
+
+  local index_dir="${runfiles}/${index_path}"
+  local count=0 entry
+  for entry in "$index_dir"/*; do
+    count=$((count + 1))
+    if [[ ! "$(basename "$entry")" =~ ^[0-9a-f]{64}\.zinfo$ ]]; then
+      fail "unexpected index entry ${entry}"
+    fi
+    if [[ ! -s "$entry" ]]; then
+      fail "index ${entry} is empty"
+    fi
+  done
+  if [[ "$count" -eq 0 ]]; then
+    fail "no layer indexes in ${index_dir}"
+  fi
+
+  # The launcher must be told about the sidecar directory.
+  local stderr
+  RULES_OCI_RUNTIME_VERBOSE=1 "$container" /bin/true </dev/null 2>"${TEST_TMPDIR}/index.err" ||
+    fail "container failed"
+  stderr=$(cat "${TEST_TMPDIR}/index.err")
+  assert_contains "$stderr" "Layer indexes available at" "launcher sees the index directory"
+}
+
 case_rootfs_contents() {
   local output
   output=$("$container" /bin/sh -c 'cat /etc/alpine-release; test -L /bin/sh && echo sh-is-a-symlink' </dev/null)
