@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
@@ -17,6 +18,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::fsutil;
 use crate::image::{Descriptor, Layout, hex_encode, parse_digest};
 use crate::log::{log, warning};
+use crate::zinfo;
 
 const WHITEOUT_PREFIX: &str = ".wh.";
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
@@ -31,16 +33,18 @@ const PIPELINE_DEPTH: usize = 8;
 /// directories in one layer do not block writes from the next.
 pub struct RootfsExtractor {
     rootfs: Utf8PathBuf,
+    index_dir: Option<Utf8PathBuf>,
     deferred_modes: Vec<(PathBuf, u32)>,
     parents: fsutil::ParentCache,
 }
 
 impl RootfsExtractor {
-    pub fn new(rootfs: &Utf8Path) -> Result<Self> {
+    pub fn new(rootfs: &Utf8Path, index_dir: Option<&Utf8Path>) -> Result<Self> {
         fs::create_dir_all(rootfs).io_context(|| format!("creating {rootfs}"))?;
         Ok(RootfsExtractor {
             parents: fsutil::ParentCache::new(rootfs.as_std_path())?,
             rootfs: rootfs.to_owned(),
+            index_dir: index_dir.map(Utf8Path::to_owned),
             deferred_modes: Vec::new(),
         })
     }
@@ -49,14 +53,30 @@ impl RootfsExtractor {
     /// second thread inflates the blob while this one writes the entries. The
     /// two overlap rather than run back to back, which on a large layer is
     /// worth roughly the whole decompression time.
+    ///
+    /// With a checkpoint index the inflating side additionally spreads over
+    /// the idle cores, since checkpoints let disjoint spans of one gzip
+    /// member decompress independently.
     pub fn apply_layer(&mut self, layout: &Layout, descriptor: &Descriptor) -> Result<()> {
-        log!("Extracting layer {} ({})", descriptor.digest, descriptor.media_type);
+        let index = self.layer_index(descriptor);
+        match &index {
+            Some(index) => log!(
+                "Extracting layer {} ({}) using {} checkpoints",
+                descriptor.digest,
+                descriptor.media_type,
+                index.checkpoints.len()
+            ),
+            None => log!("Extracting layer {} ({})", descriptor.digest, descriptor.media_type),
+        }
 
         let file = layout.open_blob(descriptor)?;
         let digest = descriptor.digest.clone();
         let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
         let owned = descriptor.clone();
-        let inflate = thread::spawn(move || inflate_blob(file, &owned, sender));
+        let inflate = thread::spawn(move || match index {
+            Some(index) => inflate_indexed(file, &index, &owned, sender),
+            None => inflate_blob(file, &owned, sender),
+        });
 
         let mut reader = ChunkReader::new(receiver);
         let mut unpacked = self.unpack(&mut reader, &digest);
@@ -76,6 +96,38 @@ impl RootfsExtractor {
                 "decompressing a layer",
                 io::Error::other("the decompression thread panicked"),
             )),
+        }
+    }
+
+    /// The checkpoint index for this layer, when there is one and parallel
+    /// decompression can put it to use. An index is an optimisation, so
+    /// anything wrong with it means falling back, not failing: the streaming
+    /// path decides what the blob actually contains.
+    fn layer_index(&self, descriptor: &Descriptor) -> Option<zinfo::Index> {
+        let dir = self.index_dir.as_ref()?;
+        if compression_of(&descriptor.media_type) != Some(Compression::Gzip) {
+            return None;
+        }
+        if thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+            return None;
+        }
+        let hex = parse_digest(&descriptor.digest).ok()?.hex;
+        let path = dir.join(format!("{hex}.zinfo"));
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+            Err(err) => {
+                warning!("ignoring layer index {path}: {err}");
+                return None;
+            }
+        };
+        match zinfo::Index::read_from(io::BufReader::new(file)) {
+            Ok(index) if index.checkpoints.len() > 1 => Some(index),
+            Ok(_) => None,
+            Err(err) => {
+                warning!("ignoring layer index {path}: {err}");
+                None
+            }
         }
     }
 
@@ -449,6 +501,111 @@ fn inflate_blob(
     Ok(())
 }
 
+/// Runs on the decompression thread when the layer has a checkpoint index:
+/// inflates disjoint spans of the blob on every available core and hands them
+/// to `sender` in order. Spans need random access, so the whole compressed
+/// blob is read up front; hashing it for the digest check then happens over
+/// the same bytes on a thread of its own, instead of alongside the read.
+fn inflate_indexed(
+    mut file: fs::File,
+    index: &zinfo::Index,
+    descriptor: &Descriptor,
+    sender: SyncSender<io::Result<Vec<u8>>>,
+) -> Result<()> {
+    let capacity = file.metadata().map_or(0, |m| m.len()) as usize;
+    let mut blob = Vec::with_capacity(capacity);
+    if let Err(err) = file.read_to_end(&mut blob) {
+        let _ = sender.send(Err(io::Error::other(err.to_string())));
+        return Err(Error::io(
+            format!("reading layer {}", descriptor.digest),
+            err,
+        ));
+    }
+
+    let spans = index.checkpoints.len();
+    let workers = thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(spans);
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+
+    let mut span_error = None;
+    let digest = thread::scope(|scope| {
+        let hashing = scope.spawn(|| Sha256::digest(&blob));
+
+        // Workers claim span indices; completed spans are put back in order
+        // here. The channel bound plus one finished span per worker caps how
+        // far decompression runs ahead of the writer.
+        let (span_sender, span_receiver) = sync_channel::<(usize, Result<Vec<u8>>)>(workers);
+        for _ in 0..workers {
+            let span_sender = span_sender.clone();
+            let (blob, next, stop) = (&blob, &next, &stop);
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= spans {
+                        break;
+                    }
+                    let result = index.extract_span(blob, i);
+                    let failed = result.is_err();
+                    if span_sender.send((i, result)).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(span_sender);
+
+        let mut pending = std::collections::HashMap::new();
+        let mut want = 0;
+        'reorder: while let Ok((i, result)) = span_receiver.recv() {
+            pending.insert(i, result);
+            while let Some(result) = pending.remove(&want) {
+                want += 1;
+                match result {
+                    Ok(span) => {
+                        if sender.send(Ok(span)).is_err() {
+                            // The writer stopped; it has an error of its own.
+                            stop.store(true, Ordering::Relaxed);
+                            break 'reorder;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = sender.send(Err(io::Error::other(err.to_string())));
+                        span_error = Some(err);
+                        stop.store(true, Ordering::Relaxed);
+                        break 'reorder;
+                    }
+                }
+            }
+        }
+        // Dropping the receiver at the end of the scope unblocks any worker
+        // still sending, so the implicit joins cannot deadlock.
+        hashing.join().unwrap_or_default()
+    });
+
+    // The digest verdict comes first: a blob that fails it explains any span
+    // error, since the index describes the blob the descriptor names.
+    if descriptor.size != 0 && descriptor.size != blob.len() as u64 {
+        return Err(Error::SizeMismatch {
+            digest: descriptor.digest.clone(),
+            expected: descriptor.size,
+            actual: blob.len() as u64,
+        });
+    }
+    let actual = hex_encode(&digest);
+    if actual != parse_digest(&descriptor.digest)?.hex {
+        return Err(Error::DigestMismatch {
+            digest: descriptor.digest.clone(),
+            actual,
+        });
+    }
+    match span_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 /// Presents the inflated chunks as a stream for `tar` to walk.
 struct ChunkReader {
     chunks: Receiver<io::Result<Vec<u8>>>,
@@ -660,9 +817,17 @@ mod tests {
     }
 
     fn extract(root: &Utf8Path, descriptor: &Descriptor) -> Result<Utf8PathBuf> {
+        extract_indexed(root, descriptor, None)
+    }
+
+    fn extract_indexed(
+        root: &Utf8Path,
+        descriptor: &Descriptor,
+        index_dir: Option<&Utf8Path>,
+    ) -> Result<Utf8PathBuf> {
         let layout = Layout::open(root)?;
         let rootfs = root.join("rootfs");
-        let mut extractor = RootfsExtractor::new(&rootfs)?;
+        let mut extractor = RootfsExtractor::new(&rootfs, index_dir)?;
         extractor.apply_layer(&layout, descriptor)?;
         extractor.finish()?;
         Ok(rootfs)
@@ -954,6 +1119,175 @@ mod tests {
         match extract(&root, &descriptor) {
             Err(Error::UnsupportedMediaType(_)) => {}
             other => panic!("expected an unsupported media type, got {other:?}"),
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    /// Compressible but non-repeating, so deflate emits many dynamic blocks
+    /// and a small span yields plenty of checkpoints.
+    fn random_bytes(len: usize) -> Vec<u8> {
+        let words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let mut out = Vec::with_capacity(len + 16);
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        while out.len() < len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            out.extend_from_slice(words[(state >> 33) as usize % words.len()].as_bytes());
+            out.extend_from_slice(state.to_le_bytes()[..3].as_ref());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// A tar large enough for several spans: one incompressible file plus the
+    /// small entries the pipeline tests use.
+    fn multi_span_tar() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let random = random_bytes(1 << 20);
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(random.len() as u64);
+        builder
+            .append_data(&mut header, "random", &random[..])
+            .expect("random");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o600);
+        header.set_size(5);
+        builder
+            .append_data(&mut header, "small", &b"hello"[..])
+            .expect("small");
+        builder.into_inner().expect("tar")
+    }
+
+    /// Compresses at the default level; `gzip` above uses the fast level,
+    /// which emits too few deflate block boundaries to checkpoint.
+    fn gzip_default(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).expect("compress");
+        encoder.finish().expect("compress")
+    }
+
+    /// Builds a checkpoint index for the blob and installs it where the
+    /// extractor looks, returning the index directory.
+    fn install_index(root: &Utf8Path, descriptor: &Descriptor, blob: &[u8]) -> Utf8PathBuf {
+        let index = zinfo::Index::build(blob, 64 * 1024).expect("index");
+        assert!(
+            index.checkpoints.len() > 2,
+            "the sample must produce several checkpoints, got {}",
+            index.checkpoints.len()
+        );
+        let dir = root.join("indexes");
+        fs::create_dir_all(&dir).expect("index dir");
+        let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+        let mut bytes = Vec::new();
+        index.write_to(&mut bytes).expect("serialise");
+        fs::write(dir.join(format!("{hex}.zinfo")), bytes).expect("install index");
+        dir
+    }
+
+    #[test]
+    fn an_indexed_layer_extracts_the_same_bytes() {
+        let root = scratch("indexed");
+        let tar = multi_span_tar();
+        let blob = gzip_default(&tar);
+        let descriptor = install_blob(&root, GZIP_LAYER, &blob);
+        let dir = install_index(&root, &descriptor, &blob);
+
+        let rootfs = extract_indexed(&root, &descriptor, Some(&dir)).expect("extract");
+        assert_eq!(
+            fs::read(rootfs.join("random")).expect("random"),
+            random_bytes(1 << 20),
+            "indexed extraction must reproduce the exact bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("small")).expect("small"),
+            "hello"
+        );
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_layer_without_an_index_file_streams_as_before() {
+        let root = scratch("indexed-absent");
+        let blob = gzip_default(&multi_span_tar());
+        let descriptor = install_blob(&root, GZIP_LAYER, &blob);
+        let dir = root.join("indexes");
+        fs::create_dir_all(&dir).expect("empty index dir");
+
+        let rootfs = extract_indexed(&root, &descriptor, Some(&dir)).expect("extract");
+        assert_eq!(
+            fs::read_to_string(rootfs.join("small")).expect("small"),
+            "hello"
+        );
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_tampered_index_fails_the_extraction() {
+        let root = scratch("indexed-tampered");
+        let blob = gzip_default(&multi_span_tar());
+        let descriptor = install_blob(&root, GZIP_LAYER, &blob);
+        let dir = install_index(&root, &descriptor, &blob);
+
+        // Flip the first checkpoint's span CRC (after magic, length and count).
+        let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+        let path = dir.join(format!("{hex}.zinfo"));
+        let mut bytes = fs::read(&path).expect("index");
+        bytes[32] ^= 0xff;
+        fs::write(&path, bytes).expect("index");
+
+        let err = extract_indexed(&root, &descriptor, Some(&dir))
+            .expect_err("a corrupt index must not extract");
+        assert!(
+            err.to_string().contains("span checksum"),
+            "expected a span checksum failure, got {err}"
+        );
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn an_index_for_another_blob_is_an_error_not_a_panic() {
+        let root = scratch("indexed-stale");
+        let blob = gzip_default(&multi_span_tar());
+        let descriptor = install_blob(&root, GZIP_LAYER, &blob);
+
+        // An index built from a different, shorter blob: checkpoints point
+        // into compressed bytes that do not exist.
+        let other = gzip_default(&random_bytes(512 * 1024));
+        let index = zinfo::Index::build(&other, 64 * 1024).expect("index");
+        let dir = root.join("indexes");
+        fs::create_dir_all(&dir).expect("index dir");
+        let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+        let mut bytes = Vec::new();
+        index.write_to(&mut bytes).expect("serialise");
+        fs::write(dir.join(format!("{hex}.zinfo")), bytes).expect("install index");
+
+        assert!(extract_indexed(&root, &descriptor, Some(&dir)).is_err());
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_digest_mismatch_wins_over_index_errors() {
+        let root = scratch("indexed-digest");
+        let blob = gzip_default(&multi_span_tar());
+        let descriptor = install_blob(&root, GZIP_LAYER, &blob);
+        let dir = install_index(&root, &descriptor, &blob);
+
+        // Replace the blob: the index no longer matches, but the reason is
+        // that the blob is not what the descriptor promised.
+        let altered = gzip_default(&random_bytes(1 << 20));
+        let path = Layout::open(&root)
+            .expect("layout")
+            .blob_path(&descriptor.digest)
+            .expect("blob path");
+        fs::write(&path, &altered).expect("blob");
+        let mut descriptor = descriptor;
+        descriptor.size = altered.len() as u64;
+
+        match extract_indexed(&root, &descriptor, Some(&dir)) {
+            Err(Error::DigestMismatch { .. }) => {}
+            other => panic!("expected a digest mismatch, got {other:?}"),
         }
         let _ = fsutil::force_remove_dir_all(root.as_std_path());
     }

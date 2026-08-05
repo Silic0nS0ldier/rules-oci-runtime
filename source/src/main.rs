@@ -57,10 +57,6 @@ fn run(args: RunArgs) -> Result<i32> {
     log!("Reading image {} for {platform}", layout.root());
 
     let manifest = layout.resolve_manifest(&platform)?;
-    if let Some(index) = &args.index {
-        // Read by the parallel extraction path once it lands.
-        log!("Layer indexes available at {index}");
-    }
     let image_config = layout.read_image_config(&manifest)?;
     if let Some(user) = image_config.user.as_deref()
         && !matches!(user, "" | "0" | "root" | "0:0" | "root:root")
@@ -81,7 +77,7 @@ fn run(args: RunArgs) -> Result<i32> {
     log!("Using {} for the container bundle", bundle.dir());
 
     let rootfs = bundle.rootfs();
-    let mut extractor = RootfsExtractor::new(&rootfs)?;
+    let mut extractor = RootfsExtractor::new(&rootfs, args.index.as_deref())?;
     for layer in &manifest.layers {
         extractor.apply_layer(&layout, layer)?;
     }

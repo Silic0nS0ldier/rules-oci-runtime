@@ -161,12 +161,16 @@ case_layer_indexes() {
     fail "no layer indexes in ${index_dir}"
   fi
 
-  # The launcher must be told about the sidecar directory.
+  # The launcher must actually consume the indexes during extraction. It
+  # deliberately ignores them on a single core, where they cannot help.
+  if [[ "$(nproc)" -lt 2 ]]; then
+    return
+  fi
   local stderr
   RULES_OCI_RUNTIME_VERBOSE=1 "$container" /bin/true </dev/null 2>"${TEST_TMPDIR}/index.err" ||
     fail "container failed"
   stderr=$(cat "${TEST_TMPDIR}/index.err")
-  assert_contains "$stderr" "Layer indexes available at" "launcher sees the index directory"
+  assert_contains "$stderr" "checkpoints" "layers extract via their indexes"
 }
 
 case_rootfs_contents() {
