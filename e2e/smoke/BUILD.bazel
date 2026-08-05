@@ -39,6 +39,7 @@ CASES = [
     "exit_code",
     "hostname_and_hosts",
     "image_env",
+    "layer_indexes",
     "missing_command",
     "read_only_rootfs",
     "rootfs_contents",

@@ -84,3 +84,29 @@ container_runtime_toolchain = rule(
     doc = _CONTAINER_RUNTIME_DOC,
     attrs = {"binary": _binary_attr("The container runtime executable.")},
 )
+
+def _current_launcher_impl(ctx):
+    # type: (ctx) -> list
+    toolchain = ctx.toolchains[LAUNCHER_TOOLCHAIN_TYPE]
+    executable = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.symlink(
+        output = executable,
+        target_file = toolchain.binary,
+        is_executable = True,
+    )
+    return [
+        DefaultInfo(
+            executable = executable,
+            runfiles = toolchain.runfiles,
+        ),
+    ]
+
+# The launcher from the resolved toolchain as an ordinary executable target.
+# Depended on with `cfg = "exec"`, it provides the launcher for the platform
+# running the build, which the target-configured toolchain of `runc_binary`
+# cannot: build actions such as layer indexing need that.
+current_launcher = rule(
+    implementation = _current_launcher_impl,
+    executable = True,
+    toolchains = [LAUNCHER_TOOLCHAIN_TYPE],
+)

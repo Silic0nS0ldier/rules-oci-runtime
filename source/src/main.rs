@@ -11,7 +11,7 @@ mod spec;
 mod sys;
 mod zinfo;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 
 use crate::bundle::Bundle;
@@ -57,6 +57,10 @@ fn run(args: RunArgs) -> Result<i32> {
     log!("Reading image {} for {platform}", layout.root());
 
     let manifest = layout.resolve_manifest(&platform)?;
+    if let Some(index) = &args.index {
+        // Read by the parallel extraction path once it lands.
+        log!("Layer indexes available at {index}");
+    }
     let image_config = layout.read_image_config(&manifest)?;
     if let Some(user) = image_config.user.as_deref()
         && !matches!(user, "" | "0" | "root" | "0:0" | "root:root")
@@ -135,15 +139,47 @@ fn run(args: RunArgs) -> Result<i32> {
 }
 
 fn index(args: IndexArgs) -> Result<i32> {
-    let blob = std::fs::read(&args.blob)
-        .map_err(|source| Error::io(format!("reading {}", args.blob), source))?;
-    let index = zinfo::Index::build(&blob, args.span)?;
-    let file = std::fs::File::create(&args.output)
-        .map_err(|source| Error::io(format!("creating {}", args.output), source))?;
+    if let Some(blob) = &args.blob {
+        index_blob(blob, &args.output, args.span)?;
+    } else if let Some(layout) = &args.layout {
+        index_layout(layout, &args.output, args.span)?;
+    }
+    Ok(0)
+}
+
+fn index_blob(blob: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
+    let bytes =
+        std::fs::read(blob).map_err(|source| Error::io(format!("reading {blob}"), source))?;
+    let index = zinfo::Index::build(&bytes, span)?;
+    let file = std::fs::File::create(output)
+        .map_err(|source| Error::io(format!("creating {output}"), source))?;
     index
         .write_to(std::io::BufWriter::new(file))
-        .map_err(|source| Error::io(format!("writing {}", args.output), source))?;
-    Ok(0)
+        .map_err(|source| Error::io(format!("writing {output}"), source))
+}
+
+/// Indexes every gzip layer of every manifest in the layout, so a
+/// multi-architecture image gets indexes for whichever platform runs it.
+fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
+    let layout = Layout::open(layout)?;
+    std::fs::create_dir_all(output)
+        .map_err(|source| Error::io(format!("creating {output}"), source))?;
+
+    let mut indexed = std::collections::HashSet::new();
+    for manifest in layout.all_manifests()? {
+        for layer in &manifest.layers {
+            if extract::compression_of(&layer.media_type) != Some(extract::Compression::Gzip) {
+                continue;
+            }
+            let hex = image::parse_digest(&layer.digest)?.hex;
+            if !indexed.insert(hex.clone()) {
+                continue;
+            }
+            let blob = layout.blob_path(&layer.digest)?;
+            index_blob(&blob, &output.join(format!("{hex}.zinfo")), span)?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_platform(value: Option<&str>) -> Result<Platform> {
@@ -198,6 +234,95 @@ mod tests {
                 parse_platform(Some(value)).is_err(),
                 "expected {value:?} to be rejected"
             );
+        }
+    }
+
+    mod indexing {
+        use std::io::Write;
+
+        use sha2::{Digest, Sha256};
+
+        use super::super::*;
+
+        fn scratch(name: &str) -> Utf8PathBuf {
+            let dir = Utf8PathBuf::from(std::env::temp_dir().to_str().expect("utf-8 tmpdir"))
+                .join(format!("oci-runtime-index-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("blobs/sha256")).expect("create layout");
+            std::fs::write(dir.join("oci-layout"), "{}").expect("oci-layout");
+            dir
+        }
+
+        /// Stores `bytes` under its digest and returns a descriptor JSON fragment.
+        fn install_blob(root: &Utf8Path, media_type: &str, bytes: &[u8]) -> String {
+            let hex = image::hex_encode(&Sha256::digest(bytes));
+            std::fs::write(root.join("blobs/sha256").join(&hex), bytes).expect("write blob");
+            format!(
+                r#"{{"mediaType": "{media_type}", "digest": "sha256:{hex}", "size": {}}}"#,
+                bytes.len()
+            )
+        }
+
+        fn gzip(bytes: &[u8]) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(bytes).expect("compress");
+            encoder.finish().expect("finish")
+        }
+
+        #[test]
+        fn a_layout_gets_one_index_per_gzip_layer() {
+            let root = scratch("layout");
+            let gzip_layer = gzip(b"pretend this is a tar");
+            let gzip_hex = image::hex_encode(&Sha256::digest(&gzip_layer));
+
+            let gzip_descriptor = install_blob(
+                &root,
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                &gzip_layer,
+            );
+            let plain_descriptor = install_blob(
+                &root,
+                "application/vnd.oci.image.layer.v1.tar",
+                b"uncompressed tar",
+            );
+            let config_descriptor =
+                install_blob(&root, "application/vnd.oci.image.config.v1+json", b"{}");
+            // The gzip layer appears twice, as in a multi-platform image
+            // sharing a base layer: it must be indexed once.
+            let manifest = format!(
+                r#"{{"config": {config_descriptor}, "layers": [{gzip_descriptor}, {plain_descriptor}, {gzip_descriptor}]}}"#,
+            );
+            let manifest_descriptor = install_blob(
+                &root,
+                "application/vnd.oci.image.manifest.v1+json",
+                manifest.as_bytes(),
+            );
+            std::fs::write(
+                root.join("index.json"),
+                format!(r#"{{"manifests": [{manifest_descriptor}]}}"#),
+            )
+            .expect("index.json");
+
+            let output = root.join("indexes");
+            index_layout(&root, &output, 4 << 20).expect("index the layout");
+
+            let entries: Vec<String> = std::fs::read_dir(&output)
+                .expect("read output")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .into_string()
+                        .expect("utf-8")
+                })
+                .collect();
+            assert_eq!(entries, [format!("{gzip_hex}.zinfo")]);
+
+            let file = std::fs::File::open(output.join(&entries[0])).expect("open index");
+            zinfo::Index::read_from(std::io::BufReader::new(file)).expect("a well-formed index");
+
+            std::fs::remove_dir_all(&root).expect("cleanup");
         }
     }
 }
