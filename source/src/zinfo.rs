@@ -8,10 +8,6 @@
 //! digests only cover the compressed bytes, so a corrupt index would otherwise
 //! corrupt the rootfs silently.
 
-// The resume side is only exercised by tests until the parallel extraction
-// path lands; remove with that change.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::io::{self, Read, Write};
 
 use crate::error::{Error, Result};
@@ -137,6 +133,15 @@ impl Index {
             .map_or(self.uncompressed_len, |next| next.out_offset);
         let len = (end - point.out_offset) as usize;
 
+        // The index describes the blob its digest names, but the blob handed
+        // in could still be another file entirely.
+        if point.in_offset as usize > blob.len() || (point.bits != 0 && point.in_offset == 0) {
+            return Err(Error::io(
+                context,
+                io::Error::other(format!("checkpoint {i} lies beyond the blob")),
+            ));
+        }
+
         // An empty window is a stream or member start: parse the header there.
         let at_header = point.window.is_empty() && point.bits == 0;
         let mut inflater = Inflater::new(if at_header {
@@ -258,6 +263,9 @@ impl Index {
                 window,
                 crc,
             });
+        }
+        if previous.is_some_and(|(_, o)| uncompressed_len < o) {
+            return Err(io::Error::other("checkpoints out of order"));
         }
         Ok(Index {
             uncompressed_len,
