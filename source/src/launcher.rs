@@ -129,7 +129,9 @@ mod tests {
             Utf8Path::new("/tmp/rf"),
             &["/bin/echo".to_string(), "--not-a-flag".to_string()],
         );
-        let crate::cli::Command::Run(args) = crate::cli::Cli::parse_from(argv).command;
+        let crate::cli::Command::Run(args) = crate::cli::Cli::parse_from(argv).command else {
+            panic!("synthesised command line must parse as `run`");
+        };
         assert_eq!(args.layout, "/tmp/rf/ws/pkg/image");
         assert_eq!(args.runtime, "/tmp/rf/tools/runc");
         assert!(args.read_only);
