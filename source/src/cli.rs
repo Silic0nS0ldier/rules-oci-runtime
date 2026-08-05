@@ -19,6 +19,23 @@ pub struct Cli {
 pub enum Command {
     /// Unpack an image layout into a bundle and run it.
     Run(Box<RunArgs>),
+    /// Build a parallel-decompression checkpoint index for a gzip blob.
+    Index(IndexArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct IndexArgs {
+    /// Gzip layer blob to index.
+    #[arg(long, value_name = "PATH")]
+    pub blob: Utf8PathBuf,
+
+    /// Where to write the index.
+    #[arg(long, value_name = "PATH")]
+    pub output: Utf8PathBuf,
+
+    /// Target uncompressed distance between checkpoints, in bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = 4 << 20)]
+    pub span: u64,
 }
 
 #[derive(Debug, Args)]
@@ -155,6 +172,7 @@ mod tests {
         argv.extend_from_slice(args);
         match Cli::try_parse_from(argv).expect("parse").command {
             Command::Run(args) => *args,
+            other => panic!("expected `run`, parsed {other:?}"),
         }
     }
 
