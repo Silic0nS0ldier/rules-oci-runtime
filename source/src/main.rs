@@ -23,6 +23,10 @@ use crate::log::log;
 use crate::runtime::{ContainerRuntime, RunRequest, Runc};
 use crate::spec::{BindMount, Spec, SpecOptions};
 
+/// Indexing holds a whole blob and its index in memory per worker, so the
+/// build action stays within a sensible footprint on a many core machine.
+const MAX_INDEX_WORKERS: usize = 4;
+
 fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     if let Some(path) = bundle::remover_target(&argv) {
@@ -144,9 +148,25 @@ fn index(args: IndexArgs) -> Result<i32> {
 }
 
 fn index_blob(blob: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
-    let bytes =
-        std::fs::read(blob).map_err(|source| Error::io(format!("reading {blob}"), source))?;
-    let index = zinfo::Index::build(&bytes, span)?;
+    let file =
+        std::fs::File::open(blob).map_err(|source| Error::io(format!("opening {blob}"), source))?;
+    let len = file.metadata().map_or(0, |m| m.len()) as usize;
+    let mapped = sys::Mapping::of(&file, len);
+    let mut read = Vec::new();
+    if mapped.is_none() {
+        std::io::Read::read_to_end(&mut &file, &mut read)
+            .map_err(|source| Error::io(format!("reading {blob}"), source))?;
+    }
+    let bytes: &[u8] = match &mapped {
+        Some(mapping) => mapping,
+        None => &read,
+    };
+    let index = zinfo::Index::build(bytes, span).map_err(|source| match source {
+        // Which blob failed matters more than usual here: this runs as a build
+        // action over every layer of an image at once.
+        Error::Io { context, source } => Error::io(format!("{context} {blob}"), source),
+        other => other,
+    })?;
     let file = std::fs::File::create(output)
         .map_err(|source| Error::io(format!("creating {output}"), source))?;
     index
@@ -156,12 +176,17 @@ fn index_blob(blob: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
 
 /// Indexes every gzip layer of every manifest in the layout, so a
 /// multi-architecture image gets indexes for whichever platform runs it.
+///
+/// Blobs are independent, so they are indexed concurrently. This runs as a
+/// build action once per image, where the whole point is to spend time now
+/// instead of at every container start.
 fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
     let layout = Layout::open(layout)?;
     std::fs::create_dir_all(output)
         .map_err(|source| Error::io(format!("creating {output}"), source))?;
 
     let mut indexed = std::collections::HashSet::new();
+    let mut work = Vec::new();
     for manifest in layout.all_manifests()? {
         for layer in &manifest.layers {
             if extract::compression_of(&layer.media_type) != Some(extract::Compression::Gzip) {
@@ -172,7 +197,39 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
                 continue;
             }
             let blob = layout.blob_path(&layer.digest)?;
-            index_blob(&blob, &output.join(format!("{hex}.zinfo")), span)?;
+            work.push((blob, output.join(format!("{hex}.zinfo"))));
+        }
+    }
+
+    // Each worker holds one blob and the index it is building, so the width is
+    // capped rather than following the core count.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(work.len())
+        .min(MAX_INDEX_WORKERS);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<Result<()>>>> =
+        work.iter().map(|_| std::sync::Mutex::new(None)).collect();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (work, next, results) = (&work, &next, &results);
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((blob, output)) = work.get(i) else { break };
+                    let result = index_blob(blob, output, span);
+                    *results[i].lock().expect("index result") = Some(result);
+                }
+            });
+        }
+    });
+
+    // Reported in layout order, so the same broken layout always fails the
+    // same way however the work happened to be scheduled.
+    for result in results {
+        if let Some(result) = result.into_inner().expect("index result") {
+            result?;
         }
     }
     Ok(())
@@ -317,6 +374,52 @@ mod tests {
 
             let file = std::fs::File::open(output.join(&entries[0])).expect("open index");
             zinfo::Index::read_from(std::io::BufReader::new(file)).expect("a well-formed index");
+
+            std::fs::remove_dir_all(&root).expect("cleanup");
+        }
+
+        /// Blobs are indexed concurrently, so which failure surfaces must come
+        /// from the layout rather than from whichever worker finished first.
+        #[test]
+        fn the_first_broken_layer_in_the_layout_is_the_one_reported() {
+            let root = scratch("broken");
+            // Both are truncated gzip streams, so both fail to index.
+            let first = install_blob(
+                &root,
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                &gzip(b"first")[..12],
+            );
+            let second = install_blob(
+                &root,
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                &gzip(b"second")[..12],
+            );
+            let config_descriptor =
+                install_blob(&root, "application/vnd.oci.image.config.v1+json", b"{}");
+            assert_ne!(first, second, "the two layers must be distinct blobs");
+            let manifest = format!(
+                r#"{{"config": {config_descriptor}, "layers": [{first}, {second}]}}"#
+            );
+            let manifest_descriptor = install_blob(
+                &root,
+                "application/vnd.oci.image.manifest.v1+json",
+                manifest.as_bytes(),
+            );
+            std::fs::write(
+                root.join("index.json"),
+                format!(r#"{{"manifests": [{manifest_descriptor}]}}"#),
+            )
+            .expect("index.json");
+
+            let first_hex = image::hex_encode(&Sha256::digest(&gzip(b"first")[..12]));
+            for _ in 0..8 {
+                let err = index_layout(&root, &root.join("indexes"), 4 << 20)
+                    .expect_err("a truncated blob cannot be indexed");
+                assert!(
+                    err.to_string().contains(&first_hex),
+                    "expected the first layer to be reported, got {err}"
+                );
+            }
 
             std::fs::remove_dir_all(&root).expect("cleanup");
         }
