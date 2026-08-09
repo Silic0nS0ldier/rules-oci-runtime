@@ -1,10 +1,15 @@
 # `rules_oci_runtime`
 
-**WIP**: Bazel rules for running OCI container images (currently using [`runc`](https://github.com/opencontainers/runc)).
+> [!CAUTION]
+> This repository is in a proof-of-concept, vibe-coded state.
+> It has not been security hardened and is not production ready.
+> Time permitting, the plan is to conduct a full rewrite and thorough audit once (and if) value is demonstrated.
 
-The API is still being refined, so releases are published to GitHub rather than
-to the Bazel Central Registry. Each release quotes the snippet to copy, with the
-version and hash filled in:
+Bazel rules for running OCI images defined by [`@rules_oci`](https://github.com/bazel-contrib/rules_oci) _without_ relying on a heavy weight orchestrator like Docker or Podman, instead running an [OCI compliant runtime](https://github.com/opencontainers/runtime-spec) (e.g. [`runc`](https://github.com/opencontainers/runc)) directly.
+
+The ruleset works but is not final, so releases are currently only published to GitHub (not BCR).
+
+## Usage
 
 ```starlark
 # MODULE.bazel
@@ -36,12 +41,37 @@ Target //:container up-to-date:
 Hello, world!
 ```
 
-As with Docker/OCI runtimes, arguments passed after `--` replace the image `Cmd`.
+## Why?
 
-Set `RULES_OCI_RUNTIME_VERBOSE=1` to log container setup to stderr.
+- No dependencies on Docker/Podman.
+- Easy to use in devcontainers, only requiring `"privileged": true,`.
+
+## How it works
+
+The image layout directory produced by `rules_oci` is consumed directly, so
+there is no image tarball round-trip and no container runtime daemon.
+
+A single Rust binary, the launcher, does all of the work:
+
+1. Reads `index.json`, walks nested indexes and selects the manifest matching the requested platform (defaults to the host).
+2. Verifies every blob against its digest and size while streaming it.
+3. Extracts the layers into a private bundle directory, applying `.wh.` whiteouts and rejecting entries that would escape the rootfs.
+4. Generates an OCI runtime `config.json` (rootless when run as an unprivileged user, otherwise a plain privileged spec).
+5. Copies the host `/etc/resolv.conf` and writes `/etc/hosts` and `/etc/hostname` so DNS works out of the box.
+6. Executes `runc` against a private state root, forwards signals to the container, propagates its exit code and removes the bundle afterwards.
+
+Containers share the host network namespace, and each run gets a unique container ID, so concurrent runs of the same target do not interfere.
+
+## Debugging
+
+2 debugging oriented flags exist within the launcher;
+1. `--verbose` (or `RULES_OCI_RUNTIME_VERBOSE=1` env var) to log container startup operations.
+2. `--keep-bundle` to preserve the [filesystem bundle](https://github.com/opencontainers/runtime-spec/blob/6999a89a76a0329f440d5740497bedb9dd431297/bundle.md) on exit.
+
+e.g.
 
 ```sh
-RULES_OCI_RUNTIME_VERBOSE=1 bazel --quiet run //:container -- /bin/sh -c 'echo "Hello, world!"'
+bazel --quiet run //:container -- --verbose /bin/sh -c 'echo "Hello, world!"'
 ```
 ```
 Target //:container up-to-date:
@@ -56,33 +86,6 @@ Running container rules-oci-runtime-c575126f1cd80bad
 Hello, world!
 Container has exited, cleaning up...
 ```
-
-## Why?
-
-- No dependencies on Docker/Podman.
-- Easy to use in devcontainers, only requiring `"privileged": true,`.
-
-## How it works
-
-The image layout directory produced by `rules_oci` is consumed directly, so
-there is no image tarball round-trip and no container runtime daemon.
-
-A single Rust binary, the launcher, does all of the work:
-
-1. Reads `index.json`, walks nested indexes and selects the manifest matching
-   the requested platform (defaults to the host).
-2. Verifies every blob against its digest and size while streaming it.
-3. Extracts the layers into a private bundle directory, applying `.wh.`
-   whiteouts and rejecting entries that would escape the rootfs.
-4. Generates an OCI runtime `config.json` (rootless when run as an
-   unprivileged user, otherwise a plain privileged spec).
-5. Copies the host `/etc/resolv.conf` and writes `/etc/hosts` and
-   `/etc/hostname` so DNS works out of the box.
-6. Executes `runc` against a private state root, forwards signals to the
-   container, propagates its exit code and removes the bundle afterwards.
-
-Containers share the host network namespace, and each run gets a unique
-container ID, so concurrent runs of the same target do not interfere.
 
 ## Rules
 
@@ -100,25 +103,18 @@ runc_binary(
 )
 ```
 
-`mounts` entries are `SOURCE:DESTINATION[:OPTIONS]`, where `OPTIONS` is a comma
-separated mount option list such as `ro` or `rw,noexec`. `$VAR` and `${VAR}` in
-`SOURCE` are expanded when the container starts.
+`mounts` entries are `SOURCE:DESTINATION[:OPTIONS]`, where `OPTIONS` is a comma separated mount option list such as `ro` or `rw,noexec`. `$VAR` and `${VAR}` in `SOURCE` are expanded when the container starts.
 
 ## Toolchains
 
-Both binaries a `runc_binary` needs are resolved through toolchains, so either
-can be replaced without forking these rules.
+Both binaries a `runc_binary` needs are resolved through toolchains, so either can be replaced without forking these rules.
 
 | Toolchain type | Binary | Default |
 | -------------- | ------ | ------- |
 | `//lib:launcher_toolchain_type` | The launcher described above. | A prebuilt launcher release. |
 | `//lib:container_runtime_toolchain_type` | An OCI runtime such as `runc`. | A pinned `runc` release. |
 
-The launcher is published as a statically linked binary for Linux amd64 and
-arm64 with each release, and the archive above pins the pair. A source checkout
-has no release to draw on, so it must build the launcher from source, which
-pulls in `rules_rust`: add the `rules_oci_runtime_source` module and stand the
-prebuilt toolchains down.
+The launcher is published as a statically linked binary for Linux amd64 and arm64 with each release, and the archive above pins the pair. A source checkout has no release to draw on, so it must build the launcher from source, which pulls in `rules_rust`: add the `rules_oci_runtime_source` module and stand the prebuilt toolchains down.
 
 ```starlark
 # MODULE.bazel
@@ -176,43 +172,6 @@ Flags accepted before the container command override the rule attributes:
 bazel run //:container -- --env FOO=bar --workdir /tmp /bin/sh -c 'echo "$FOO"'
 ```
 
-## Development
+## Contributing
 
-```sh
-bazel test //...                    # rule tests and documentation freshness
-(cd source && bazel test //...)     # launcher unit tests
-(cd e2e/smoke && bazel test //...)  # end to end tests
-bazel run //docs:update             # regenerate docs/defs.md
-```
-
-## Releasing
-
-Publishing a release tagged `vX.Y.Z`, notes and all, builds a statically linked
-launcher for Linux amd64 and arm64, stamps their hashes and the version into a
-generated ruleset archive, attaches the three to that release along with an
-installation snippet, then runs a container from them to prove the pins are
-good. Running the workflow by hand does everything except attach.
-
-Every other CI run builds the same archive with the launchers baked in rather
-than pinned, since there is no release for them to be pinned to, and uploads it
-as a workflow artifact versioned `0.0.0-ci`. Such an archive stands alone, so
-trying a change out before it is released takes nothing but a download:
-
-```starlark
-# MODULE.bazel
-bazel_dep(name = "rules_oci_runtime", version = "0.0.0-ci")
-archive_override(
-    module_name = "rules_oci_runtime",
-    strip_prefix = "rules_oci_runtime-0.0.0-ci",
-    urls = ["file:///tmp/rules_oci_runtime-0.0.0-ci.tar.gz"],
-)
-```
-
-That is what the check every archive goes through sets up:
-
-```sh
-.github/workflows/check_release_archive.sh \
-    --version 0.0.0-ci \
-    --archive rules_oci_runtime-0.0.0-ci.tar.gz \
-    --run-container
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test and release the ruleset.

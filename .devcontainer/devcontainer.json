@@ -12,7 +12,8 @@
 	"customizations": {
 		"vscode": {
 			"extensions": [
-				"bazelbuild.vscode-bazel"
+				"bazelbuild.vscode-bazel",
+				"vstirbu.vscode-mermaid-preview"
 			],
 			"settings": {
 				"bazel.enableCodeLens": true,

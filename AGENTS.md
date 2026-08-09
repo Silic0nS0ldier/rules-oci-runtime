@@ -1,0 +1,55 @@
+# Agent Guidance
+
+This is supplemental to [README.md](README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+
+This repository houses the `@rules_oci_runtime` Bazel module. It exists to allow running OCI images defined with [`@rules_oci`](https://github.com/bazel-contrib/rules_oci) _without_ relying on a heavy weight orchestrator like Docker or Podman, instead running an [OCI compliant runtime](https://github.com/opencontainers/runtime-spec) (e.g. [`runc`](https://github.com/opencontainers/runc)) directly.
+
+## Layout
+
+```mermaid
+treeView-beta
+./ :::highlight ## @rules_oci_runtime, core ruleset.
+├── .devcontainer/
+|   ├── feature-bazel/ ## Adds Bazel-specific tools to dev environment.
+|   └── devcontainer.json
+├── .github/
+|   ├── workflows/
+|   └── renovate.json
+├── docs/
+├── e2e/*/ ## End-to-end test modules.
+├── launcher/BUILD.bazel ## Houses self-contained launcher binaries (e.g. for CI tarball).
+├── lib/
+|   ├── private/ ## Ruleset implementation details
+|   └── defs.bzl ## Public API exports.
+├── source/ :::highlight ## @rules_oci_runtime_source, opt-in to build launcher from source.
+|   ├── src/ ## Launcher source (Rust).
+|   └── MODULE.bazel
+└── MODULE.bazel
+```
+
+## Formatting
+
+The repo is **not** `cargo fmt` clean and is not meant to become clean in
+passing. Never format the whole crate — it buries the real change. Compare
+`cargo fmt --check` findings against the base branch and only address ones your
+change introduced.
+
+## Benchmarking
+
+Launcher performance is the recurring workstream, so measure it properly:
+
+- Report CPU time (user + sys) and syscall counts. Wall clock is unreliable in
+  containers and VMs.
+- Interleave old and new binaries round robin; report min, median and max.
+- Benchmark on an image rich in symlinks and overwrites, not just a distro base.
+  A per entry cache regression that was invisible on alpine cost 5x on
+  `browserless/chromium`.
+- Confirm the fast run actually did the work (entry counts, exit codes) and diff
+  the extracted trees before believing a speedup.
+
+## Git
+
+- Commit freely; **never push**. The user pushes and opens PRs.
+- Land invasive work as separate or stacked PRs rather than one large branch.
+- Commit bodies carry the measured numbers behind a performance claim.
+- `Refs #N` is for issues only. PR numbers are added by GitHub at merge time.
