@@ -91,7 +91,7 @@ Register a `launcher_toolchain` to use a patched launcher instead.
 <pre>
 load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
 
-runc_binary(<a href="#runc_binary-name">name</a>, <a href="#runc_binary-data">data</a>, <a href="#runc_binary-env">env</a>, <a href="#runc_binary-hostname">hostname</a>, <a href="#runc_binary-image">image</a>, <a href="#runc_binary-mounts">mounts</a>, <a href="#runc_binary-read_only">read_only</a>, <a href="#runc_binary-workdir">workdir</a>)
+runc_binary(<a href="#runc_binary-name">name</a>, <a href="#runc_binary-data">data</a>, <a href="#runc_binary-env">env</a>, <a href="#runc_binary-hostname">hostname</a>, <a href="#runc_binary-image">image</a>, <a href="#runc_binary-index">index</a>, <a href="#runc_binary-mounts">mounts</a>, <a href="#runc_binary-read_only">read_only</a>, <a href="#runc_binary-workdir">workdir</a>)
 </pre>
 
 Creates an executable that runs an OCI image with `runc`.
@@ -128,6 +128,7 @@ adding the module is all the setup needed on Linux amd64 and arm64.
 | <a id="runc_binary-env"></a>env |  Environment variables added to the container, overriding the image.   | <a href="https://bazel.build/rules/lib/core/dict">Dictionary: String -> String</a> | optional |  `{}`  |
 | <a id="runc_binary-hostname"></a>hostname |  Hostname inside the container. Defaults to `container`.   | String | optional |  `""`  |
 | <a id="runc_binary-image"></a>image |  An OCI image layout directory, such as an `oci_image` or `oci.pull` target.   | <a href="https://bazel.build/concepts/labels">Label</a> | required |  |
+| <a id="runc_binary-index"></a>index |  Index the gzip layers at build time so extraction can run in parallel.<br><br>Each checkpoint index is a small sidecar in the runfiles tree; the image layout and its digests are unchanged. Indexing decompresses every layer once per build of the image, so switch it off if build time matters more than startup time.   | Boolean | optional |  `True`  |
 | <a id="runc_binary-mounts"></a>mounts |  Bind mounts, each `SOURCE:DESTINATION[:OPTIONS]`.<br><br>`OPTIONS` is a comma separated mount option list such as `ro` or `rw,noexec`, defaulting to `rw`. `$VAR` and `${VAR}` are expanded in `SOURCE` when the container starts, so `$BUILD_WORKSPACE_DIRECTORY:/src:ro` mounts the workspace.   | List of strings | optional |  `[]`  |
 | <a id="runc_binary-read_only"></a>read_only |  Mount the container root filesystem read-only.   | Boolean | optional |  `False`  |
 | <a id="runc_binary-workdir"></a>workdir |  Working directory inside the container, overriding the image `WorkingDir`.   | String | optional |  `""`  |
