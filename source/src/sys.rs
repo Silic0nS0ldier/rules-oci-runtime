@@ -1,8 +1,9 @@
 //! The small amount of libc this binary needs: identity, tty detection,
-//! randomness and signal forwarding.
+//! randomness, file mapping and signal forwarding.
 
 use std::fs::File;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::error::{IoContext, Result};
@@ -19,6 +20,71 @@ const FORWARDED: [libc::c_int; 7] = [
     libc::SIGUSR2,
     libc::SIGWINCH,
 ];
+
+/// A read-only mapping of a whole file.
+///
+/// Callers that need random access over a blob would otherwise have to copy it
+/// into the heap first; a mapping lets them read the page cache in place, and
+/// lets several threads fault in the pages they touch concurrently.
+///
+/// The bytes are only valid while the file behind them is: truncating it under
+/// a live mapping turns reads past the new end into SIGBUS rather than a short
+/// read. Every caller here maps an immutable content addressed blob.
+pub struct Mapping {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+// SAFETY: the mapping is read-only for its whole life and owns its address
+// range, so handing it between threads exposes nothing thread-affine.
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    /// Maps `len` bytes of `file`, or returns `None` when there is nothing to
+    /// map or the kernel refuses. Mapping is an optimisation: a caller that
+    /// gets `None` is expected to read the file instead.
+    pub fn of(file: &File, len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: a null hint asks the kernel to choose the address, and the
+        // descriptor is open for the duration of the call.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Mapping { ptr, len })
+    }
+}
+
+impl std::ops::Deref for Mapping {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: mmap returned `len` readable bytes at `ptr`, and the mapping
+        // outlives the slice.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: the pointer and length are the ones mmap handed back.
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
+    }
+}
 
 pub fn euid() -> u32 {
     // SAFETY: geteuid is always successful and has no preconditions.
