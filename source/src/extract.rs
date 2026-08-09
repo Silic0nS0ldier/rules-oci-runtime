@@ -29,6 +29,46 @@ const CHUNK_BYTES: usize = 256 * 1024;
 /// How many chunks may be in flight, bounding the pipeline to 2 MiB.
 const PIPELINE_DEPTH: usize = 8;
 
+/// A pipeline buffer and how much of it the producer filled.
+///
+/// The buffer keeps its full length for its whole life, so a recycled one is
+/// handed straight back to `Read::read` without being zeroed again; `len` is
+/// what makes the rest of it invisible.
+struct Chunk {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl std::ops::Deref for Chunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// The producer's end of a buffer pool.
+///
+/// A quarter of a megabyte is above the threshold at which an allocator stops
+/// serving from its heap: musl sends every one of these to `mmap` and gives it
+/// back on free, which for a 535 MiB layer is thousands of mappings and a
+/// page fault for each of their pages. Circulating a handful of buffers costs
+/// one channel operation instead.
+struct Pool(Receiver<Vec<u8>>);
+
+impl Pool {
+    fn take(&self) -> Vec<u8> {
+        self.0.try_recv().unwrap_or_else(|_| vec![0u8; CHUNK_BYTES])
+    }
+}
+
+/// Creates a pool and the handle used to return buffers to it. Returns never
+/// block, so the channel holds every buffer the pipeline can have in flight.
+fn buffer_pool() -> (Pool, SyncSender<Vec<u8>>) {
+    let (ret, free) = sync_channel(PIPELINE_DEPTH * 2);
+    (Pool(free), ret)
+}
+
 /// Applies layers in order, deferring directory permissions so that read-only
 /// directories in one layer do not block writes from the next.
 pub struct RootfsExtractor {
@@ -72,13 +112,17 @@ impl RootfsExtractor {
         let file = layout.open_blob(descriptor)?;
         let digest = descriptor.digest.clone();
         let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
+        let (pool, ret) = buffer_pool();
+        // Indexed spans are sized by the index rather than by CHUNK_BYTES, so
+        // there is nothing for the streaming pool to hand them back to.
+        let ret = index.is_none().then_some(ret);
         let owned = descriptor.clone();
         let inflate = thread::spawn(move || match index {
             Some(index) => inflate_indexed(file, &index, &owned, sender),
-            None => inflate_blob(file, &owned, sender),
+            None => inflate_blob(file, &owned, sender, pool),
         });
 
-        let mut reader = ChunkReader::new(receiver);
+        let mut reader = ChunkReader::new(receiver, ret);
         let mut unpacked = self.unpack(&mut reader, &digest);
         if unpacked.is_ok() {
             // The tar stream ends at its marker, but the digest covers the blob.
@@ -419,18 +463,17 @@ struct HashState {
 ///
 /// The hash covers exactly the bytes the decompressor is given, so the digest
 /// still describes what was extracted rather than a second read of the file.
-fn read_and_hash(mut file: fs::File, sender: SyncSender<io::Result<Vec<u8>>>) -> HashState {
+fn read_and_hash(mut file: fs::File, sender: SyncSender<io::Result<Chunk>>, pool: Pool) -> HashState {
     let mut state = HashState::default();
     loop {
-        let mut chunk = vec![0u8; CHUNK_BYTES];
-        match file.read(&mut chunk) {
+        let mut buf = pool.take();
+        match file.read(&mut buf) {
             Ok(0) => return state,
             Ok(read) => {
-                chunk.truncate(read);
-                state.hasher.update(&chunk);
+                state.hasher.update(&buf[..read]);
                 state.bytes += read as u64;
                 // The consumer has stopped, and has an error of its own to report.
-                if sender.send(Ok(chunk)).is_err() {
+                if sender.send(Ok(Chunk { buf, len: read })).is_err() {
                     return state;
                 }
             }
@@ -450,11 +493,13 @@ fn read_and_hash(mut file: fs::File, sender: SyncSender<io::Result<Vec<u8>>>) ->
 fn inflate_blob(
     file: fs::File,
     descriptor: &Descriptor,
-    sender: SyncSender<io::Result<Vec<u8>>>,
+    sender: SyncSender<io::Result<Chunk>>,
+    pool: Pool,
 ) -> Result<()> {
     let (raw_sender, raw_receiver) = sync_channel(PIPELINE_DEPTH);
-    let hashing = thread::spawn(move || read_and_hash(file, raw_sender));
-    let counted = ChunkReader::new(raw_receiver);
+    let (raw_pool, raw_ret) = buffer_pool();
+    let hashing = thread::spawn(move || read_and_hash(file, raw_sender, raw_pool));
+    let counted = ChunkReader::new(raw_receiver, Some(raw_ret));
     let mut decoder = match decompressor(&descriptor.media_type, counted) {
         Ok(decoder) => decoder,
         Err(err) => {
@@ -464,8 +509,8 @@ fn inflate_blob(
     };
 
     loop {
-        let mut chunk = vec![0u8; CHUNK_BYTES];
-        let read = match decoder.read(&mut chunk) {
+        let mut buf = pool.take();
+        let read = match decoder.read(&mut buf) {
             Ok(0) => break,
             Ok(read) => read,
             Err(err) => {
@@ -477,8 +522,7 @@ fn inflate_blob(
                 ));
             }
         };
-        chunk.truncate(read);
-        if sender.send(Ok(chunk)).is_err() {
+        if sender.send(Ok(Chunk { buf, len: read })).is_err() {
             return Ok(());
         }
     }
@@ -512,7 +556,7 @@ fn inflate_indexed(
     mut file: fs::File,
     index: &zinfo::Index,
     descriptor: &Descriptor,
-    sender: SyncSender<io::Result<Vec<u8>>>,
+    sender: SyncSender<io::Result<Chunk>>,
 ) -> Result<()> {
     let capacity = file.metadata().map_or(0, |m| m.len()) as usize;
     let mut blob = Vec::with_capacity(capacity);
@@ -566,7 +610,8 @@ fn inflate_indexed(
                 want += 1;
                 match result {
                     Ok(span) => {
-                        if sender.send(Ok(span)).is_err() {
+                        let len = span.len();
+                        if sender.send(Ok(Chunk { buf: span, len })).is_err() {
                             // The writer stopped; it has an error of its own.
                             stop.store(true, Ordering::Relaxed);
                             break 'reorder;
@@ -608,17 +653,25 @@ fn inflate_indexed(
     }
 }
 
-/// Presents the inflated chunks as a stream for `tar` to walk.
+/// Presents the inflated chunks as a stream for `tar` to walk, returning each
+/// buffer to the producer's pool once it has been drained.
 struct ChunkReader {
-    chunks: Receiver<io::Result<Vec<u8>>>,
-    current: io::Cursor<Vec<u8>>,
+    chunks: Receiver<io::Result<Chunk>>,
+    current: Chunk,
+    taken: usize,
+    ret: Option<SyncSender<Vec<u8>>>,
 }
 
 impl ChunkReader {
-    fn new(chunks: Receiver<io::Result<Vec<u8>>>) -> Self {
+    fn new(chunks: Receiver<io::Result<Chunk>>, ret: Option<SyncSender<Vec<u8>>>) -> Self {
         ChunkReader {
             chunks,
-            current: io::Cursor::new(Vec::new()),
+            current: Chunk {
+                buf: Vec::new(),
+                len: 0,
+            },
+            taken: 0,
+            ret,
         }
     }
 }
@@ -626,12 +679,25 @@ impl ChunkReader {
 impl Read for ChunkReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let read = self.current.read(buf)?;
-            if read > 0 {
-                return Ok(read);
+            let available = self.current.len - self.taken;
+            if available > 0 {
+                let take = available.min(buf.len());
+                buf[..take].copy_from_slice(&self.current.buf[self.taken..self.taken + take]);
+                self.taken += take;
+                return Ok(take);
+            }
+            // A full pool means the producer has all the buffers it can use,
+            // so the spare is dropped rather than blocking the pipeline on it.
+            if let Some(ret) = &self.ret
+                && !self.current.buf.is_empty()
+            {
+                let _ = ret.try_send(std::mem::take(&mut self.current.buf));
             }
             match self.chunks.recv() {
-                Ok(Ok(chunk)) => self.current = io::Cursor::new(chunk),
+                Ok(Ok(chunk)) => {
+                    self.current = chunk;
+                    self.taken = 0;
+                }
                 Ok(Err(err)) => return Err(err),
                 // The sender is gone, so the blob has been read in full.
                 Err(_) => return Ok(0),
@@ -720,10 +786,11 @@ mod tests {
         fs::write(&blob, b"hello").expect("blob");
 
         let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
-        let state = read_and_hash(fs::File::open(&blob).expect("open"), sender);
+        let (pool, ret) = buffer_pool();
+        let state = read_and_hash(fs::File::open(&blob).expect("open"), sender, pool);
 
         let mut passed_on = Vec::new();
-        ChunkReader::new(receiver)
+        ChunkReader::new(receiver, Some(ret))
             .read_to_end(&mut passed_on)
             .expect("read");
         assert_eq!(passed_on, b"hello");
@@ -732,6 +799,37 @@ mod tests {
             hex_encode(&state.hasher.finalize()),
             hex_encode(&Sha256::digest(b"hello"))
         );
+    }
+
+    /// A recycled buffer still holds the previous chunk's bytes, so the length
+    /// travelling with it is the only thing keeping them out of the stream.
+    #[test]
+    fn recycled_buffers_do_not_leak_the_previous_chunk() {
+        let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
+        let (pool, ret) = buffer_pool();
+
+        let mut first = pool.take();
+        first[..4].copy_from_slice(b"aaaa");
+        sender.send(Ok(Chunk { buf: first, len: 4 })).expect("send");
+        let mut second = pool.take();
+        second[..2].copy_from_slice(b"bb");
+        sender
+            .send(Ok(Chunk {
+                buf: second,
+                len: 2,
+            }))
+            .expect("send");
+        drop(sender);
+
+        let mut streamed = Vec::new();
+        ChunkReader::new(receiver, Some(ret))
+            .read_to_end(&mut streamed)
+            .expect("read");
+        assert_eq!(streamed, b"aaaabb");
+
+        // Draining a chunk hands its buffer back with the stale tail intact.
+        let recycled = pool.take();
+        assert_eq!(&recycled[..4], b"aaaa");
     }
 
     #[test]
