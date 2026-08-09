@@ -1,6 +1,6 @@
 //! Filesystem helpers shared by extraction and cleanup.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -80,19 +80,20 @@ fn make_writable_recursive(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Removes a single filesystem object, following no symlinks.
-pub fn remove_any(path: &Path) -> Result<()> {
+/// Removes a single filesystem object, following no symlinks. Returns whether
+/// there was anything to remove.
+pub fn remove_any(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => force_remove_dir_all(path),
+        Ok(metadata) if metadata.is_dir() => force_remove_dir_all(path).map(|()| true),
         Ok(_) => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(crate::error::Error::io(
                 format!("removing {}", path.display()),
                 err,
             )),
         },
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(crate::error::Error::io(
             format!("inspecting {}", path.display()),
             err,
@@ -111,7 +112,7 @@ pub fn remove_any(path: &Path) -> Result<()> {
 /// nearly all of that into a hash lookup.
 pub struct ParentCache {
     canonical_root: PathBuf,
-    verified: HashSet<PathBuf>,
+    verified: BTreeSet<PathBuf>,
 }
 
 impl ParentCache {
@@ -119,7 +120,7 @@ impl ParentCache {
         let canonical_root = root
             .canonicalize()
             .io_context(|| format!("resolving {}", root.display()))?;
-        let mut verified = HashSet::new();
+        let mut verified = BTreeSet::new();
         verified.insert(root.to_owned());
         verified.insert(canonical_root.clone());
         Ok(ParentCache {
@@ -166,8 +167,21 @@ impl ParentCache {
 
     /// Forgets `path` and everything under it, because what was verified there
     /// has been removed and a later layer may put a symlink in its place.
+    ///
+    /// Paths sort component-wise, so a subtree is a contiguous range and the
+    /// cost is bound by what is actually forgotten, not the cache size: an
+    /// image that replaces thousands of entries would otherwise rescan the
+    /// whole cache for each one.
     pub fn forget(&mut self, path: &Path) {
-        self.verified.retain(|verified| !verified.starts_with(path));
+        let doomed: Vec<PathBuf> = self
+            .verified
+            .range(path.to_path_buf()..)
+            .take_while(|p| p.starts_with(path))
+            .cloned()
+            .collect();
+        for p in &doomed {
+            self.verified.remove(p);
+        }
     }
 }
 
