@@ -550,23 +550,32 @@ fn inflate_blob(
 /// Runs on the decompression thread when the layer has a checkpoint index:
 /// inflates disjoint spans of the blob on every available core and hands them
 /// to `sender` in order. Spans need random access, so the whole compressed
-/// blob is read up front; hashing it for the digest check then happens over
-/// the same bytes on a thread of its own, instead of alongside the read.
+/// blob is mapped; hashing it for the digest check then happens over the same
+/// pages on a thread of its own, instead of alongside a read.
 fn inflate_indexed(
     mut file: fs::File,
     index: &zinfo::Index,
     descriptor: &Descriptor,
     sender: SyncSender<io::Result<Chunk>>,
 ) -> Result<()> {
-    let capacity = file.metadata().map_or(0, |m| m.len()) as usize;
-    let mut blob = Vec::with_capacity(capacity);
-    if let Err(err) = file.read_to_end(&mut blob) {
+    let len = file.metadata().map_or(0, |m| m.len()) as usize;
+    let mapped = crate::sys::Mapping::of(&file, len);
+    // Nothing to map, or the kernel would not: the spans still need the whole
+    // blob, so fall back to a copy of it.
+    let mut read = Vec::new();
+    if mapped.is_none()
+        && let Err(err) = file.read_to_end(&mut read)
+    {
         let _ = sender.send(Err(io::Error::other(err.to_string())));
         return Err(Error::io(
             format!("reading layer {}", descriptor.digest),
             err,
         ));
     }
+    let blob: &[u8] = match &mapped {
+        Some(mapping) => mapping,
+        None => &read,
+    };
 
     let spans = index.checkpoints.len();
     let workers = thread::available_parallelism()
