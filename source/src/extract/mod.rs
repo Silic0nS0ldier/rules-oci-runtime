@@ -8,6 +8,7 @@
 mod entry;
 mod file;
 mod pipeline;
+mod plan;
 #[cfg(test)]
 mod tests;
 
@@ -37,6 +38,7 @@ pub struct RootfsExtractor {
     index_dir: Option<Utf8PathBuf>,
     deferred_modes: Vec<(PathBuf, u32)>,
     parents: fsutil::ParentCache,
+    plan: plan::Plan,
 }
 
 impl RootfsExtractor {
@@ -47,7 +49,15 @@ impl RootfsExtractor {
             rootfs: rootfs.to_owned(),
             index_dir: index_dir.map(Utf8Path::to_owned),
             deferred_modes: Vec::new(),
+            plan: plan::Plan::default(),
         })
+    }
+
+    /// Resolves the image before extracting it, so that entries a later layer
+    /// replaces are never written. Without an entry table for every layer this
+    /// plans nothing and each layer is placed in full, as before.
+    pub fn plan(&mut self, layers: &[Descriptor]) {
+        self.plan = plan::Plan::build(self.index_dir.as_deref(), layers);
     }
 
     /// Decompression is CPU bound and writing the rootfs is IO bound, so a
