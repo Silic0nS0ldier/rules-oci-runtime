@@ -118,8 +118,9 @@ impl RootfsExtractor {
                 let dst = fsutil::join_components(root, &whiteout);
                 if self.parents.contains_parent_of(&dst)? {
                     log!("Whiteout: removing /{}", relative_display(root, &dst));
-                    fsutil::remove_any(&dst)?;
-                    self.parents.forget(&dst);
+                    if fsutil::remove_any(&dst)? {
+                        self.parents.forget(&dst);
+                    }
                 }
                 continue;
             }
@@ -164,8 +165,9 @@ impl RootfsExtractor {
                 self.deferred_modes.push((dst.clone(), mode));
                 entry.set_preserve_permissions(false);
             } else {
-                fsutil::remove_any(&dst)?;
-                self.parents.forget(&dst);
+                if fsutil::remove_any(&dst)? {
+                    self.parents.forget(&dst);
+                }
                 entry.set_preserve_permissions(true);
             }
             entry.set_preserve_mtime(true);
