@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -259,23 +260,64 @@ impl RootfsExtractor {
                     self.parents.forget(&dst);
                 }
                 self.deferred_modes.push((dst.clone(), mode));
-                entry.set_preserve_permissions(false);
-            } else {
-                if fsutil::remove_any(&dst)? {
-                    self.parents.forget(&dst);
+                match fs::create_dir(&dst) {
+                    Ok(()) => {}
+                    // `prepare_directory` cleared anything that was not a
+                    // directory, so what is left is one to keep.
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(err) => {
+                        return Err(Error::io(format!("creating {}", dst.display()), err));
+                    }
                 }
-                entry.set_preserve_permissions(true);
+                continue;
             }
-            entry.set_preserve_mtime(true);
 
-            let unpacked = entry
-                .unpack_in(root)
-                .io_context(|| format!("extracting {:?} from layer {layer}", path.display()))?;
-            if !unpacked {
-                return Err(Error::UnsafeEntry {
-                    layer: layer.to_string(),
-                    path: path.display().to_string(),
-                });
+            // Replacing whatever is here is what `set_overwrite` bought from
+            // `tar`, and the link calls below will not do it themselves.
+            if fsutil::remove_any(&dst)? {
+                self.parents.forget(&dst);
+            }
+
+            let unsafe_entry = || Error::UnsafeEntry {
+                layer: layer.to_string(),
+                path: path.display().to_string(),
+            };
+
+            match entry_type {
+                EntryType::Symlink => {
+                    let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
+                    std::os::unix::fs::symlink(&target, &dst).io_context(|| {
+                        format!("extracting {:?} from layer {layer}", path.display())
+                    })?;
+                    if let Ok(mtime) = entry.header().mtime() {
+                        set_symlink_mtime(&dst, mtime);
+                    }
+                }
+                EntryType::Link => {
+                    let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
+                    // A hard link names an earlier entry of the same archive,
+                    // so it is rooted at the rootfs like any other entry path.
+                    let source = fsutil::sanitize_relative_path(&target)
+                        .map(|parts| fsutil::join_components(root, &parts))
+                        .ok_or_else(unsafe_entry)?;
+                    if !self.parents.contains_parent_of(&source)? {
+                        return Err(unsafe_entry());
+                    }
+                    fs::hard_link(&source, &dst).io_context(|| {
+                        format!("extracting {:?} from layer {layer}", path.display())
+                    })?;
+                }
+                // Sparse files still need `tar` to place the holes.
+                _ => {
+                    entry.set_preserve_permissions(true);
+                    entry.set_preserve_mtime(true);
+                    let unpacked = entry.unpack_in(root).io_context(|| {
+                        format!("extracting {:?} from layer {layer}", path.display())
+                    })?;
+                    if !unpacked {
+                        return Err(unsafe_entry());
+                    }
+                }
             }
         }
         Ok(())
@@ -428,6 +470,41 @@ fn set_mtime(file: &fs::File, mtime: u64) {
     };
     let times = [time, time];
     let _ = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+}
+
+/// The same for a symlink, which has no descriptor to hang the call on and
+/// must not be followed to the file it names.
+fn set_symlink_mtime(path: &Path, mtime: u64) {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let time = libc::timespec {
+        tv_sec: mtime as libc::time_t,
+        tv_nsec: 0,
+    };
+    let times = [time, time];
+    // SAFETY: the path is a live NUL terminated string and `times` holds the
+    // two values utimensat reads.
+    let _ = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+}
+
+/// The target of a link entry, or `None` when the header does not name one.
+/// An empty target is no target: `symlinkat` would take it and leave a link
+/// that resolves to nothing.
+fn link_name<R: Read>(entry: &tar::Entry<'_, R>, layer: &str) -> Result<Option<PathBuf>> {
+    let target = entry
+        .link_name()
+        .io_context(|| format!("reading a link name in layer {layer}"))?;
+    Ok(target
+        .filter(|target| target.as_os_str().as_bytes() != b"")
+        .map(|target| target.into_owned()))
 }
 
 /// Keeps existing directories (including symlinks to directories) intact so
@@ -972,9 +1049,110 @@ mod tests {
         }
     }
 
+    /// Symlinks, hard links and directories are placed by this module rather
+    /// than by `tar`, so each of their behaviours needs its own cover.
     #[test]
-    fn an_entry_cannot_escape_through_a_symlinked_parent() {
-        // A layer can ship a symlink out of the rootfs and then an entry
+    fn link_entries_are_placed_with_their_metadata() {
+        let root = scratch("link-entries");
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(5);
+        header.set_mtime(1_000_000);
+        builder
+            .append_data(&mut header, "target", &b"hello"[..])
+            .expect("file");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_size(0);
+        header.set_mtime(1_234_567);
+        builder
+            .append_link(&mut header, "sym", "target")
+            .expect("symlink");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Link);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "hard", "target")
+            .expect("hard link");
+
+        let blob = builder.into_inner().expect("tar");
+        let descriptor = install_blob(&root, PLAIN_LAYER, &blob);
+        let rootfs = extract(&root, &descriptor).expect("extract");
+
+        assert_eq!(
+            fs::read_link(rootfs.join("sym")).expect("symlink"),
+            Path::new("target")
+        );
+        let metadata = fs::symlink_metadata(rootfs.join("sym")).expect("symlink metadata");
+        assert_eq!(
+            metadata
+                .modified()
+                .expect("mtime")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("epoch")
+                .as_secs(),
+            1_234_567,
+            "the symlink itself carries the mtime, not what it points at"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("hard")).expect("hard link"),
+            "hello"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_hard_link_cannot_name_a_target_outside_the_rootfs() {
+        let root = scratch("hard-link-escape");
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Link);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "stolen", "../../etc/passwd")
+            .expect("hard link");
+        let blob = builder.into_inner().expect("tar");
+
+        let descriptor = install_blob(&root, PLAIN_LAYER, &blob);
+        let err = extract(&root, &descriptor).expect_err("the entry must be refused");
+        assert!(
+            matches!(err, Error::UnsafeEntry { .. }),
+            "expected an unsafe entry, got {err:?}"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_link_entry_without_a_target_is_refused() {
+        let root = scratch("empty-link");
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_size(0);
+        header.set_path("sym").expect("path");
+        header.set_link_name_literal("").expect("empty link name");
+        header.set_cksum();
+        builder.append(&header, &[][..]).expect("symlink");
+        let blob = builder.into_inner().expect("tar");
+
+        let descriptor = install_blob(&root, PLAIN_LAYER, &blob);
+        let err = extract(&root, &descriptor).expect_err("the entry must be refused");
+        assert!(
+            matches!(err, Error::UnsafeEntry { .. }),
+            "expected an unsafe entry, got {err:?}"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn an_entry_cannot_escape_through_a_symlinked_parent() {        // A layer can ship a symlink out of the rootfs and then an entry
         // underneath it. The parent of that entry does not exist and cannot be
         // resolved, which used to count as safe, so creating it followed the
         // symlink and wrote the file outside the rootfs.
