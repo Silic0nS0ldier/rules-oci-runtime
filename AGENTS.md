@@ -9,6 +9,13 @@ This repository houses the `@rules_oci_runtime` Bazel module. It exists to allow
 ```mermaid
 treeView-beta
 ./ :::highlight ## @rules_oci_runtime, core ruleset.
+├── .bazel/
+|   ├── bin/ ## Build outputs.
+|   ├── out/ ## Shortcut to intermediary build outputs.
+|   └── testlogs/ ## Outputs from running tests.
+|       ├── **/test.outputs/ ## Any additional outputs produced by tests.
+|       ├── **/test.log
+|       └── **/test.xml
 ├── .devcontainer/
 |   ├── feature-bazel/ ## Adds Bazel-specific tools to dev environment.
 |   └── devcontainer.json
@@ -22,10 +29,13 @@ treeView-beta
 |   ├── private/ ## Ruleset implementation details
 |   └── defs.bzl ## Public API exports.
 ├── source/ :::highlight ## @rules_oci_runtime_source, opt-in to build launcher from source.
+|   ├── .bazel/
 |   ├── src/ ## Launcher source (Rust).
 |   └── MODULE.bazel
 └── MODULE.bazel
 ```
+
+Note that testing (`bazel test //...`) must be run within _each_ Bazel module.
 
 ## Formatting
 
@@ -38,6 +48,7 @@ change introduced.
 
 Launcher performance is the recurring workstream, so measure it properly:
 
+- Use an optimised release build (`--config=release`).
 - Report CPU time (user + sys) and syscall counts. Wall clock is unreliable in
   containers and VMs.
 - Interleave old and new binaries round robin; report min, median and max.
