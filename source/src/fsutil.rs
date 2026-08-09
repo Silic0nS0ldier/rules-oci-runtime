@@ -8,24 +8,32 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{IoContext, Result};
 
-/// Splits a tar entry path into safe components, or returns `None` when the
-/// entry tries to escape (absolute paths are rooted at the rootfs, `..` is
-/// never allowed).
-pub fn sanitize_relative_path(path: &Path) -> Option<Vec<std::ffi::OsString>> {
-    let mut parts = Vec::new();
+/// Rebuilds `dst` as `root` joined with the safe components of `path`, or
+/// returns false when the entry tries to escape (absolute paths are rooted at
+/// the rootfs, `..` is never allowed) or names nothing at all.
+///
+/// The destination is what every caller actually wants, so it is built
+/// directly into a buffer they own: a layer is tens of thousands of entries,
+/// and a component list per entry is tens of thousands of allocations that
+/// only exist to be joined back together.
+pub fn resolve_under(root: &Path, path: &Path, dst: &mut PathBuf) -> bool {
+    dst.clear();
+    dst.push(root);
+    let mut components = 0;
     for component in path.components() {
         match component {
             Component::Prefix(_) | Component::RootDir | Component::CurDir => continue,
-            Component::ParentDir => return None,
+            Component::ParentDir => return false,
             Component::Normal(part) => {
                 if part.is_empty() {
                     continue;
                 }
-                parts.push(part.to_owned())
+                dst.push(part);
+                components += 1;
             }
         }
     }
-    if parts.is_empty() { None } else { Some(parts) }
+    components > 0
 }
 
 /// Removes a tree even when directories were extracted without write permission.
@@ -269,60 +277,61 @@ fn parent_is_within(canonical_root: &Path, path: &Path) -> Result<bool> {
     Ok(canonical_parent.starts_with(canonical_root))
 }
 
-pub fn join_components(root: &Path, parts: &[std::ffi::OsString]) -> PathBuf {
-    let mut path = root.to_path_buf();
-    for part in parts {
-        path.push(part);
-    }
-    path
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
-    fn parts(path: &str) -> Option<Vec<String>> {
-        sanitize_relative_path(Path::new(path))
-            .map(|parts| parts.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())
+    fn resolved(path: &str) -> Option<String> {
+        let mut dst = PathBuf::new();
+        resolve_under(Path::new("/tmp/rootfs"), Path::new(path), &mut dst)
+            .then(|| dst.to_string_lossy().into_owned())
     }
 
     #[test]
     fn absolute_paths_are_rooted_at_the_rootfs() {
-        assert_eq!(parts("/etc/passwd"), Some(vec!["etc".into(), "passwd".into()]));
+        assert_eq!(resolved("/etc/passwd").as_deref(), Some("/tmp/rootfs/etc/passwd"));
     }
 
     #[test]
     fn leading_dot_slash_is_stripped() {
-        assert_eq!(parts("./usr/bin/env"), Some(vec!["usr".into(), "bin".into(), "env".into()]));
+        assert_eq!(
+            resolved("./usr/bin/env").as_deref(),
+            Some("/tmp/rootfs/usr/bin/env")
+        );
     }
 
     #[test]
     fn redundant_separators_are_collapsed() {
-        assert_eq!(parts("usr//bin///env"), Some(vec!["usr".into(), "bin".into(), "env".into()]));
+        assert_eq!(
+            resolved("usr//bin///env").as_deref(),
+            Some("/tmp/rootfs/usr/bin/env")
+        );
     }
 
     #[test]
     fn parent_traversal_is_rejected() {
-        assert_eq!(parts("../etc/passwd"), None);
-        assert_eq!(parts("usr/../../etc/passwd"), None);
-        assert_eq!(parts("/../etc"), None);
+        assert_eq!(resolved("../etc/passwd"), None);
+        assert_eq!(resolved("usr/../../etc/passwd"), None);
+        assert_eq!(resolved("/../etc"), None);
     }
 
     #[test]
     fn empty_paths_are_rejected() {
-        assert_eq!(parts("."), None);
-        assert_eq!(parts("/"), None);
-        assert_eq!(parts(""), None);
+        assert_eq!(resolved("."), None);
+        assert_eq!(resolved("/"), None);
+        assert_eq!(resolved(""), None);
     }
 
+    /// The buffer is reused across entries, so a shorter path must not leave a
+    /// longer one's tail behind.
     #[test]
-    fn components_are_joined_in_order() {
-        let joined = join_components(
-            Path::new("/tmp/rootfs"),
-            &[OsString::from("etc"), OsString::from("hosts")],
-        );
-        assert_eq!(joined, PathBuf::from("/tmp/rootfs/etc/hosts"));
+    fn a_reused_buffer_is_rebuilt_rather_than_appended_to() {
+        let root = Path::new("/tmp/rootfs");
+        let mut dst = PathBuf::from("/somewhere/else/entirely");
+        assert!(resolve_under(root, Path::new("usr/bin/env"), &mut dst));
+        assert_eq!(dst, PathBuf::from("/tmp/rootfs/usr/bin/env"));
+        assert!(resolve_under(root, Path::new("etc"), &mut dst));
+        assert_eq!(dst, PathBuf::from("/tmp/rootfs/etc"));
     }
 
     #[test]

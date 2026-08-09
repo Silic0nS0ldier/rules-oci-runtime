@@ -188,31 +188,40 @@ impl RootfsExtractor {
         // One buffer for the whole layer: allocating per file would cost more
         // than the copy it serves.
         let mut buffer = vec![0u8; CHUNK_BYTES];
+        // Reused for every entry, so a layer costs two path allocations rather
+        // than a handful per entry.
+        let mut path = PathBuf::new();
+        let mut dst = PathBuf::new();
 
         for entry in entries {
             let mut entry = entry.io_context(|| format!("reading layer {layer}"))?;
-            let path = entry
-                .path()
-                .io_context(|| format!("reading entry path in layer {layer}"))?
-                .into_owned();
+            path.clear();
+            path.push(
+                entry
+                    .path()
+                    .io_context(|| format!("reading entry path in layer {layer}"))?
+                    .as_ref(),
+            );
 
-            let Some(parts) = fsutil::sanitize_relative_path(&path) else {
+            if !fsutil::resolve_under(root, &path, &mut dst) {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),
                     path: path.display().to_string(),
                 });
-            };
+            }
 
-            let name = parts.last().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-            if name == OPAQUE_WHITEOUT {
-                let dir = fsutil::join_components(root, &parts[..parts.len() - 1]);
+            let name = dst.file_name().unwrap_or_default().as_bytes();
+            if name == OPAQUE_WHITEOUT.as_bytes() {
+                dst.pop();
+                let dir = std::mem::take(&mut dst);
                 self.apply_opaque_whiteout(root, &dir)?;
+                dst = dir;
                 continue;
             }
-            if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
-                let mut whiteout = parts[..parts.len() - 1].to_vec();
-                whiteout.push(target.into());
-                let dst = fsutil::join_components(root, &whiteout);
+            if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX.as_bytes()) {
+                // `target` borrows the buffer the new name has to go into.
+                let target = std::ffi::OsStr::from_bytes(target).to_owned();
+                dst.set_file_name(target);
                 if self.parents.contains_parent_of(&dst)? {
                     log!("Whiteout: removing /{}", relative_display(root, &dst));
                     if fsutil::remove_any(&dst)? {
@@ -222,7 +231,6 @@ impl RootfsExtractor {
                 continue;
             }
 
-            let dst = fsutil::join_components(root, &parts);
             let entry_type = entry.header().entry_type();
             if !is_supported(entry_type) {
                 warning!(
@@ -297,9 +305,10 @@ impl RootfsExtractor {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
                     // A hard link names an earlier entry of the same archive,
                     // so it is rooted at the rootfs like any other entry path.
-                    let source = fsutil::sanitize_relative_path(&target)
-                        .map(|parts| fsutil::join_components(root, &parts))
-                        .ok_or_else(unsafe_entry)?;
+                    let mut source = PathBuf::new();
+                    if !fsutil::resolve_under(root, &target, &mut source) {
+                        return Err(unsafe_entry());
+                    }
                     if !self.parents.contains_parent_of(&source)? {
                         return Err(unsafe_entry());
                     }
