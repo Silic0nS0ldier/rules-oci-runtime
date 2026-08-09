@@ -55,12 +55,26 @@ impl Platform {
     pub fn matches(&self, candidate: &Platform) -> bool {
         let os_ok = candidate.os.is_empty() || candidate.os == self.os;
         let arch_ok = candidate.architecture.is_empty() || candidate.architecture == self.architecture;
-        let variant_ok = match (&self.variant, &candidate.variant) {
-            (_, None) => true,
-            (Some(ours), Some(theirs)) => ours == theirs,
-            (None, Some(theirs)) => theirs.is_empty(),
+        let ours = default_variant_removed(&self.architecture, self.variant.as_deref());
+        let theirs = default_variant_removed(&candidate.architecture, candidate.variant.as_deref());
+        let variant_ok = match theirs {
+            None => true,
+            Some(theirs) => ours.as_deref() == Some(theirs.as_str()),
         };
         os_ok && arch_ok && variant_ok
+    }
+}
+
+/// `arm64/v8` and `amd64/v1` name the same platforms as bare `arm64` and `amd64`,
+/// so registries (and `docker buildx`) spell them either way.
+fn default_variant_removed(architecture: &str, variant: Option<&str>) -> Option<String> {
+    let variant = variant
+        .map(str::to_ascii_lowercase)
+        .filter(|variant| !variant.is_empty())?;
+    match (architecture.to_ascii_lowercase().as_str(), variant.as_str()) {
+        ("arm64" | "aarch64", "v8" | "8") => None,
+        ("amd64" | "x86_64", "v1") => None,
+        _ => Some(variant),
     }
 }
 
@@ -453,6 +467,52 @@ mod tests {
     }
 
     #[test]
+    fn default_variants_match_the_bare_architecture() {
+        let host = Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            variant: None,
+        };
+        assert!(host.matches(&Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            variant: Some("v8".into())
+        }));
+        assert!(!host.matches(&Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            variant: Some("v9".into())
+        }));
+
+        let requested = Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            variant: Some("v8".into()),
+        };
+        assert!(requested.matches(&Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            variant: None
+        }));
+
+        let amd64 = Platform {
+            architecture: "amd64".into(),
+            os: "linux".into(),
+            variant: None,
+        };
+        assert!(amd64.matches(&Platform {
+            architecture: "amd64".into(),
+            os: "linux".into(),
+            variant: Some("v1".into())
+        }));
+        assert!(!amd64.matches(&Platform {
+            architecture: "amd64".into(),
+            os: "linux".into(),
+            variant: Some("v3".into())
+        }));
+    }
+
+    #[test]
     fn platform_is_displayed_with_variant() {
         assert_eq!(
             Platform {
@@ -553,5 +613,151 @@ mod tests {
             platform: None,
         };
         assert!(verify(&descriptor, content).is_ok());
+    }
+
+    mod resolution {
+        use super::*;
+
+        struct Scratch(Utf8PathBuf);
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn scratch(name: &str) -> Scratch {
+            let dir = Utf8PathBuf::from(std::env::temp_dir().to_str().expect("utf-8 tmpdir"))
+                .join(format!("oci-runtime-resolve-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("blobs/sha256")).expect("create layout");
+            std::fs::write(dir.join("oci-layout"), "{}").expect("oci-layout");
+            Scratch(dir)
+        }
+
+        /// Stores `bytes` under its digest and returns a descriptor JSON fragment.
+        fn install_blob(
+            root: &Utf8Path,
+            media_type: &str,
+            bytes: &[u8],
+            platform: Option<&str>,
+        ) -> String {
+            let hex = hex_encode(&Sha256::digest(bytes));
+            std::fs::write(root.join("blobs/sha256").join(&hex), bytes).expect("write blob");
+            let platform = match platform {
+                None => String::new(),
+                Some(platform) => {
+                    let mut fields = platform.split('/');
+                    let os = fields.next().unwrap_or_default();
+                    let architecture = fields.next().unwrap_or_default();
+                    let variant = match fields.next() {
+                        Some(variant) => format!(r#","variant":"{variant}""#),
+                        None => String::new(),
+                    };
+                    format!(
+                        r#","platform":{{"os":"{os}","architecture":"{architecture}"{variant}}}"#
+                    )
+                }
+            };
+            format!(
+                r#"{{"mediaType":"{media_type}","digest":"sha256:{hex}","size":{}{platform}}}"#,
+                bytes.len()
+            )
+        }
+
+        /// A manifest whose image config records the platform it was built for,
+        /// so a test can tell which one was resolved.
+        fn manifest_for(root: &Utf8Path, platform: &str) -> String {
+            let config = install_blob(
+                root,
+                "application/vnd.oci.image.config.v1+json",
+                format!(r#"{{"config":{{"Cmd":["{platform}"]}}}}"#).as_bytes(),
+                None,
+            );
+            install_blob(
+                root,
+                MEDIA_TYPE_OCI_MANIFEST,
+                format!(r#"{{"config":{config},"layers":[]}}"#).as_bytes(),
+                Some(platform),
+            )
+        }
+
+        /// The shape registries publish: the arm64 manifest carries the default
+        /// `v8` variant, the amd64 one carries none, and 32-bit arm carries a
+        /// variant that really does discriminate.
+        fn multi_platform_layout(name: &str) -> Scratch {
+            let root = scratch(name);
+            let amd64 = manifest_for(&root.0, "linux/amd64");
+            let arm64 = manifest_for(&root.0, "linux/arm64/v8");
+            let arm = manifest_for(&root.0, "linux/arm/v7");
+            std::fs::write(
+                root.0.join("index.json"),
+                format!(r#"{{"manifests":[{amd64},{arm64},{arm}]}}"#),
+            )
+            .expect("index.json");
+            root
+        }
+
+        /// The `Cmd` of the resolved manifest, which names its platform.
+        fn resolved_platform(layout: &Layout, platform: &str) -> String {
+            let platform = crate::parse_platform(Some(platform)).expect("platform");
+            let manifest = layout.resolve_manifest(&platform).expect("a manifest");
+            let config = layout.read_image_config(&manifest).expect("image config");
+            config.cmd.expect("Cmd").join(" ")
+        }
+
+        #[test]
+        fn a_manifest_declaring_the_default_variant_is_resolved() {
+            let root = multi_platform_layout("default-variant");
+            let layout = Layout::open(&root.0).expect("layout");
+
+            assert_eq!(resolved_platform(&layout, "linux/arm64"), "linux/arm64/v8");
+            assert_eq!(
+                resolved_platform(&layout, "linux/arm64/v8"),
+                "linux/arm64/v8"
+            );
+            assert_eq!(resolved_platform(&layout, "linux/amd64"), "linux/amd64");
+            assert_eq!(resolved_platform(&layout, "linux/amd64/v1"), "linux/amd64");
+            assert_eq!(resolved_platform(&layout, "linux/arm/v7"), "linux/arm/v7");
+        }
+
+        #[test]
+        fn a_nested_index_declaring_the_default_variant_is_descended_into() {
+            let root = scratch("nested-variant");
+            let arm64 = manifest_for(&root.0, "linux/arm64/v8");
+            let nested = install_blob(
+                &root.0,
+                MEDIA_TYPE_OCI_INDEX,
+                format!(r#"{{"manifests":[{arm64}]}}"#).as_bytes(),
+                Some("linux/arm64/v8"),
+            );
+            std::fs::write(
+                root.0.join("index.json"),
+                format!(r#"{{"manifests":[{nested}]}}"#),
+            )
+            .expect("index.json");
+
+            let layout = Layout::open(&root.0).expect("layout");
+            assert_eq!(resolved_platform(&layout, "linux/arm64"), "linux/arm64/v8");
+        }
+
+        #[test]
+        fn a_platform_the_image_lacks_reports_what_it_has() {
+            let root = multi_platform_layout("no-match");
+            let layout = Layout::open(&root.0).expect("layout");
+
+            let platform = crate::parse_platform(Some("linux/riscv64")).expect("platform");
+            let error = layout.resolve_manifest(&platform).expect_err("no manifest");
+            assert_eq!(
+                error.to_string(),
+                "image has no manifest for linux/riscv64 \
+                 (available: linux/amd64, linux/arm/v7, linux/arm64/v8)"
+            );
+
+            // A variant that is not the architecture default still discriminates.
+            let platform = crate::parse_platform(Some("linux/arm/v6")).expect("platform");
+            let error = layout.resolve_manifest(&platform).expect_err("no manifest");
+            assert!(matches!(error, Error::NoMatchingPlatform { .. }));
+        }
     }
 }
