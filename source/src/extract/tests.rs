@@ -1188,3 +1188,25 @@ fn every_route_agrees_when_a_layer_writes_through_a_symlink() {
     );
 }
 
+
+/// An opaque whiteout hides what is *in* a directory. The directory itself
+/// stays, and a route that resolves the tree up front has to keep it too.
+#[test]
+fn every_route_agrees_on_an_opaque_whiteout() {
+    assert_routes_agree(
+        "route-opaque",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/one", b"one");
+                append_dir(b, "d/sub/");
+                append_file(b, "d/sub/two", b"two");
+            }),
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/.wh..wh..opq", b"");
+            }),
+        ],
+    );
+}

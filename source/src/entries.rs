@@ -123,9 +123,7 @@ impl Table {
                 mtime: header.mtime().unwrap_or(0),
                 offset: entry.raw_file_position(),
                 size: entry.size(),
-                path: entry
-                    .path_bytes()
-                    .into_owned(),
+                path: without_trailing_slash(entry.path_bytes().into_owned()),
                 link: entry
                     .link_name_bytes()
                     .map(|link| link.into_owned())
@@ -221,6 +219,19 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(bytes);
     Ok(())
+}
+
+/// `tar` spells a directory with a trailing slash, which would leave the plan
+/// holding `d/` for the directory and `d` for the same place as an ancestor of
+/// what is under it. Worse, `d/` sorts inside its own subtree, so clearing the
+/// subtree takes the directory with it.
+fn without_trailing_slash(mut path: Vec<u8>) -> Vec<u8> {
+    let kept = path.iter().rposition(|&byte| byte != b'/').map_or(0, |at| at + 1);
+    // A path of nothing but slashes names the root, which has no shorter form.
+    if kept > 0 {
+        path.truncate(kept);
+    }
+    path
 }
 
 fn short(what: &str) -> io::Error {
@@ -331,9 +342,39 @@ mod tests {
         assert_eq!(table.entries[2].link, b"dir/file");
     }
 
+    /// The plan keys its tree on these paths, and `d/` would sort inside its
+    /// own subtree rather than at the head of it.
     #[test]
-    fn a_table_survives_serialisation() {
-        let table = Table::build(&sample()[..]).expect("table");
+    fn directory_paths_are_recorded_without_their_trailing_slash() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, "d/", std::io::empty())
+            .expect("dir");
+
+        let tar = builder.into_inner().expect("tar");
+        let table = Table::build(&tar[..]).expect("table");
+        assert_eq!(table.entries[0].path, b"d");
+    }
+
+    #[test]
+    fn a_path_of_nothing_but_slashes_is_left_alone() {
+        assert_eq!(without_trailing_slash(b"d/".to_vec()), b"d");
+        assert_eq!(without_trailing_slash(b"a/b//".to_vec()), b"a/b");
+        assert_eq!(without_trailing_slash(b"./".to_vec()), b".");
+        assert_eq!(without_trailing_slash(b"file".to_vec()), b"file");
+        assert_eq!(
+            without_trailing_slash(b"/".to_vec()),
+            b"/",
+            "the root has no shorter form to reduce to"
+        );
+    }
+
+    #[test]
+    fn a_table_survives_serialisation() {        let table = Table::build(&sample()[..]).expect("table");
         let mut bytes = Vec::new();
         table.write_to(&mut bytes).expect("write");
         assert_eq!(Table::read_from(&bytes[..]).expect("read"), table);
