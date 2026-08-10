@@ -201,8 +201,8 @@ case_verbose_logging() {
     </dev/null 2>"${TEST_TMPDIR}/verbose.err")
   stderr=$(cat "${TEST_TMPDIR}/verbose.err")
   assert_equals "only-container-output" "$stdout" "verbose stdout"
-  assert_contains "$stderr" "Extracting layer" "verbose setup logging"
-  assert_not_contains "$stdout" "Extracting layer" "setup logging kept off stdout"
+  assert_contains "$stderr" "Extracting" "verbose setup logging"
+  assert_not_contains "$stdout" "Extracting" "setup logging kept off stdout"
 }
 
 case_signal_forwarding() {

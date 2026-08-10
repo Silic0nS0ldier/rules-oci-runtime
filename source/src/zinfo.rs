@@ -125,6 +125,14 @@ impl Index {
     /// Inflates the span between checkpoint `i` and its successor (or the end
     /// of the stream) and verifies it against the recorded CRC.
     pub fn extract_span(&self, blob: &[u8], i: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.extract_span_into(blob, i, &mut out)?;
+        Ok(out)
+    }
+
+    /// The same, appending to a buffer the caller keeps, so a reader working
+    /// through a run of spans neither reallocates nor copies between them.
+    pub fn extract_span_into(&self, blob: &[u8], i: usize, out: &mut Vec<u8>) -> Result<()> {
         let context = "resuming from checkpoint";
         let point = &self.checkpoints[i];
         let end = self
@@ -164,12 +172,14 @@ impl Index {
                 .map_err(|e| Error::io(context, e))?;
         }
 
-        let mut out = vec![0u8; len];
+        let base = out.len();
+        out.resize(base + len, 0);
+        let span = &mut out[base..];
         let mut in_pos = point.in_offset as usize;
         let mut filled = 0usize;
         while filled < len {
             let (consumed, produced, ret) = inflater
-                .inflate(&blob[in_pos..], &mut out[filled..], Flush::None)
+                .inflate(&blob[in_pos..], &mut span[filled..], Flush::None)
                 .map_err(|e| Error::io(context, e))?;
             in_pos += consumed;
             filled += produced;
@@ -196,14 +206,14 @@ impl Index {
         }
 
         let mut crc = flate2::Crc::new();
-        crc.update(&out);
+        crc.update(span);
         if crc.sum() != point.crc {
             return Err(Error::io(
                 context,
                 io::Error::other(format!("checkpoint {i} does not match its span checksum")),
             ));
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn write_to(&self, mut writer: impl Write) -> io::Result<()> {

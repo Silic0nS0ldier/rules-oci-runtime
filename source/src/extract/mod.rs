@@ -9,6 +9,7 @@ mod entry;
 mod file;
 mod pipeline;
 mod plan;
+mod spans;
 #[cfg(test)]
 mod tests;
 
@@ -86,6 +87,33 @@ impl RootfsExtractor {
         Ok(())
     }
 
+    /// Places every layer of the image.
+    ///
+    /// A resolved image whose entries are all placeable goes straight from the
+    /// plan: the spans of every layer become one queue of work, and each is
+    /// inflated and written by the same thread. Anything else is walked a
+    /// layer at a time, which is what has to happen when the plan cannot say
+    /// where an entry ends up without building the tree to find out.
+    pub fn apply(&mut self, layout: &Layout, descriptors: &[Descriptor]) -> Result<()> {
+        if let Some(work) = self.plan.work() {
+            // Every layer needs a checkpoint index, since a span is where a
+            // worker starts inflating. One checkpoint is enough: it means the
+            // layer is one span.
+            let indexes: Option<Vec<zinfo::Index>> = self
+                .index_dir
+                .as_deref()
+                .map(|dir| descriptors.iter().map(|d| index_at(dir, d)).collect())
+                .unwrap_or_default();
+            if let Some(indexes) = indexes {
+                return spans::extract(&self.rootfs, layout, descriptors, &self.plan, work, indexes);
+            }
+        }
+        for descriptor in descriptors {
+            self.apply_layer(layout, descriptor)?;
+        }
+        Ok(())
+    }
+
     /// Decompression is CPU bound and writing the rootfs is IO bound, so a
     /// second thread inflates the blob while this one writes the entries. The
     /// two overlap rather than run back to back, which on a large layer is
@@ -136,36 +164,12 @@ impl RootfsExtractor {
         }
     }
 
-    /// The checkpoint index for this layer, when there is one and parallel
-    /// decompression can put it to use. An index is an optimisation, so
-    /// anything wrong with it means falling back, not failing: the streaming
-    /// path decides what the blob actually contains.
+    /// The checkpoint index for this layer, when there is one and the
+    /// streaming pipeline can put it to use. One checkpoint is the whole blob,
+    /// which buys that path nothing.
     fn layer_index(&self, descriptor: &Descriptor) -> Option<zinfo::Index> {
-        let dir = self.index_dir.as_ref()?;
-        if compression_of(&descriptor.media_type) != Some(Compression::Gzip) {
-            return None;
-        }
-        if thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
-            return None;
-        }
-        let hex = parse_digest(&descriptor.digest).ok()?.hex;
-        let path = dir.join(format!("{hex}.zinfo"));
-        let file = match fs::File::open(&path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
-            Err(err) => {
-                warning!("ignoring layer index {path}: {err}");
-                return None;
-            }
-        };
-        match zinfo::Index::read_from(io::BufReader::new(file)) {
-            Ok(index) if index.checkpoints.len() > 1 => Some(index),
-            Ok(_) => None,
-            Err(err) => {
-                warning!("ignoring layer index {path}: {err}");
-                None
-            }
-        }
+        index_at(self.index_dir.as_deref()?, descriptor)
+            .filter(|index| index.checkpoints.len() > 1)
     }
 
     /// Applies the recorded directory permissions, deepest first.
@@ -182,5 +186,36 @@ impl RootfsExtractor {
             }
         }
         Ok(())
+    }
+}
+
+/// Reads the checkpoint index recorded for a layer, if there is a usable one.
+///
+/// An index is an optimisation, so anything wrong with it means falling back
+/// rather than failing: whichever path ends up reading the layer decides what
+/// it actually contains.
+fn index_at(dir: &Utf8Path, descriptor: &Descriptor) -> Option<zinfo::Index> {
+    if compression_of(&descriptor.media_type) != Some(Compression::Gzip) {
+        return None;
+    }
+    if thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+        return None;
+    }
+    let hex = parse_digest(&descriptor.digest).ok()?.hex;
+    let path = dir.join(format!("{hex}.zinfo"));
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warning!("ignoring layer index {path}: {err}");
+            return None;
+        }
+    };
+    match zinfo::Index::read_from(io::BufReader::new(file)) {
+        Ok(index) => Some(index),
+        Err(err) => {
+            warning!("ignoring layer index {path}: {err}");
+            None
+        }
     }
 }
