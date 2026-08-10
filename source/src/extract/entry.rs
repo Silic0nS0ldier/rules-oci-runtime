@@ -63,6 +63,15 @@ impl RootfsExtractor {
                 continue;
             }
             if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX.as_bytes()) {
+                // `.wh.` with nothing after it names nothing to remove, and
+                // taking it as a name would leave it pointing at the directory
+                // the marker sits in.
+                if target.is_empty() {
+                    return Err(Error::InvalidWhiteout {
+                        layer: layer.to_string(),
+                        path: path.display().to_string(),
+                    });
+                }
                 // `target` borrows the buffer the new name has to go into.
                 let target = std::ffi::OsStr::from_bytes(target).to_owned();
                 dst.set_file_name(target);
