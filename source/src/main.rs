@@ -1,5 +1,6 @@
 mod bundle;
 mod cli;
+mod entries;
 mod error;
 mod extract;
 mod fsutil;
@@ -82,6 +83,7 @@ fn run(args: RunArgs) -> Result<i32> {
 
     let rootfs = bundle.rootfs();
     let mut extractor = RootfsExtractor::new(&rootfs, args.index.as_deref())?;
+    extractor.plan(&manifest.layers);
     for layer in &manifest.layers {
         extractor.apply_layer(&layout, layer)?;
     }
@@ -140,14 +142,19 @@ fn run(args: RunArgs) -> Result<i32> {
 
 fn index(args: IndexArgs) -> Result<i32> {
     if let Some(blob) = &args.blob {
-        index_blob(blob, &args.output, args.span)?;
+        index_blob(
+            blob,
+            &args.output,
+            &Utf8PathBuf::from(format!("{}.entries", args.output)),
+            args.span,
+        )?;
     } else if let Some(layout) = &args.layout {
         index_layout(layout, &args.output, args.span)?;
     }
     Ok(0)
 }
 
-fn index_blob(blob: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
+fn index_blob(blob: &Utf8Path, checkpoints: &Utf8Path, entries: &Utf8Path, span: u64) -> Result<()> {
     let file =
         std::fs::File::open(blob).map_err(|source| Error::io(format!("opening {blob}"), source))?;
     let len = file.metadata().map_or(0, |m| m.len()) as usize;
@@ -161,17 +168,39 @@ fn index_blob(blob: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
         Some(mapping) => mapping,
         None => &read,
     };
-    let index = zinfo::Index::build(bytes, span).map_err(|source| match source {
-        // Which blob failed matters more than usual here: this runs as a build
-        // action over every layer of an image at once.
+    // Which blob failed matters more than usual here: this runs as a build
+    // action over every layer of an image at once.
+    let named = |source| match source {
         Error::Io { context, source } => Error::io(format!("{context} {blob}"), source),
         other => other,
-    })?;
-    let file = std::fs::File::create(output)
-        .map_err(|source| Error::io(format!("creating {output}"), source))?;
-    index
-        .write_to(std::io::BufWriter::new(file))
-        .map_err(|source| Error::io(format!("writing {output}"), source))
+    };
+
+    let index = zinfo::Index::build(bytes, span).map_err(named)?;
+    write_sidecar(checkpoints, |writer| index.write_to(writer))?;
+
+    // A second pass rather than a second job for the inflater: the entry walk
+    // wants the tar stream in order, and the checkpoint pass keeps none of it.
+    //
+    // A layer the walk cannot follow still extracts, because extraction reads
+    // the stream itself; it just does not get planned. So the table is left
+    // out rather than failing the build over it.
+    match entries::Table::build(flate2::read::MultiGzDecoder::new(bytes)) {
+        Ok(table) => write_sidecar(entries, |writer| table.write_to(writer)),
+        Err(err) => {
+            log::warn(format!("not recording the entries of {blob}: {err}"));
+            Ok(())
+        }
+    }
+}
+
+fn write_sidecar(
+    path: &Utf8Path,
+    write: impl FnOnce(std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> Result<()> {
+    let file = std::fs::File::create(path)
+        .map_err(|source| Error::io(format!("creating {path}"), source))?;
+    write(std::io::BufWriter::new(file))
+        .map_err(|source| Error::io(format!("writing {path}"), source))
 }
 
 /// Indexes every gzip layer of every manifest in the layout, so a
@@ -197,7 +226,11 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
                 continue;
             }
             let blob = layout.blob_path(&layer.digest)?;
-            work.push((blob, output.join(format!("{hex}.zinfo"))));
+            work.push((
+                blob,
+                output.join(format!("{hex}.zinfo")),
+                output.join(format!("{hex}.entries")),
+            ));
         }
     }
 
@@ -217,8 +250,8 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
             scope.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((blob, output)) = work.get(i) else { break };
-                    let result = index_blob(blob, output, span);
+                    let Some((blob, checkpoints, entries)) = work.get(i) else { break };
+                    let result = index_blob(blob, checkpoints, entries, span);
                     *results[i].lock().expect("index result") = Some(result);
                 }
             });

@@ -147,18 +147,22 @@ case_layer_indexes() {
   fi
 
   local index_dir="${runfiles}/${index_path}"
-  local count=0 entry
+  local checkpoints=0 tables=0 entry
   for entry in "$index_dir"/*; do
-    count=$((count + 1))
-    if [[ ! "$(basename "$entry")" =~ ^[0-9a-f]{64}\.zinfo$ ]]; then
-      fail "unexpected index entry ${entry}"
-    fi
+    case "$(basename "$entry")" in
+      [0-9a-f]*.zinfo) checkpoints=$((checkpoints + 1)) ;;
+      [0-9a-f]*.entries) tables=$((tables + 1)) ;;
+      *) fail "unexpected index entry ${entry}" ;;
+    esac
     if [[ ! -s "$entry" ]]; then
       fail "index ${entry} is empty"
     fi
   done
-  if [[ "$count" -eq 0 ]]; then
+  if [[ "$checkpoints" -eq 0 ]]; then
     fail "no layer indexes in ${index_dir}"
+  fi
+  if [[ "$tables" -ne "$checkpoints" ]]; then
+    fail "expected an entry table per layer index, got ${tables} and ${checkpoints}"
   fi
 
   # The launcher must actually consume the indexes during extraction. It

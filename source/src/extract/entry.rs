@@ -84,6 +84,14 @@ impl RootfsExtractor {
                 continue;
             }
 
+            // A body a later layer replaces is written and then thrown away,
+            // so the plan takes it out before any of that happens.
+            if matches!(entry_type, EntryType::Regular | EntryType::Continuous)
+                && self.plan.is_shadowed(layer, path.as_os_str().as_bytes())
+            {
+                continue;
+            }
+
             if !self.parents.prepare(&dst)? {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),
