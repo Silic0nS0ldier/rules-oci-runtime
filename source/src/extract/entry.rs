@@ -35,6 +35,7 @@ impl RootfsExtractor {
         // than a handful per entry.
         let mut path = PathBuf::new();
         let mut dst = PathBuf::new();
+        self.written.clear();
 
         for entry in entries {
             let mut entry = entry.io_context(|| format!("reading layer {layer}"))?;
@@ -65,7 +66,8 @@ impl RootfsExtractor {
                 // `target` borrows the buffer the new name has to go into.
                 let target = std::ffi::OsStr::from_bytes(target).to_owned();
                 dst.set_file_name(target);
-                if self.parents.contains_parent_of(&dst)? {
+                // A whiteout hides the layers below it, never the one it is in.
+                if !self.written.contains(&dst) && self.parents.contains_parent_of(&dst)? {
                     log!("Whiteout: removing /{}", relative_display(root, &dst));
                     if fsutil::remove_any(&dst)? {
                         self.parents.forget(&dst);
@@ -83,6 +85,11 @@ impl RootfsExtractor {
                 );
                 continue;
             }
+
+            // Recorded before the entry is placed rather than after, so that a
+            // whiteout later in the layer can tell this layer's work from the
+            // work of the layers below whatever the plan does with the entry.
+            self.written.insert(dst.clone());
 
             // A body a later layer replaces is written and then thrown away,
             // so the plan takes it out before any of that happens.
@@ -206,17 +213,42 @@ impl RootfsExtractor {
         if !self.parents.contains(dir)? {
             return Ok(());
         }
+        log!("Whiteout: clearing /{}", relative_display(root, dir));
+        self.clear_lower_layers(dir)?;
+        self.parents.forget(dir);
+        Ok(())
+    }
+
+    /// Removes everything under `dir` that this layer did not put there.
+    ///
+    /// A path this layer wrote stays, and so does the directory holding it,
+    /// which is why this walks down rather than clearing the level and
+    /// stopping.
+    fn clear_lower_layers(&mut self, dir: &Path) -> Result<()> {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(Error::io(format!("listing {}", dir.display()), err)),
         };
-        log!("Whiteout: clearing /{}", relative_display(root, dir));
+        let mut keep = Vec::new();
         for entry in entries {
             let entry = entry.io_context(|| format!("listing {}", dir.display()))?;
-            fsutil::remove_any(&entry.path())?;
+            let path = entry.path();
+            if self.written.contains(&path) {
+                if entry
+                    .file_type()
+                    .io_context(|| format!("inspecting {}", path.display()))?
+                    .is_dir()
+                {
+                    keep.push(path);
+                }
+                continue;
+            }
+            fsutil::remove_any(&path)?;
         }
-        self.parents.forget(dir);
+        for path in keep {
+            self.clear_lower_layers(&path)?;
+        }
         Ok(())
     }
 }
