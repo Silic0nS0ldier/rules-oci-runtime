@@ -29,6 +29,10 @@ pub enum Kind {
     Directory,
     Symlink,
     HardLink,
+    /// A file whose body is stored as a sparse map rather than laid out flat,
+    /// so `offset` and `size` do not describe where its contents are. It takes
+    /// a path like any other file, but only `tar` knows how to place it.
+    Sparse,
     Unsupported,
 }
 
@@ -40,6 +44,7 @@ impl Kind {
             Kind::Symlink => 2,
             Kind::HardLink => 3,
             Kind::Unsupported => 4,
+            Kind::Sparse => 5,
         }
     }
 
@@ -50,8 +55,14 @@ impl Kind {
             2 => Kind::Symlink,
             3 => Kind::HardLink,
             4 => Kind::Unsupported,
+            5 => Kind::Sparse,
             _ => return None,
         })
+    }
+
+    /// True when the entry ends up as a regular file, however it is stored.
+    pub fn is_file(self) -> bool {
+        matches!(self, Kind::File | Kind::Sparse)
     }
 }
 
@@ -85,17 +96,19 @@ impl Table {
             let header = entry.header();
             let entry_type = header.entry_type();
             // Classified by what the extractor does with it, not by the type
-            // alone: a continuous file is a file, and a sparse one is placed
-            // like a file even though `tar` has to lay out its holes.
+            // alone: a continuous file is a plain file, while a sparse one
+            // ends up as a file but is not stored as one.
             let kind = if entry_type.is_dir() {
                 Kind::Directory
             } else if entry_type.is_symlink() {
                 Kind::Symlink
             } else if entry_type.is_hard_link() {
                 Kind::HardLink
+            } else if entry_type == tar::EntryType::GNUSparse {
+                Kind::Sparse
             } else if matches!(
                 entry_type,
-                tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse
+                tar::EntryType::Regular | tar::EntryType::Continuous
             ) {
                 Kind::File
             } else {

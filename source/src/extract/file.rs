@@ -69,11 +69,20 @@ pub(super) fn unpack_regular<R: Read>(
 
     // `mode` is what the file was created with, but the umask applies to
     // creation and not to this, so it is still needed to get the mode asked for.
-    file.set_permissions(fs::Permissions::from_mode(mode))?;
-    if let Ok(mtime) = entry.header().mtime() {
-        set_mtime(&file, mtime);
-    }
+    finish_file(&file, mode, entry.header().mtime().ok())?;
     Ok(replaced)
+}
+
+/// Gives a freshly written file the mode and timestamp its entry asked for.
+///
+/// The mode is applied again because the umask applies to creation but not to
+/// this, and it is the only way to end up with what the layer asked for.
+pub(super) fn finish_file(file: &fs::File, mode: u32, mtime: Option<u64>) -> io::Result<()> {
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    if let Some(mtime) = mtime {
+        set_mtime(file, mtime);
+    }
+    Ok(())
 }
 
 fn open_exclusive(dst: &Path, mode: u32) -> io::Result<fs::File> {
