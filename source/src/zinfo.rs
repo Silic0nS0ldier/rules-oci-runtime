@@ -126,13 +126,23 @@ impl Index {
     /// of the stream) and verifies it against the recorded CRC.
     pub fn extract_span(&self, blob: &[u8], i: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        self.extract_span_into(blob, i, &mut out)?;
+        self.extract_span_into(blob, i, &mut out, 0)?;
         Ok(out)
     }
 
-    /// The same, appending to a buffer the caller keeps, so a reader working
-    /// through a run of spans neither reallocates nor copies between them.
-    pub fn extract_span_into(&self, blob: &[u8], i: usize, out: &mut Vec<u8>) -> Result<()> {
+    /// The same, into `out` at `at`, returning how much was written.
+    ///
+    /// `out` is only ever grown, never truncated, so a caller working through
+    /// span after span pays to zero a buffer once rather than once per span.
+    /// Only the bytes this reports are freshly inflated; anything after them
+    /// is whatever the last caller left behind.
+    pub fn extract_span_into(
+        &self,
+        blob: &[u8],
+        i: usize,
+        out: &mut Vec<u8>,
+        at: usize,
+    ) -> Result<usize> {
         let context = "resuming from checkpoint";
         let point = &self.checkpoints[i];
         let end = self
@@ -172,9 +182,10 @@ impl Index {
                 .map_err(|e| Error::io(context, e))?;
         }
 
-        let base = out.len();
-        out.resize(base + len, 0);
-        let span = &mut out[base..];
+        if out.len() < at + len {
+            out.resize(at + len, 0);
+        }
+        let span = &mut out[at..at + len];
         let mut in_pos = point.in_offset as usize;
         let mut filled = 0usize;
         while filled < len {
@@ -213,7 +224,7 @@ impl Index {
                 io::Error::other(format!("checkpoint {i} does not match its span checksum")),
             ));
         }
-        Ok(())
+        Ok(len)
     }
 
     pub fn write_to(&self, mut writer: impl Write) -> io::Result<()> {
@@ -470,9 +481,32 @@ mod tests {
         assert_spans_reproduce(&index, &blob, &data);
     }
 
+    /// The buffer is reused between spans and only ever grows, so what a span
+    /// reports is the only part of it that belongs to that span. A caller
+    /// reading past it would be handed whatever the last, longer span left.
     #[test]
-    fn a_second_gzip_member_gets_its_own_checkpoint() {
-        let first = sample_data(300 << 10);
+    fn a_span_owns_only_what_it_reports_writing() {
+        let data = sample_data(2 << 20);
+        let blob = gzip(&data);
+        let index = Index::build(&blob, 128 << 10).unwrap();
+
+        let mut buffer = vec![0xab; 4 << 20];
+        let stale = buffer.len();
+        let written = index
+            .extract_span_into(&blob, 1, &mut buffer, 0)
+            .expect("span");
+
+        let start = index.checkpoints[1].out_offset as usize;
+        assert_eq!(&buffer[..written], &data[start..start + written]);
+        assert_eq!(buffer.len(), stale, "a buffer this size needs no growing");
+        assert!(
+            buffer[written..].iter().all(|&byte| byte == 0xab),
+            "nothing past the span may be touched"
+        );
+    }
+
+    #[test]
+    fn a_second_gzip_member_gets_its_own_checkpoint() {        let first = sample_data(300 << 10);
         let second = sample_data(200 << 10);
         let mut blob = gzip(&first);
         let member_start = blob.len() as u64;

@@ -306,16 +306,20 @@ fn run_span(
 
     // A body can run past the end of its own span, so the run continues into
     // the ones after it. They are claimed by whoever needs them.
-    buffer.clear();
+    //
+    // `filled` is what this unit inflated, which is not the buffer's length:
+    // the buffer keeps whatever the last unit grew it to, so that growing it
+    // is the only thing that has to zero anything.
+    let mut filled = 0usize;
     let mut at = checkpoint;
-    while (buffer.len() as u64) < needed {
+    while (filled as u64) < needed {
         if at >= layer.index.checkpoints.len() {
             return Err(Error::io(
                 format!("extracting layer {}", layer.descriptor.digest),
                 std::io::Error::other("an entry runs past the end of the layer"),
             ));
         }
-        layer.index.extract_span_into(&layer.blob, at, buffer)?;
+        filled += layer.index.extract_span_into(&layer.blob, at, buffer, filled)?;
         at += 1;
     }
 
@@ -323,7 +327,11 @@ fn run_span(
         let entry = &table.entries[entry as usize];
         let from = (entry.offset - base) as usize;
         let to = from + entry.size as usize;
-        let body = buffer.get(from..to).ok_or_else(|| {
+        // Bounded by what this unit inflated rather than by the buffer, which
+        // keeps the length the widest unit before it needed. `needed` above is
+        // taken from the last entry, so this holds already; slicing says so
+        // rather than leaving the buffer free to answer with stale bytes.
+        let body = buffer[..filled].get(from..to).ok_or_else(|| {
             Error::io(
                 format!("extracting layer {}", layer.descriptor.digest),
                 std::io::Error::other("an entry lies outside the span it was planned into"),
