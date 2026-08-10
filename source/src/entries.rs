@@ -84,13 +84,19 @@ impl Table {
             let entry = entry.io_context(|| context.to_string())?;
             let header = entry.header();
             let entry_type = header.entry_type();
+            // Classified by what the extractor does with it, not by the type
+            // alone: a continuous file is a file, and a sparse one is placed
+            // like a file even though `tar` has to lay out its holes.
             let kind = if entry_type.is_dir() {
                 Kind::Directory
             } else if entry_type.is_symlink() {
                 Kind::Symlink
             } else if entry_type.is_hard_link() {
                 Kind::HardLink
-            } else if entry_type.is_file() {
+            } else if matches!(
+                entry_type,
+                tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse
+            ) {
                 Kind::File
             } else {
                 Kind::Unsupported

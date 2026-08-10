@@ -28,10 +28,18 @@ use crate::log::{log, warning};
 const WHITEOUT_PREFIX: &[u8] = b".wh.";
 const OPAQUE_WHITEOUT: &[u8] = b".wh..wh..opq";
 
-/// The entries each layer can skip, keyed by layer digest.
+/// What `create_dir` would have given a directory nothing names.
+const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
+
+/// The entries each layer can skip, keyed by layer digest, and the directory
+/// tree they all need.
 #[derive(Default)]
 pub struct Plan {
     shadowed: HashMap<String, HashSet<Vec<u8>>>,
+    directories: Vec<(Vec<u8>, u32)>,
+    /// False when the image could not be resolved, and every layer therefore
+    /// has to be placed in full.
+    resolved: bool,
 }
 
 impl Plan {
@@ -81,23 +89,7 @@ impl Plan {
             .map(|entry| entry.link.as_slice())
             .collect();
 
-        // Sorted by path, so everything under a directory is one range and a
-        // whiteout costs what it removes rather than a pass over the image.
-        let mut winner: BTreeMap<&[u8], (usize, usize)> = BTreeMap::new();
-        for (l, table) in tables.iter().enumerate() {
-            for (e, entry) in table.entries.iter().enumerate() {
-                match whiteout(&entry.path) {
-                    Some(Whiteout::Opaque(dir)) => remove_under(&mut winner, &dir),
-                    Some(Whiteout::Named(target)) => {
-                        winner.remove(target.as_slice());
-                        remove_under(&mut winner, &target);
-                    }
-                    None => {
-                        winner.insert(&entry.path, (l, e));
-                    }
-                }
-            }
-        }
+        let tree = replay(tables);
 
         let mut shadowed: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
         let mut total = 0;
@@ -113,7 +105,10 @@ impl Plan {
                 if linked.contains(entry.path.as_slice()) {
                     continue;
                 }
-                if winner.get(entry.path.as_slice()) != Some(&(l, e)) {
+                let survives = tree
+                    .get(entry.path.as_slice())
+                    .is_some_and(|node| node.owner == (l, e));
+                if !survives {
                     bytes += entry.size;
                     doomed.insert(entry.path.clone());
                 }
@@ -129,7 +124,22 @@ impl Plan {
                 bytes >> 20
             );
         }
-        Plan { shadowed }
+        Plan {
+            shadowed,
+            directories: directories(&tree),
+            resolved: true,
+        }
+    }
+
+    /// True when the whole image was resolved, so the directory tree below is
+    /// the one it ends up with and the layers need not build it themselves.
+    pub fn is_resolved(&self) -> bool {
+        self.resolved
+    }
+
+    /// The directories the image needs, parents before children.
+    pub fn directories(&self) -> &[(Vec<u8>, u32)] {
+        &self.directories
     }
 
     /// True when this layer's copy of `path` is replaced or removed by a later
@@ -139,6 +149,121 @@ impl Plan {
             .get(digest)
             .is_some_and(|doomed| doomed.contains(path))
     }
+}
+
+/// What the layers leave at a path once all of them have been applied.
+struct Node {
+    kind: Kind,
+    /// The layer and entry that put it there.
+    owner: (usize, usize),
+    mode: u32,
+}
+
+/// Replays every layer in order into the tree they build between them.
+///
+/// This mirrors what the extractor does to the filesystem, entry for entry,
+/// which is what makes the result something the extractor can be held to:
+/// a directory keeps a symlink already standing where it wants to be, and
+/// anything else takes over the path it names and everything underneath it.
+///
+/// Sorted by path, so everything under a directory is one contiguous range and
+/// a removal costs what it removes rather than a pass over the whole image.
+fn replay(tables: &[Table]) -> BTreeMap<&[u8], Node> {
+    let mut tree: BTreeMap<&[u8], Node> = BTreeMap::new();
+    let mut bound = Vec::new();
+    for (l, table) in tables.iter().enumerate() {
+        for (e, entry) in table.entries.iter().enumerate() {
+            match whiteout(&entry.path) {
+                Some(Whiteout::Opaque(dir)) => remove_under(&mut tree, &dir, &mut bound),
+                Some(Whiteout::Named(target)) => {
+                    tree.remove(target.as_slice());
+                    remove_under(&mut tree, &target, &mut bound);
+                }
+                None => {
+                    let node = Node {
+                        kind: entry.kind,
+                        owner: (l, e),
+                        mode: entry.mode,
+                    };
+                    match entry.kind {
+                        // The extractor warns and moves on, leaving the path
+                        // as it found it.
+                        Kind::Unsupported => {}
+                        Kind::Directory => {
+                            // `prepare_directory` keeps a symlink that already
+                            // resolves to a directory, so the layer's own
+                            // directory entry does not take the path back.
+                            let keep = tree
+                                .get(entry.path.as_slice())
+                                .is_some_and(|at| at.kind == Kind::Symlink);
+                            if !keep {
+                                tree.insert(&entry.path, node);
+                            }
+                        }
+                        // Everything else clears the path first, which takes
+                        // the tree underneath it as well.
+                        _ => {
+                            remove_under(&mut tree, &entry.path, &mut bound);
+                            tree.insert(&entry.path, node);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tree
+}
+
+/// The directories the final tree needs, parents before children.
+///
+/// A path that ends up a symlink is left out however many entries sit under
+/// it: what it points at is where they actually go, and creating a directory
+/// there would displace the link.
+fn directories(tree: &BTreeMap<&[u8], Node>) -> Vec<(Vec<u8>, u32)> {
+    let mut wanted: BTreeMap<&[u8], u32> = BTreeMap::new();
+    for (path, node) in tree {
+        if node.kind == Kind::Directory && !behind_a_link(tree, path) {
+            wanted.insert(path, node.mode);
+        }
+        // Ancestors nothing names still have to exist. `create_dir` would have
+        // made them with the default mode, so they get it here too.
+        for ancestor in ancestors(path) {
+            if tree.contains_key(ancestor)
+                || wanted.contains_key(ancestor)
+                || behind_a_link(tree, ancestor)
+            {
+                continue;
+            }
+            wanted.insert(ancestor, DEFAULT_DIRECTORY_MODE);
+        }
+    }
+    // A `BTreeMap` orders by path, so a parent always precedes what is under
+    // it and the tree can be created in one pass.
+    wanted
+        .into_iter()
+        .map(|(path, mode)| (path.to_vec(), mode))
+        .collect()
+}
+
+/// Every strict ancestor of `path`, shallowest first.
+fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(move |(at, _)| &path[..at])
+        .filter(|ancestor| !ancestor.is_empty())
+}
+
+/// True when something that is not a directory stands on the way to `path`.
+///
+/// Whatever that is resolves somewhere else, and it is not created here, so
+/// there would be nothing to create this under. The extractor resolves the
+/// entries that live there against the tree as it builds it, as it always has.
+fn behind_a_link(tree: &BTreeMap<&[u8], Node>, path: &[u8]) -> bool {
+    ancestors(path).any(|ancestor| {
+        tree.get(ancestor)
+            .is_some_and(|node| node.kind != Kind::Directory)
+    })
 }
 
 enum Whiteout {
@@ -174,21 +299,29 @@ fn whiteout(path: &[u8]) -> Option<Whiteout> {
 
 /// Drops every entry beneath `dir`, without touching a sibling whose name
 /// merely starts the same way.
-fn remove_under(winner: &mut BTreeMap<&[u8], (usize, usize)>, dir: &[u8]) {
-    let mut low = dir.to_vec();
-    low.push(b'/');
-    let mut high = low.clone();
-    // One past every path that continues with a separator.
-    *high.last_mut().expect("a trailing separator") = b'/' + 1;
-    let doomed: Vec<&[u8]> = winner
-        .range::<[u8], _>((
-            std::ops::Bound::Included(low.as_slice()),
-            std::ops::Bound::Excluded(high.as_slice()),
-        ))
-        .map(|(path, _)| *path)
-        .collect();
+///
+/// Every entry that is not a directory replays through here, so the bound it
+/// seeks from is built in a buffer the caller keeps rather than a fresh pair
+/// of allocations per path.
+fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8>) {
+    bound.clear();
+    bound.extend_from_slice(dir);
+    bound.push(b'/');
+
+    // Everything under `dir` sorts from the bound onwards and is contiguous,
+    // so the first path that is not under it ends the range.
+    let mut doomed: Vec<&[u8]> = Vec::new();
+    for (path, _) in tree.range::<[u8], _>((
+        std::ops::Bound::Included(bound.as_slice()),
+        std::ops::Bound::Unbounded,
+    )) {
+        if !path.starts_with(bound) {
+            break;
+        }
+        doomed.push(path);
+    }
     for path in doomed {
-        winner.remove(path);
+        tree.remove(path);
     }
 }
 
@@ -216,6 +349,38 @@ mod tests {
             path: path.as_bytes().to_vec(),
             link: Vec::new(),
         }
+    }
+
+    fn of_kind(path: &str, kind: Kind) -> Entry {
+        Entry {
+            kind,
+            mode: if kind == Kind::Directory { 0o755 } else { 0o644 },
+            ..file(path)
+        }
+    }
+
+    fn dir(path: &str) -> Entry {
+        of_kind(path, Kind::Directory)
+    }
+
+    fn symlink(path: &str, target: &str) -> Entry {
+        Entry {
+            link: target.as_bytes().to_vec(),
+            ..of_kind(path, Kind::Symlink)
+        }
+    }
+
+    fn layer(entries: Vec<Entry>) -> Table {
+        Table { entries }
+    }
+
+    /// The paths the plan would create as directories, for readability.
+    fn dirs_of(layers: &[Table]) -> Vec<String> {
+        let (plan, _) = plan_of(layers);
+        plan.directories()
+            .iter()
+            .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
+            .collect()
     }
 
     fn table(paths: &[&str]) -> Table {
@@ -307,9 +472,127 @@ mod tests {
         assert!(!plan.is_shadowed(&descriptor(0).digest, b"anything"));
     }
 
+    /// Replacing a directory with anything else takes the tree under it away,
+    /// exactly as `remove_any` does during extraction. Without this the plan
+    /// would keep entries that no longer have anywhere to be, and once the
+    /// directory tree is built up front they would be written through whatever
+    /// took the directory's place.
+    mod a_directory_replaced_by_something_else {
+        use super::*;
+
+        #[test]
+        fn a_symlink_takes_the_tree_under_it() {
+            let (plan, d) = plan_of(&[
+                layer(vec![dir("lib"), file("lib/a"), file("lib/sub/b"), file("libre")]),
+                layer(vec![symlink("lib", "usr/lib")]),
+            ]);
+            assert!(plan.is_shadowed(&d[0].digest, b"lib/a"));
+            assert!(plan.is_shadowed(&d[0].digest, b"lib/sub/b"));
+            assert!(
+                !plan.is_shadowed(&d[0].digest, b"libre"),
+                "a sibling that merely starts the same way is untouched"
+            );
+        }
+
+        #[test]
+        fn a_file_takes_the_tree_under_it() {
+            let (plan, d) = plan_of(&[
+                layer(vec![dir("d"), file("d/a")]),
+                layer(vec![file("d")]),
+            ]);
+            assert!(plan.is_shadowed(&d[0].digest, b"d/a"));
+        }
+
+        #[test]
+        fn a_hard_link_takes_the_tree_under_it() {
+            let mut link = of_kind("d", Kind::HardLink);
+            link.link = b"elsewhere".to_vec();
+            let (plan, d) = plan_of(&[
+                layer(vec![dir("d"), file("d/a"), file("elsewhere")]),
+                layer(vec![link]),
+            ]);
+            assert!(plan.is_shadowed(&d[0].digest, b"d/a"));
+        }
+
+        /// The path is gone, so nothing may be created there as a directory.
+        #[test]
+        fn the_replaced_path_is_not_created_as_a_directory() {
+            let dirs = dirs_of(&[
+                layer(vec![dir("lib"), file("lib/a")]),
+                layer(vec![symlink("lib", "usr/lib")]),
+            ]);
+            assert!(
+                !dirs.iter().any(|d| d == "lib"),
+                "a symlink must not be displaced by a directory: {dirs:?}"
+            );
+        }
+
+        /// Restoring the directory afterwards puts everything back in play.
+        #[test]
+        fn a_directory_put_back_afterwards_is_a_directory_again() {
+            let dirs = dirs_of(&[
+                layer(vec![dir("d"), file("d/a")]),
+                layer(vec![file("d")]),
+                layer(vec![dir("d"), file("d/b")]),
+            ]);
+            assert!(dirs.iter().any(|entry| entry == "d"), "{dirs:?}");
+
+            let (plan, digests) = plan_of(&[
+                layer(vec![dir("d"), file("d/a")]),
+                layer(vec![file("d")]),
+                layer(vec![dir("d"), file("d/b")]),
+            ]);
+            assert!(plan.is_shadowed(&digests[0].digest, b"d/a"));
+            assert!(!plan.is_shadowed(&digests[2].digest, b"d/b"));
+        }
+
+        /// Nothing under the replacement is created either. A directory there
+        /// would have to be made through whatever took the path, which is not
+        /// created here and so is not there yet to be followed.
+        #[test]
+        fn nothing_beneath_the_replacement_is_created_either() {
+            let dirs = dirs_of(&[
+                layer(vec![symlink("lib", "usr/lib"), dir("usr"), dir("usr/lib")]),
+                layer(vec![dir("lib/sub"), file("lib/sub/a")]),
+            ]);
+            assert!(
+                !dirs.iter().any(|entry| entry.starts_with("lib")),
+                "nothing may be created behind the link: {dirs:?}"
+            );
+            assert!(dirs.iter().any(|entry| entry == "usr/lib"), "{dirs:?}");
+        }
+    }
+
+    /// A directory entry does not take a path back from a symlink that already
+    /// resolves to a directory, which is what keeps `/lib -> usr/lib` standing
+    /// when a later layer also ships `lib/`.
     #[test]
-    fn whiteout_names_are_recognised() {
-        assert!(matches!(whiteout(b"dir/.wh..wh..opq"), Some(Whiteout::Opaque(d)) if d == b"dir"));
+    fn a_directory_entry_leaves_a_standing_symlink_alone() {
+        let dirs = dirs_of(&[
+            layer(vec![symlink("lib", "usr/lib"), dir("usr"), dir("usr/lib")]),
+            layer(vec![dir("lib")]),
+        ]);
+        assert!(!dirs.iter().any(|d| d == "lib"), "{dirs:?}");
+        assert!(dirs.iter().any(|d| d == "usr/lib"), "{dirs:?}");
+    }
+
+    #[test]
+    fn directories_are_listed_parents_first() {
+        let dirs = dirs_of(&[layer(vec![dir("a/b/c"), file("a/b/c/d"), dir("a")])]);
+        assert_eq!(dirs, ["a", "a/b", "a/b/c"], "including the ones nothing names");
+    }
+
+    #[test]
+    fn a_whiteout_takes_the_directory_it_names_out_of_the_tree() {
+        let dirs = dirs_of(&[
+            layer(vec![dir("gone"), file("gone/a"), dir("kept")]),
+            layer(vec![file(".wh.gone")]),
+        ]);
+        assert_eq!(dirs, ["kept"]);
+    }
+
+    #[test]
+    fn whiteout_names_are_recognised() {        assert!(matches!(whiteout(b"dir/.wh..wh..opq"), Some(Whiteout::Opaque(d)) if d == b"dir"));
         assert!(matches!(whiteout(b".wh..wh..opq"), Some(Whiteout::Opaque(d)) if d.is_empty()));
         assert!(matches!(whiteout(b"dir/.wh.name"), Some(Whiteout::Named(n)) if n == b"dir/name"));
         assert!(matches!(whiteout(b".wh.name"), Some(Whiteout::Named(n)) if n == b"name"));
