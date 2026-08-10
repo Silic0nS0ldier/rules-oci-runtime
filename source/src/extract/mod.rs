@@ -14,6 +14,7 @@ mod tests;
 
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::mpsc::sync_channel;
@@ -56,8 +57,33 @@ impl RootfsExtractor {
     /// Resolves the image before extracting it, so that entries a later layer
     /// replaces are never written. Without an entry table for every layer this
     /// plans nothing and each layer is placed in full, as before.
-    pub fn plan(&mut self, layers: &[Descriptor]) {
+    ///
+    /// The directories the image ends up with are created here rather than
+    /// discovered a layer at a time, so nothing later has to work out where an
+    /// entry can go.
+    pub fn plan(&mut self, layers: &[Descriptor]) -> Result<()> {
         self.plan = plan::Plan::build(self.index_dir.as_deref(), layers);
+        if !self.plan.is_resolved() {
+            return Ok(());
+        }
+
+        let root = self.rootfs.clone();
+        let mut path = PathBuf::new();
+        for (relative, mode) in self.plan.directories() {
+            path.clear();
+            path.push(root.as_std_path());
+            path.push(std::ffi::OsStr::from_bytes(relative));
+            match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(Error::io(format!("creating {}", path.display()), err));
+                }
+            }
+            self.deferred_modes.push((path.clone(), *mode));
+        }
+        log!("Created {} directories", self.plan.directories().len());
+        Ok(())
     }
 
     /// Decompression is CPU bound and writing the rootfs is IO bound, so a

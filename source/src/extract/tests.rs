@@ -771,3 +771,158 @@ fn a_digest_mismatch_wins_over_index_errors() {
     }
     let _ = fsutil::force_remove_dir_all(root.as_std_path());
 }
+
+/// Applies several layers to one rootfs with the plan in play, the way a real
+/// image runs, so that what the plan decides is checked against what the
+/// extractor then does rather than on its own.
+fn extract_planned(root: &Utf8Path, layers: &[Vec<u8>]) -> Result<Utf8PathBuf> {
+    let index_dir = root.join("indexes");
+    fs::create_dir_all(&index_dir).expect("index dir");
+
+    let mut descriptors = Vec::new();
+    for tar in layers {
+        let descriptor = install_blob(root, PLAIN_LAYER, tar);
+        let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+        let table = crate::entries::Table::build(&tar[..]).expect("entry table");
+        let mut bytes = Vec::new();
+        table.write_to(&mut bytes).expect("serialise");
+        fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
+        descriptors.push(descriptor);
+    }
+    // `install_blob` rewrites index.json each time; the layers live in the
+    // manifest the caller passes to the extractor, not in the layout.
+    let layout = Layout::open(root)?;
+    let rootfs = root.join("rootfs");
+    let mut extractor = RootfsExtractor::new(&rootfs, Some(&index_dir))?;
+    extractor.plan(&descriptors)?;
+    for descriptor in &descriptors {
+        extractor.apply_layer(&layout, descriptor)?;
+    }
+    extractor.finish()?;
+    Ok(rootfs)
+}
+
+fn tar_of(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    build(&mut builder);
+    builder.into_inner().expect("tar")
+}
+
+fn append_dir(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_size(0);
+    builder.append_data(&mut header, path, io::empty()).expect("dir");
+}
+
+fn append_file(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8]) {
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_size(body.len() as u64);
+    builder.append_data(&mut header, path, body).expect("file");
+}
+
+fn append_symlink(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &str) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(EntryType::Symlink);
+    header.set_size(0);
+    builder.append_link(&mut header, path, target).expect("symlink");
+}
+
+/// A later layer turning a directory into a symlink is the case the plan has
+/// to get right: the files the earlier layer put in that directory are gone,
+/// and writing them anyway would send them through the link to somewhere they
+/// were never meant to be.
+#[test]
+fn a_directory_replaced_by_a_symlink_takes_its_contents_with_it() {
+    let root = scratch("planned-dir-to-symlink");
+    let rootfs = extract_planned(
+        &root,
+        &[
+            tar_of(|b| {
+                append_dir(b, "usr/");
+                append_dir(b, "usr/lib/");
+                append_file(b, "usr/lib/real", b"real");
+                append_dir(b, "lib/");
+                append_file(b, "lib/stale", b"stale");
+            }),
+            tar_of(|b| append_symlink(b, "lib", "usr/lib")),
+        ],
+    )
+    .expect("extract");
+
+    assert_eq!(
+        fs::read_link(rootfs.join("lib")).expect("symlink"),
+        Path::new("usr/lib"),
+        "the link the last layer asked for is what stands"
+    );
+    assert!(
+        !rootfs.join("usr/lib/stale").exists(),
+        "the replaced directory's contents must not reappear through the link"
+    );
+    assert_eq!(
+        fs::read_to_string(rootfs.join("usr/lib/real")).expect("real"),
+        "real"
+    );
+
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+/// The reverse: a symlink already standing where a later layer ships a
+/// directory keeps the link, so entries under it follow it.
+#[test]
+fn a_standing_symlink_survives_a_later_directory_entry() {
+    let root = scratch("planned-symlink-kept");
+    let rootfs = extract_planned(
+        &root,
+        &[
+            tar_of(|b| {
+                append_dir(b, "usr/");
+                append_dir(b, "usr/lib/");
+                append_symlink(b, "lib", "usr/lib");
+            }),
+            tar_of(|b| {
+                append_dir(b, "lib/");
+                append_file(b, "lib/through", b"through");
+            }),
+        ],
+    )
+    .expect("extract");
+
+    assert!(rootfs.join("lib").is_symlink(), "the link has to survive");
+    assert_eq!(
+        fs::read_to_string(rootfs.join("usr/lib/through")).expect("through"),
+        "through",
+        "an entry under the link lands where the link points"
+    );
+
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+/// Planning must not lose a whiteout: the marker is a regular file entry, and
+/// the tree it clears was built by layers the plan also resolved.
+#[test]
+fn a_planned_image_still_applies_its_whiteouts() {
+    let root = scratch("planned-whiteout");
+    let rootfs = extract_planned(
+        &root,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/gone", b"gone");
+                append_file(b, "d/kept", b"kept");
+            }),
+            tar_of(|b| append_file(b, "d/.wh.gone", b"")),
+        ],
+    )
+    .expect("extract");
+
+    assert!(!rootfs.join("d/gone").exists());
+    assert_eq!(
+        fs::read_to_string(rootfs.join("d/kept")).expect("kept"),
+        "kept"
+    );
+
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
