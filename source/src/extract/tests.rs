@@ -3,9 +3,10 @@
 //! These drive whole layers through the extractor rather than any one of its
 //! pieces, so they live beside the module rather than inside it.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -830,6 +831,13 @@ fn append_symlink(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &str)
     builder.append_link(&mut header, path, target).expect("symlink");
 }
 
+fn append_hard_link(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &str) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(EntryType::Link);
+    header.set_size(0);
+    builder.append_link(&mut header, path, target).expect("hard link");
+}
+
 /// A later layer turning a directory into a symlink is the case the plan has
 /// to get right: the files the earlier layer put in that directory are gone,
 /// and writing them anyway would send them through the link to somewhere they
@@ -926,3 +934,257 @@ fn a_planned_image_still_applies_its_whiteouts() {
 
     let _ = fsutil::force_remove_dir_all(root.as_std_path());
 }
+
+/// The ways a layer set can reach the rootfs. Which one runs is decided by
+/// what sidecars sit beside the blobs, so a fixture can be put through all
+/// three and the results compared.
+#[derive(Clone, Copy, Debug)]
+enum Route {
+    /// No sidecars: every layer is walked and applied in turn.
+    Streaming,
+    /// Entry tables only: the plan resolves the tree, but without a
+    /// checkpoint index the layers are still walked.
+    Planned,
+    /// Entry tables and checkpoint indexes: the plan becomes a queue of spans
+    /// extracted in parallel.
+    Spans,
+}
+
+impl Route {
+    const ALL: [Route; 3] = [Route::Streaming, Route::Planned, Route::Spans];
+}
+
+/// Applies `layers` by the given route, installing exactly the sidecars that
+/// route needs.
+fn extract_by(route: Route, root: &Utf8Path, layers: &[Vec<u8>]) -> Result<Utf8PathBuf> {
+    let index_dir = root.join("indexes");
+    fs::create_dir_all(&index_dir).expect("index dir");
+
+    let mut descriptors = Vec::new();
+    for tar in layers {
+        let blob = gzip_default(tar);
+        let descriptor = install_blob(root, GZIP_LAYER, &blob);
+        let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+
+        if matches!(route, Route::Planned | Route::Spans) {
+            let table = crate::entries::Table::build(&tar[..]).expect("entry table");
+            let mut bytes = Vec::new();
+            table.write_to(&mut bytes).expect("serialise");
+            fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
+        }
+        if matches!(route, Route::Spans) {
+            let index = zinfo::Index::build(&blob, 64 * 1024).expect("index");
+            let mut bytes = Vec::new();
+            index.write_to(&mut bytes).expect("serialise");
+            fs::write(index_dir.join(format!("{hex}.zinfo")), bytes).expect("install index");
+        }
+        descriptors.push(descriptor);
+    }
+
+    // `install_blob` rewrites index.json each time, so the layout is opened
+    // once every blob is in place.
+    let layout = Layout::open(root)?;
+    let rootfs = root.join("rootfs");
+    let dir = match route {
+        Route::Streaming => None,
+        Route::Planned | Route::Spans => Some(index_dir.as_path()),
+    };
+    let mut extractor = RootfsExtractor::new(&rootfs, dir)?;
+    extractor.plan(&descriptors)?;
+
+    // A route that quietly falls back to another one would compare equal for
+    // the wrong reason, so each is held to the plan it is supposed to produce.
+    match route {
+        Route::Streaming => assert!(
+            !extractor.plan.is_resolved(),
+            "streaming must not resolve a plan"
+        ),
+        Route::Planned => {
+            assert!(extractor.plan.is_resolved(), "the plan must resolve");
+            assert!(
+                descriptors.iter().all(|d| index_at(&index_dir, d).is_none()),
+                "the planned route must have no checkpoint index to fall back on"
+            );
+        }
+        Route::Spans => {
+            assert!(extractor.plan.work().is_some(), "the plan must produce work");
+            assert!(
+                descriptors.iter().all(|d| index_at(&index_dir, d).is_some()),
+                "every layer needs a checkpoint index for the span route"
+            );
+        }
+    }
+
+    extractor.apply(&layout, &descriptors)?;
+    extractor.finish()?;
+    Ok(rootfs)
+}
+
+/// A rootfs reduced to sorted lines, so two of them can be compared and the
+/// first difference read directly.
+///
+/// Directory mtimes are left out: nothing sets them, so they hold whenever the
+/// directory happened to be created.
+fn snapshot(rootfs: &Utf8Path) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut inodes = BTreeMap::new();
+    walk(rootfs, rootfs, &mut lines, &mut inodes);
+    lines.sort();
+    lines
+}
+
+fn walk(
+    root: &Utf8Path,
+    dir: &Utf8Path,
+    lines: &mut Vec<String>,
+    inodes: &mut BTreeMap<(u64, u64), String>,
+) {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|entry| entry.expect("entry"))
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = Utf8PathBuf::from_path_buf(entry.path()).expect("utf8 path");
+        let at = path.strip_prefix(root).expect("relative").to_string();
+        let meta = fs::symlink_metadata(&path).expect("stat");
+        let mode = meta.permissions().mode() & 0o7777;
+
+        if meta.is_symlink() {
+            let target = fs::read_link(&path).expect("readlink");
+            lines.push(format!("link {at} -> {}", target.display()));
+        } else if meta.is_dir() {
+            lines.push(format!("dir  {at} mode={mode:04o}"));
+            walk(root, &path, lines, inodes);
+        } else {
+            let body = fs::read(&path).expect("read");
+            let digest = hex_encode(&Sha256::digest(&body));
+            // Hard links are the same inode under two names, which only shows
+            // up by pairing the names that share one.
+            let shared = match inodes.get(&(meta.dev(), meta.ino())) {
+                Some(first) => format!(" linked-to={first}"),
+                None => {
+                    inodes.insert((meta.dev(), meta.ino()), at.clone());
+                    String::new()
+                }
+            };
+            lines.push(format!(
+                "file {at} mode={mode:04o} size={} mtime={} sha={}{shared}",
+                body.len(),
+                meta.mtime(),
+                &digest[..16],
+            ));
+        }
+    }
+}
+
+/// Applies the layers by each of `routes` and fails on the first pair that
+/// differ.
+///
+/// The routes share no code past the plan, so agreement between them is the
+/// only thing keeping the fast one honest. Which routes apply is stated by the
+/// caller rather than discovered, so a fixture the span route declines says so
+/// instead of quietly comparing one route against itself.
+fn assert_routes_agree(name: &str, routes: &[Route], layers: &[Vec<u8>]) {
+    let mut baseline: Option<(Route, Vec<String>)> = None;
+
+    for &route in routes {
+        let root = scratch(&format!("{name}-{route:?}"));
+        let rootfs = extract_by(route, &root, layers)
+            .unwrap_or_else(|err| panic!("{name}: {route:?} failed to extract: {err}"));
+        let tree = snapshot(&rootfs);
+
+        match &baseline {
+            None => baseline = Some((route, tree)),
+            Some((first, expected)) => assert_eq!(
+                *expected, tree,
+                "{name}: {first:?} and {route:?} produced different trees"
+            ),
+        }
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+#[test]
+fn every_route_agrees_on_a_layered_image() {
+    assert_routes_agree(
+        "route-layered",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "etc/");
+                append_file(b, "etc/config", b"first");
+                append_dir(b, "bin/");
+                append_file(b, "bin/tool", b"tool");
+                append_symlink(b, "bin/tool-link", "tool");
+            }),
+            tar_of(|b| {
+                append_file(b, "etc/config", b"second");
+                append_file(b, "etc/added", b"added");
+            }),
+            tar_of(|b| {
+                append_file(b, "etc/.wh.added", b"");
+                append_file(b, "bin/other", b"other");
+            }),
+        ],
+    );
+}
+
+#[test]
+fn every_route_agrees_on_hard_links() {
+    assert_routes_agree(
+        "route-hard-links",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/original", b"body");
+                append_hard_link(b, "d/same", "d/original");
+            }),
+            tar_of(|b| append_hard_link(b, "d/later", "d/original")),
+        ],
+    );
+}
+
+#[test]
+fn every_route_agrees_when_a_directory_becomes_a_symlink() {
+    assert_routes_agree(
+        "route-dir-to-symlink",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "usr/");
+                append_dir(b, "usr/lib/");
+                append_file(b, "usr/lib/real", b"real");
+                append_dir(b, "lib/");
+                append_file(b, "lib/shadowed", b"shadowed");
+            }),
+            tar_of(|b| append_symlink(b, "lib", "usr/lib")),
+        ],
+    );
+}
+
+#[test]
+fn every_route_agrees_when_a_layer_writes_through_a_symlink() {
+    // The plan declines the span route outright when an entry sits behind a
+    // symlink, since it cannot say where the entry lands without building the
+    // tree to find out.
+    assert_routes_agree(
+        "route-through-symlink",
+        &[Route::Streaming, Route::Planned],
+        &[
+            tar_of(|b| {
+                append_dir(b, "usr/");
+                append_dir(b, "usr/lib/");
+                append_symlink(b, "lib", "usr/lib");
+            }),
+            tar_of(|b| {
+                append_dir(b, "lib/");
+                append_file(b, "lib/through", b"through");
+            }),
+        ],
+    );
+}
+
