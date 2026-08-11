@@ -131,13 +131,6 @@ impl RootfsExtractor {
                 continue;
             }
 
-            // A resolved image had its directory tree built before any layer
-            // ran, and a directory entry can only ask for one that is already
-            // there.
-            if kind == Kind::Directory && self.plan.is_resolved() {
-                continue;
-            }
-
             if !self.parents.prepare(&dst)? {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),
