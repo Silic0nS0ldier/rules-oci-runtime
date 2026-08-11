@@ -26,13 +26,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use camino::Utf8Path;
-use sha2::{Digest, Sha256};
 
 use crate::entries::{Entry, Table};
 use crate::error::{Error, IoContext, Result};
-use crate::image::{Descriptor, Layout, hex_encode, parse_digest};
+use crate::image::{Descriptor, Layout};
 use crate::log::log;
-use crate::sys::Mapping;
+use crate::sys::Blob;
 use crate::zinfo;
 
 use super::file::{Occupied, create_file, finish_file, place_symlink};
@@ -41,7 +40,7 @@ use super::plan::{Plan, Work};
 /// Everything one layer contributes, held open for the length of the run.
 struct Layer {
     descriptor: Descriptor,
-    blob: Mapping,
+    blob: Blob,
     index: zinfo::Index,
 }
 
@@ -136,17 +135,9 @@ fn open_layers(
         .iter()
         .zip(indexes)
         .map(|(descriptor, index)| {
-            let file = layout.open_blob(descriptor)?;
-            let len = file.metadata().map_or(0, |m| m.len()) as usize;
-            let blob = Mapping::of(&file, len).ok_or_else(|| {
-                Error::io(
-                    format!("mapping layer {}", descriptor.digest),
-                    std::io::Error::other("the blob could not be mapped"),
-                )
-            })?;
             Ok(Layer {
                 descriptor: descriptor.clone(),
-                blob,
+                blob: layout.map_blob(descriptor)?,
                 index,
             })
         })
@@ -376,20 +367,5 @@ fn resolve(root: &Path, path: &mut PathBuf, entry: &Entry) {
 }
 
 fn verify(layer: &Layer) -> Result<()> {
-    let descriptor = &layer.descriptor;
-    if descriptor.size != 0 && descriptor.size != layer.blob.len() as u64 {
-        return Err(Error::SizeMismatch {
-            digest: descriptor.digest.clone(),
-            expected: descriptor.size,
-            actual: layer.blob.len() as u64,
-        });
-    }
-    let actual = hex_encode(&Sha256::digest(&*layer.blob));
-    if actual != parse_digest(&descriptor.digest)?.hex {
-        return Err(Error::DigestMismatch {
-            digest: descriptor.digest.clone(),
-            actual,
-        });
-    }
-    Ok(())
+    crate::image::verify(&layer.descriptor, &layer.blob)
 }

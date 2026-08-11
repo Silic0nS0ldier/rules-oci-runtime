@@ -155,17 +155,9 @@ fn index(args: IndexArgs) -> Result<i32> {
 fn index_blob(blob: &Utf8Path, checkpoints: &Utf8Path, entries: &Utf8Path, span: u64) -> Result<()> {
     let file =
         std::fs::File::open(blob).map_err(|source| Error::io(format!("opening {blob}"), source))?;
-    let len = file.metadata().map_or(0, |m| m.len()) as usize;
-    let mapped = sys::Mapping::of(&file, len);
-    let mut read = Vec::new();
-    if mapped.is_none() {
-        std::io::Read::read_to_end(&mut &file, &mut read)
-            .map_err(|source| Error::io(format!("reading {blob}"), source))?;
-    }
-    let bytes: &[u8] = match &mapped {
-        Some(mapping) => mapping,
-        None => &read,
-    };
+    let bytes =
+        sys::Blob::of(&file).map_err(|source| Error::io(format!("reading {blob}"), source))?;
+    let bytes: &[u8] = &bytes;
     // Which blob failed matters more than usual here: this runs as a build
     // action over every layer of an image at once.
     let named = |source| match source {
