@@ -14,9 +14,7 @@ use crate::log::{log, warning};
 use super::RootfsExtractor;
 use super::file::{prepare_directory, set_symlink_mtime, unpack_regular};
 use super::pipeline::CHUNK_BYTES;
-
-pub(super) const WHITEOUT_PREFIX: &str = ".wh.";
-pub(super) const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+use super::whiteout::{self, Whiteout};
 
 impl RootfsExtractor {
     pub(super) fn unpack(&mut self, reader: &mut dyn Read, layer: &str) -> Result<()> {
@@ -79,35 +77,38 @@ impl RootfsExtractor {
             }
             fsutil::join_under(root, &relative, &mut dst);
 
-            let name = dst.file_name().unwrap_or_default().as_bytes();
-            if name == OPAQUE_WHITEOUT.as_bytes() {
-                dst.pop();
-                let dir = std::mem::take(&mut dst);
-                self.apply_opaque_whiteout(root, &dir)?;
-                dst = dir;
-                continue;
-            }
-            if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX.as_bytes()) {
-                // `.wh.` with nothing after it names nothing to remove, and
-                // taking it as a name would leave it pointing at the directory
-                // the marker sits in.
-                if target.is_empty() {
+            match whiteout::of(&relative) {
+                Some(Whiteout::Opaque(dir)) => {
+                    let dir = match dir.is_empty() {
+                        // A marker at the top of the layer names the rootfs.
+                        true => root.to_path_buf(),
+                        false => {
+                            let mut at = PathBuf::new();
+                            fsutil::join_under(root, &dir, &mut at);
+                            at
+                        }
+                    };
+                    self.apply_opaque_whiteout(root, &dir)?;
+                    continue;
+                }
+                Some(Whiteout::Named(target)) => {
+                    fsutil::join_under(root, &target, &mut dst);
+                    // A whiteout hides the layers below it, never the one it is in.
+                    if !self.written.contains(&dst) && self.parents.contains_parent_of(&dst)? {
+                        log!("Whiteout: removing /{}", relative_display(root, &dst));
+                        if fsutil::remove_any(&dst)? {
+                            self.parents.forget(&dst);
+                        }
+                    }
+                    continue;
+                }
+                Some(Whiteout::Invalid) => {
                     return Err(Error::InvalidWhiteout {
                         layer: layer.to_string(),
                         path: path.display().to_string(),
                     });
                 }
-                // `target` borrows the buffer the new name has to go into.
-                let target = std::ffi::OsStr::from_bytes(target).to_owned();
-                dst.set_file_name(target);
-                // A whiteout hides the layers below it, never the one it is in.
-                if !self.written.contains(&dst) && self.parents.contains_parent_of(&dst)? {
-                    log!("Whiteout: removing /{}", relative_display(root, &dst));
-                    if fsutil::remove_any(&dst)? {
-                        self.parents.forget(&dst);
-                    }
-                }
-                continue;
+                None => {}
             }
 
             let entry_type = entry.header().entry_type();

@@ -12,6 +12,7 @@ mod plan;
 mod spans;
 #[cfg(test)]
 mod tests;
+mod whiteout;
 
 use std::collections::HashSet;
 use std::fs;
