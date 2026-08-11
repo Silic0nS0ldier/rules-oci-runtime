@@ -996,6 +996,53 @@ fn an_opaque_whiteout_keeps_a_directory_holding_this_layer_s_work() {
     );
 }
 
+/// The tree the layers leave says where the image ends up, not what it went
+/// through to get there. A layer writing under a path that is a file at the
+/// time stops the walk, and a later layer making a directory of that path
+/// again leaves nothing in the final tree to say so.
+#[test]
+fn no_route_places_an_entry_written_under_a_file() {
+    for route in Route::ALL {
+        let root = scratch(&format!("under-a-file-{route:?}"));
+        let (result, placed) = apply_by(
+            route,
+            &root,
+            &[
+                tar_of(|b| append_file(b, "d", b"file")),
+                tar_of(|b| append_file(b, "d/x", b"x")),
+                tar_of(|b| append_dir(b, "d/")),
+            ],
+        );
+
+        assert!(!placed, "{route:?}: the plan must decline the image");
+        assert!(
+            result.is_err(),
+            "{route:?}: writing under a file must be refused"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+/// Hard links are placed once every file is on disk, and one naming another
+/// has to be made after it. The plan collects them by walking the tree, which
+/// is in path order, so a link naming one that sorts after it was made against
+/// something that was not there yet.
+#[test]
+fn every_route_agrees_on_a_hard_link_naming_another_hard_link() {
+    assert_routes_agree(
+        "route-hard-link-chain",
+        &Route::ALL,
+        &[
+            tar_of(|b| append_file(b, "t", b"body")),
+            tar_of(|b| {
+                append_hard_link(b, "z", "t");
+                append_hard_link(b, "a", "z");
+            }),
+        ],
+    );
+}
+
 /// The ways a layer set can reach the rootfs. Which one runs is decided by
 /// what sidecars sit beside the blobs, so a fixture can be put through all
 /// three and the results compared.
@@ -1558,11 +1605,11 @@ fn a_whiteout_does_not_hide_its_own_layer() {
 /// sits in, which was then removed.
 #[test]
 fn a_whiteout_naming_nothing_is_refused() {
-    // The span route is not among them: the plan refuses to place the entry,
-    // which drops the image to the walk, and the walk is what reports it.
-    for route in [Route::Streaming, Route::Planned] {
+    // No route places it: the plan declines the image outright, which leaves
+    // the walk to report it whatever sidecars are there.
+    for route in Route::ALL {
         let root = scratch(&format!("bare-wh-{route:?}"));
-        let err = extract_by(
+        let (result, placed) = apply_by(
             route,
             &root,
             &[
@@ -1572,10 +1619,10 @@ fn a_whiteout_naming_nothing_is_refused() {
                 }),
                 tar_of(|b| append_file(b, "d/.wh.", b"")),
             ],
-            true,
-        )
-        .expect_err("a whiteout naming nothing must be refused");
+        );
+        let err = result.expect_err("a whiteout naming nothing must be refused");
 
+        assert!(!placed, "{route:?}: the plan must decline the image");
         assert!(
             matches!(err, Error::InvalidWhiteout { .. }),
             "{route:?}: expected an invalid whiteout, got {err:?}"

@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use camino::Utf8Path;
 
-use crate::entries::{Kind, Table};
+use crate::entries::{Entry, Kind, Table};
 use crate::fsutil;
 use crate::image::{Descriptor, parse_digest};
 use crate::log::log;
@@ -107,7 +107,14 @@ impl Plan {
             .map(|entry| entry.link.as_slice())
             .collect();
 
-        let tree = replay(&tables);
+        let (tree, blocked) = replay(&tables);
+        // The walk stops where a layer names something it cannot place, and a
+        // plan that skipped that entry would sail past it. Nothing here is
+        // worth an image that extracts differently depending on the sidecars
+        // it happens to have.
+        if blocked == Blocked::TheWalkStopsHere {
+            return Plan::default();
+        }
 
         let mut shadowed: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
         let mut total = 0;
@@ -146,7 +153,9 @@ impl Plan {
             );
         }
         let directories = directories(&tree);
-        let work = placeable(&tree, &tables);
+        let work = (blocked == Blocked::Nothing)
+            .then(|| placeable(&tree, &tables))
+            .flatten();
         Plan {
             shadowed,
             directories,
@@ -249,11 +258,6 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
     };
     for (path, node) in tree {
         let (layer, entry) = node.owner;
-        // A `.wh.` naming nothing is invalid and the walk rejects it, so the
-        // plan must not quietly place it as an ordinary file instead.
-        if matches!(whiteout::of(path), Some(Whiteout::Invalid)) {
-            return None;
-        }
         match node.kind {
             // Nothing here is created under something that is not a directory,
             // so whatever is there has to be resolved against the tree as it
@@ -286,15 +290,23 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
     for (layer, entries) in work.files.iter_mut().enumerate() {
         entries.sort_unstable_by_key(|&e| tables[layer].entries[e as usize].offset);
     }
+    // In the order the layers named them, so a link naming another link is
+    // made after it, as it was on the walk.
+    work.hard_links.sort_unstable();
     Some(work)
 }
 
 /// What the layers leave at a path once all of them have been applied.
 struct Node {
     kind: Kind,
-    /// The layer and entry that put it there.
+    /// The layer and entry that placed what is here.
     owner: (usize, usize),
     mode: u32,
+    /// The last layer with an entry naming this path, which is not always the
+    /// one that placed what is here: a directory entry can leave a standing
+    /// symlink alone and still name the path. `None` for a directory nobody
+    /// named, made only to hold something else.
+    named_by: Option<usize>,
 }
 
 /// Replays every layer in order into the tree they build between them.
@@ -304,54 +316,104 @@ struct Node {
 /// a directory keeps a symlink already standing where it wants to be, and
 /// anything else takes over the path it names and everything underneath it.
 ///
+/// Also reports what stood in the way of the entries as they were placed. The
+/// tree says where the image ends up, not what it went through to get there:
+/// a layer writing under a path that is a file at the time stops the walk,
+/// even where a later layer makes a directory of it again.
+///
 /// Sorted by path, so everything under a directory is one contiguous range and
 /// a removal costs what it removes rather than a pass over the whole image.
-fn replay(tables: &[Table]) -> BTreeMap<&[u8], Node> {
+fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
     let mut tree: BTreeMap<&[u8], Node> = BTreeMap::new();
     let mut bound = Vec::new();
+    let mut blocked = Blocked::Nothing;
     for (l, table) in tables.iter().enumerate() {
         for (e, entry) in table.entries.iter().enumerate() {
+            // Markers as well as entries: the walk asks the filesystem about
+            // the path either way, and asking underneath a file is what stops
+            // it.
+            blocked = blocked.worst(under(&tree, tables, &entry.path));
             match whiteout::of(&entry.path) {
-                // A whiteout hides the layers below it and never its own, so
-                // where the marker sits in the layer does not matter.
-                Some(Whiteout::Opaque(dir)) => remove_under(&mut tree, &dir, &mut bound, l),
+                // An opaque marker empties the directory of what the layers
+                // below put there, so where it sits in its own layer does not
+                // matter.
+                Some(Whiteout::Opaque(dir)) => remove_under(
+                    &mut tree,
+                    &dir,
+                    &mut bound,
+                    Removal::LowerLayers { layer: l },
+                ),
                 Some(Whiteout::Named(target)) => {
-                    if tree
+                    // A path this layer placed is not hidden by its own
+                    // layer's marker, and neither is anything under it: the
+                    // walk sees the path in what it has written and leaves the
+                    // marker alone entirely.
+                    let ours = tree
                         .get(target.as_slice())
-                        .is_some_and(|node| node.owner.0 < l)
-                    {
+                        .is_some_and(|node| node.named_by == Some(l));
+                    if !ours {
                         tree.remove(target.as_slice());
+                        // What is underneath goes with it, this layer's own
+                        // work included, because the walk removes the named
+                        // path whole.
+                        remove_under(&mut tree, &target, &mut bound, Removal::Whole);
                     }
-                    remove_under(&mut tree, &target, &mut bound, l);
                 }
-                // A marker naming nothing removes nothing. It stays an entry
-                // like any other, which is how `placeable` sees it and
-                // declines the image to the walk that refuses it.
-                None | Some(Whiteout::Invalid) => {
+                // A marker naming nothing removes nothing, and the walk
+                // refuses the image over it.
+                marker => {
+                    if marker.is_some() {
+                        blocked = Blocked::TheWalkStopsHere;
+                    }
+                    blocked = blocked.worst(links_somewhere(&tree, tables, entry));
                     let node = Node {
                         kind: entry.kind,
                         owner: (l, e),
                         mode: entry.mode,
+                        named_by: Some(l),
                     };
                     match entry.kind {
                         // The extractor warns and moves on, leaving the path
                         // as it found it.
                         Kind::Unsupported => {}
                         Kind::Directory => {
+                            ensure_parents(&mut tree, &entry.path, (l, e));
                             // `prepare_directory` keeps a symlink that already
-                            // resolves to a directory, so the layer's own
-                            // directory entry does not take the path back.
-                            let keep = tree
-                                .get(entry.path.as_slice())
-                                .is_some_and(|at| at.kind == Kind::Symlink);
+                            // resolves to a directory and replaces one that
+                            // does not, so which it is decides the path.
+                            let standing = tree.get(entry.path.as_slice());
+                            let keep = match standing.filter(|at| at.kind == Kind::Symlink) {
+                                None => false,
+                                Some(at) => match resolves_to_a_directory(
+                                    &tree,
+                                    tables,
+                                    entry.path.as_slice(),
+                                    at,
+                                ) {
+                                    Some(resolves) => resolves,
+                                    // Not something the plan can follow. The
+                                    // link is left where it is, which creates
+                                    // nothing over it either way.
+                                    None => {
+                                        blocked = blocked.worst(Blocked::ThroughASymlink);
+                                        true
+                                    }
+                                },
+                            };
                             if !keep {
                                 tree.insert(&entry.path, node);
+                            } else if let Some(at) = tree.get_mut(entry.path.as_slice()) {
+                                // The link stays, but the path has been named
+                                // again, which is what a whiteout later in
+                                // this layer goes by.
+                                at.named_by = Some(l);
                             }
                         }
                         // Everything else clears the path first, which takes
                         // the tree underneath it as well.
                         _ => {
-                            remove_under(&mut tree, &entry.path, &mut bound, l + 1);
+                            ensure_parents(&mut tree, &entry.path, (l, e));
+                            remove_under(&mut tree, &entry.path, &mut bound, Removal::Whole);
                             tree.insert(&entry.path, node);
                         }
                     }
@@ -359,7 +421,119 @@ fn replay(tables: &[Table]) -> BTreeMap<&[u8], Node> {
             }
         }
     }
-    tree
+    (tree, blocked)
+}
+
+/// Whether the symlink standing at `path` resolves to a directory, or `None`
+/// when the plan cannot say: a target it will not resolve, or one that lands
+/// on another symlink.
+fn resolves_to_a_directory(
+    tree: &BTreeMap<&[u8], Node>,
+    tables: &[Table],
+    path: &[u8],
+    at: &Node,
+) -> Option<bool> {
+    let target = &tables[at.owner.0].entries[at.owner.1].link;
+    let mut joined = Vec::new();
+    // An absolute target is rooted at the rootfs; a relative one starts from
+    // the directory the link sits in.
+    if !target.starts_with(b"/")
+        && let Some(slash) = path.iter().rposition(|&byte| byte == b'/')
+    {
+        joined.extend_from_slice(&path[..slash + 1]);
+    }
+    joined.extend_from_slice(target);
+
+    let mut resolved = Vec::new();
+    if !fsutil::canonical_entry_path(&joined, &mut resolved) {
+        return None;
+    }
+    match tree.get(resolved.as_slice()).map(|node| node.kind) {
+        Some(Kind::Symlink) => None,
+        Some(kind) => Some(kind == Kind::Directory),
+        // Nothing names it, but it is still a directory when something is
+        // under it: the walk creates the parents of what it places.
+        None => Some(holds_anything(tree, &resolved)),
+    }
+}
+
+/// True when the tree holds anything under `dir`, which makes it a directory
+/// even though no entry names it.
+fn holds_anything(tree: &BTreeMap<&[u8], Node>, dir: &[u8]) -> bool {
+    let mut bound = dir.to_vec();
+    bound.push(b'/');
+    tree.range::<[u8], _>((
+        std::ops::Bound::Included(bound.as_slice()),
+        std::ops::Bound::Unbounded,
+    ))
+    .next()
+    .is_some_and(|(path, _)| path.starts_with(&bound))
+}
+
+/// What stands between the walk and `path`, if anything.
+///
+/// A symlink that resolves to a directory is one the walk writes through; one
+/// that resolves to nothing is one it stops on, which is the difference
+/// between an image it extracts and an image it refuses.
+fn under(tree: &BTreeMap<&[u8], Node>, tables: &[Table], path: &[u8]) -> Blocked {
+    let Some((ancestor, node)) = blocked_by(tree, path) else {
+        return Blocked::Nothing;
+    };
+    if node.kind != Kind::Symlink {
+        return Blocked::TheWalkStopsHere;
+    }
+    match resolves_to_a_directory(tree, tables, ancestor, node) {
+        Some(true) => Blocked::ThroughASymlink,
+        _ => Blocked::TheWalkStopsHere,
+    }
+}
+
+/// Whether a link entry names something the walk can link to.
+fn links_somewhere(tree: &BTreeMap<&[u8], Node>, tables: &[Table], entry: &Entry) -> Blocked {
+    match entry.kind {
+        // A link naming nothing is refused rather than left pointing at
+        // whatever the empty name resolves to.
+        Kind::Symlink | Kind::HardLink if entry.link.is_empty() => Blocked::TheWalkStopsHere,
+        // A hard link is made against what is on disk, which is what the tree
+        // holds at this point. A directory cannot be linked, and nothing was
+        // placed for a type the extractor does not support. Nor can a link
+        // name itself or anything under itself: the walk clears the path
+        // before linking, which takes the copy it was about to link to.
+        Kind::HardLink
+            if names_itself(&entry.path, &entry.link)
+                || under(tree, tables, &entry.link) != Blocked::Nothing
+                || !tree.get(entry.link.as_slice()).is_some_and(|node| {
+                    !matches!(node.kind, Kind::Directory | Kind::Unsupported)
+                }) =>
+        {
+            Blocked::TheWalkStopsHere
+        }
+        _ => Blocked::Nothing,
+    }
+}
+
+/// Records the directories the walk creates to hold an entry.
+///
+/// They are nobody's entry, so nothing names them and nothing gives them a
+/// mode, but they stay behind once whatever they were made for is gone --
+/// which is why the tree has to hold them rather than work them out from what
+/// survives.
+fn ensure_parents<'a>(tree: &mut BTreeMap<&'a [u8], Node>, path: &'a [u8], owner: (usize, usize)) {
+    for ancestor in ancestors(path) {
+        // Something already there is either the directory this needs or a
+        // symlink the walk writes through, and neither is ours to replace.
+        tree.entry(ancestor).or_insert(Node {
+            kind: Kind::Directory,
+            owner,
+            mode: DEFAULT_DIRECTORY_MODE,
+            named_by: None,
+        });
+    }
+}
+
+/// True when `target` is `path` or something under it.
+fn names_itself(path: &[u8], target: &[u8]) -> bool {
+    target == path || (target.starts_with(path) && target.get(path.len()) == Some(&b'/'))
 }
 
 /// The directories the final tree needs, parents before children.
@@ -407,14 +581,68 @@ fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {    path.iter()
 /// there would be nothing to create this under. The extractor resolves the
 /// entries that live there against the tree as it builds it, as it always has.
 fn behind_a_link(tree: &BTreeMap<&[u8], Node>, path: &[u8]) -> bool {
-    ancestors(path).any(|ancestor| {
-        tree.get(ancestor)
-            .is_some_and(|node| node.kind != Kind::Directory)
+    blocked_by(tree, path).is_some()
+}
+
+/// The first thing on the way to `path` that is not a directory.
+fn blocked_by<'a, 'p>(
+    tree: &'a BTreeMap<&'p [u8], Node>,
+    path: &'p [u8],
+) -> Option<(&'p [u8], &'a Node)> {
+    ancestors(path).find_map(|ancestor| {
+        let node = tree.get(ancestor)?;
+        (node.kind != Kind::Directory).then_some((ancestor, node))
     })
 }
 
-/// Drops every entry beneath `dir` that a layer before `below` put there,
-/// without touching a sibling whose name merely starts the same way.
+/// What replaying the layers found in the way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    /// Nothing: every entry had a directory to go in and named something the
+    /// walk could place.
+    Nothing,
+    /// Something was written through a symlink. The walk follows it to
+    /// wherever it points and the image still extracts; the plan cannot say
+    /// where that is.
+    ThroughASymlink,
+    /// An entry the walk stops on: a marker naming nothing, a link naming
+    /// nothing, a hard link naming what is not on disk yet, or anything under
+    /// a path that was not a directory at the time.
+    ///
+    /// These are judged over every entry rather than over the tree the layers
+    /// leave behind, because the entry that stops the walk is often one a
+    /// later layer replaces -- and a plan that skipped it would sail past
+    /// something the walk refuses.
+    TheWalkStopsHere,
+}
+
+impl Blocked {
+    fn worst(self, other: Blocked) -> Blocked {
+        match (self, other) {
+            (Blocked::TheWalkStopsHere, _) | (_, Blocked::TheWalkStopsHere) => {
+                Blocked::TheWalkStopsHere
+            }
+            (Blocked::ThroughASymlink, _) | (_, Blocked::ThroughASymlink) => {
+                Blocked::ThroughASymlink
+            }
+            _ => Blocked::Nothing,
+        }
+    }
+}
+
+/// Why something under a path is being dropped.
+#[derive(Clone, Copy)]
+enum Removal {
+    /// The path is being taken over, so the walk clears it whole and this
+    /// layer's own work under it goes with everything else.
+    Whole,
+    /// An opaque marker: what the layers below left goes, and what this layer
+    /// put there stays, along with the directories holding it.
+    LowerLayers { layer: usize },
+}
+
+/// Drops what `removal` says goes from beneath `dir`, without touching a
+/// sibling whose name merely starts the same way.
 ///
 /// An empty `dir` is the rootfs itself, which every path is under. The rootfs
 /// is not removed with them: the walk empties the directory the marker names
@@ -423,7 +651,12 @@ fn behind_a_link(tree: &BTreeMap<&[u8], Node>, path: &[u8]) -> bool {
 /// Every entry that is not a directory replays through here, so the bound it
 /// seeks from is built in a buffer the caller keeps rather than a fresh pair
 /// of allocations per path.
-fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8>, below: usize) {
+fn remove_under(
+    tree: &mut BTreeMap<&[u8], Node>,
+    dir: &[u8],
+    bound: &mut Vec<u8>,
+    removal: Removal,
+) {
     bound.clear();
     if !dir.is_empty() {
         bound.extend_from_slice(dir);
@@ -432,16 +665,33 @@ fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8
 
     // Everything under `dir` sorts from the bound onwards and is contiguous,
     // so the first path that is not under it ends the range.
+    let under: Vec<(&[u8], Option<usize>)> = tree
+        .range::<[u8], _>((
+            std::ops::Bound::Included(bound.as_slice()),
+            std::ops::Bound::Unbounded,
+        ))
+        .take_while(|(path, _)| path.starts_with(bound.as_slice()))
+        .filter(|(path, _)| **path != ROOT_ENTRY)
+        .map(|(path, node)| (*path, node.named_by))
+        .collect();
+
     let mut doomed: Vec<&[u8]> = Vec::new();
-    for (path, node) in tree.range::<[u8], _>((
-        std::ops::Bound::Included(bound.as_slice()),
-        std::ops::Bound::Unbounded,
-    )) {
-        if !path.starts_with(bound) {
-            break;
-        }
-        if node.owner.0 < below && *path != ROOT_ENTRY {
-            doomed.push(path);
+    match removal {
+        Removal::Whole => doomed.extend(under.iter().map(|(path, _)| *path)),
+        Removal::LowerLayers { layer } => {
+            // Read deepest first, so the last path this layer named is the
+            // one to ask about: everything under a directory sits directly
+            // before it.
+            let mut ours: Option<&[u8]> = None;
+            for (path, named_by) in under.iter().rev() {
+                if *named_by == Some(layer) {
+                    ours = Some(path);
+                    continue;
+                }
+                if !ours.is_some_and(|kept| names_itself(path, kept)) {
+                    doomed.push(path);
+                }
+            }
         }
     }
     for path in doomed {
