@@ -47,6 +47,21 @@ impl RootfsExtractor {
                     .as_ref(),
             );
 
+            // `./` names the rootfs, so there is nothing to place: the mode it
+            // carries is deferred like any other directory's, and a layer
+            // naming the root as anything but a directory is refused.
+            if fsutil::names_the_root(&path) {
+                if !entry.header().entry_type().is_dir() {
+                    return Err(Error::UnsafeEntry {
+                        layer: layer.to_string(),
+                        path: path.display().to_string(),
+                    });
+                }
+                let mode = entry.header().mode().unwrap_or(0o755) & 0o7777;
+                self.deferred_modes.push((root.to_path_buf(), mode));
+                continue;
+            }
+
             if !fsutil::resolve_under(root, &path, &mut dst) {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),

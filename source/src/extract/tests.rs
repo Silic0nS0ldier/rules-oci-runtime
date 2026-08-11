@@ -1596,3 +1596,46 @@ fn a_sparse_file_keeps_its_hole() {
         assert_eq!(&body[1024..], &[7u8; 512], "{route:?}: and the data follows it");
     });
 }
+
+/// `tar -C dir .` puts the archive root in the layer as `./`, and the spec's
+/// own worked example lists it as the first entry. It names the rootfs rather
+/// than anything under it, which is not the same as escaping.
+#[test]
+fn every_route_agrees_on_a_layer_rooted_at_dot() {
+    assert_routes_agree(
+        "route-dot-root",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "./");
+                append_dir(b, "./etc/");
+                append_file(b, "./etc/config", b"config");
+                append_symlink(b, "./link", "etc/config");
+            }),
+            tar_of(|b| {
+                append_dir(b, "./");
+                append_file(b, "./etc/added", b"added");
+            }),
+        ],
+    );
+}
+
+#[test]
+fn a_layer_rooted_at_dot_extracts_its_entries() {
+    for_each_route(
+        "dot-root",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "./");
+            append_dir(b, "./etc/");
+            append_file(b, "./etc/config", b"config");
+        })],
+        |route, rootfs| {
+            assert_eq!(
+                fs::read_to_string(rootfs.join("etc/config")).expect("config"),
+                "config",
+                "{route:?}: an entry under the archive root still lands"
+            );
+        },
+    );
+}
