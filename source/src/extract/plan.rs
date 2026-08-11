@@ -114,7 +114,7 @@ impl Plan {
         let mut bytes = 0u64;
         for (l, table) in tables.iter().enumerate() {
             let mut doomed = HashSet::new();
-            for (e, entry) in table.entries.iter().enumerate() {
+            for entry in table.entries.iter() {
                 // Only bodies are worth skipping, and a whiteout marker has to
                 // reach the extractor or nothing gets removed.
                 if !entry.kind.is_file() || whiteout(&entry.path).is_some() {
@@ -123,9 +123,12 @@ impl Plan {
                 if linked.contains(entry.path.as_slice()) {
                     continue;
                 }
+                // Whether the layer wins the path, not whether this entry
+                // does: a layer that names one path twice is skipped by path,
+                // so shadowing the loser would take the winner with it.
                 let survives = tree
                     .get(entry.path.as_slice())
-                    .is_some_and(|node| node.owner == (l, e));
+                    .is_some_and(|node| node.owner.0 == l);
                 if !survives {
                     bytes += entry.size;
                     doomed.insert(entry.path.clone());
@@ -486,6 +489,14 @@ mod tests {
         assert!(plan.is_shadowed(&d[0].digest, b"a"));
         assert!(!plan.is_shadowed(&d[0].digest, b"keep"));
         assert!(!plan.is_shadowed(&d[1].digest, b"a"), "the winner stays");
+    }
+
+    /// Shadowing is recorded by path, so a layer naming one path twice would
+    /// mark it doomed for the copy that loses and skip the copy that wins.
+    #[test]
+    fn a_path_a_layer_names_twice_is_not_shadowed_in_that_layer() {
+        let (plan, d) = plan_of(vec![layer(vec![file("twice"), file("twice")])]);
+        assert!(!plan.is_shadowed(&d[0].digest, b"twice"));
     }
 
     #[test]

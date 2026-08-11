@@ -1514,3 +1514,39 @@ fn a_hard_link_to_a_symlink_links_the_symlink() {
         },
     );
 }
+
+/// The spec says a layer "MUST NOT include duplicate entries for file paths",
+/// but says nothing about what to do with one that does. Whatever we do, the
+/// routes have to do the same thing.
+#[test]
+fn every_route_agrees_on_a_duplicated_path() {
+    assert_routes_agree(
+        "route-duplicates",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "d/");
+            append_file(b, "d/twice", b"first");
+            append_file(b, "d/twice", b"second");
+        })],
+    );
+}
+
+#[test]
+fn the_last_of_a_duplicated_path_is_the_one_kept() {
+    for_each_route(
+        "duplicates",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "d/");
+            append_file(b, "d/twice", b"first");
+            append_file(b, "d/twice", b"second");
+        })],
+        |route, rootfs| {
+            assert_eq!(
+                fs::read_to_string(rootfs.join("d/twice")).expect("twice"),
+                "second",
+                "{route:?}: the later entry wins, as a later layer would"
+            );
+        },
+    );
+}
