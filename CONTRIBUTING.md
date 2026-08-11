@@ -3,10 +3,18 @@
 ## Development
 
 ```sh
-bazel test //...                    # rule tests and documentation freshness
-(cd source && bazel test //...)     # launcher unit tests
-(cd e2e/smoke && bazel test //...)  # end to end tests
-bazel run //docs:update             # regenerate docs/defs.md
+bazel test //...                          # rule tests and documentation freshness
+(cd source && bazel test //...)           # launcher unit tests
+(cd e2e/smoke && bazel test //...)        # end to end tests
+(cd e2e/conformance && bazel test //...)  # extraction compared against umoci
+bazel run //docs:update                   # regenerate docs/defs.md
+```
+
+The end to end modules run rootless containers, so they need unprivileged user
+namespaces. Distributions that confine those will refuse:
+
+```sh
+sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
 ```
 
 ## Releasing
