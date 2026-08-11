@@ -838,6 +838,21 @@ fn append_hard_link(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &st
     builder.append_link(&mut header, path, target).expect("hard link");
 }
 
+fn append_file_moded(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8], mode: u32) {
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(mode);
+    header.set_size(body.len() as u64);
+    builder.append_data(&mut header, path, body).expect("file");
+}
+
+fn append_of_type(builder: &mut tar::Builder<Vec<u8>>, path: &str, entry_type: EntryType) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(entry_type);
+    header.set_mode(0o644);
+    header.set_size(0);
+    builder.append_data(&mut header, path, io::empty()).expect("entry");
+}
+
 /// A later layer turning a directory into a symlink is the case the plan has
 /// to get right: the files the earlier layer put in that directory are gone,
 /// and writing them anyway would send them through the link to somewhere they
@@ -1329,4 +1344,173 @@ fn a_whiteout_naming_nothing_is_refused() {
 
         let _ = fsutil::force_remove_dir_all(root.as_std_path());
     }
+}
+
+/// The set-user-ID, set-group-ID and sticky bits are part of the mode the
+/// layer ships, and dropping one silently changes what the image does.
+#[test]
+fn every_route_agrees_on_the_bits_above_the_permission_bits() {
+    assert_routes_agree(
+        "route-modes",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "d/");
+            append_file_moded(b, "d/setuid", b"u", 0o4755);
+            append_file_moded(b, "d/setgid", b"g", 0o2755);
+            append_file_moded(b, "d/sticky", b"s", 0o1777);
+            append_file_moded(b, "d/private", b"p", 0o600);
+        })],
+    );
+}
+
+#[test]
+fn set_user_id_survives_extraction() {
+    for_each_route(
+        "setuid",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "d/");
+            append_file_moded(b, "d/setuid", b"u", 0o4755);
+        })],
+        |route, rootfs| {
+            let mode = fs::metadata(rootfs.join("d/setuid")).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o7777, 0o4755, "{route:?}: the mode the layer ships");
+        },
+    );
+}
+
+#[test]
+fn every_route_agrees_on_empty_files_and_layers() {
+    assert_routes_agree(
+        "route-empty",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/empty", b"");
+            }),
+            // A layer that adds nothing at all.
+            tar_of(|_| {}),
+            tar_of(|b| append_file(b, "d/after", b"after")),
+        ],
+    );
+}
+
+/// `tar` cannot hold a path this long in the header field, so it ships a
+/// separate long-name entry ahead of it. That entry is not the file.
+#[test]
+fn every_route_agrees_on_paths_too_long_for_a_tar_header() {
+    let deep = format!("d/{}/leaf", vec!["directory-with-a-long-name"; 6].join("/"));
+    assert_routes_agree(
+        "route-long-paths",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "d/");
+            append_file(b, &deep, b"deep");
+        })],
+    );
+}
+
+/// A whiteout for something no lower layer ever put there is not an error:
+/// the layer is asking for a path to be absent, and it is.
+#[test]
+fn a_whiteout_of_a_path_that_was_never_there_is_not_an_error() {
+    assert_routes_agree(
+        "route-absent-whiteout",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/kept", b"kept");
+            }),
+            tar_of(|b| {
+                append_file(b, "d/.wh.never-existed", b"");
+                append_file(b, ".wh.not-here-either", b"");
+            }),
+        ],
+    );
+}
+
+#[test]
+fn every_route_agrees_on_nested_opaque_whiteouts() {
+    assert_routes_agree(
+        "route-nested-opaque",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "a/");
+                append_file(b, "a/top", b"top");
+                append_dir(b, "a/b/");
+                append_file(b, "a/b/middle", b"middle");
+                append_dir(b, "a/b/c/");
+                append_file(b, "a/b/c/deep", b"deep");
+            }),
+            tar_of(|b| {
+                append_dir(b, "a/");
+                append_file(b, "a/.wh..wh..opq", b"");
+                append_dir(b, "a/b/");
+                append_file(b, "a/b/.wh..wh..opq", b"");
+                append_file(b, "a/b/kept", b"kept");
+            }),
+        ],
+    );
+}
+
+/// Sockets, FIFOs and device nodes cannot be created without privileges we do
+/// not have, so they are skipped. The layer around them still extracts.
+#[test]
+fn an_unsupported_entry_does_not_stop_the_layer() {
+    for_each_route(
+        "unsupported",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "d/");
+            append_file(b, "d/before", b"before");
+            append_of_type(b, "d/pipe", EntryType::Fifo);
+            append_of_type(b, "d/node", EntryType::Char);
+            append_file(b, "d/after", b"after");
+        })],
+        |route, rootfs| {
+            assert!(!rootfs.join("d/pipe").exists(), "{route:?}: the fifo is skipped");
+            assert!(!rootfs.join("d/node").exists(), "{route:?}: the device is skipped");
+            assert_eq!(
+                fs::read_to_string(rootfs.join("d/after")).expect("after"),
+                "after",
+                "{route:?}: the entries after it still land"
+            );
+        },
+    );
+}
+
+/// A hard link names an inode, and when that inode is a symlink the result is
+/// a second name for the link itself, not for whatever it resolves to.
+#[test]
+fn a_hard_link_to_a_symlink_links_the_symlink() {
+    for_each_route(
+        "hard-link-to-symlink",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "d/");
+            append_file(b, "d/target", b"target");
+            append_symlink(b, "d/link", "target");
+            append_hard_link(b, "d/linked", "d/link");
+        })],
+        |route, rootfs| {
+            let linked = rootfs.join("d/linked");
+            assert!(
+                linked.is_symlink(),
+                "{route:?}: linking a symlink gives another symlink"
+            );
+            assert_eq!(
+                fs::read_link(&linked).expect("readlink"),
+                Path::new("target"),
+                "{route:?}: and it points where the original did"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&linked).expect("stat").ino(),
+                fs::symlink_metadata(rootfs.join("d/link")).expect("stat").ino(),
+                "{route:?}: the two names share one inode"
+            );
+        },
+    );
 }
