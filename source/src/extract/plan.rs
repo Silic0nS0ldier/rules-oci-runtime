@@ -586,6 +586,14 @@ mod tests {
         assert!(plan.work().is_none());
     }
 
+    /// A sparse body is a map of segments rather than a flat run of the
+    /// stream, so only `tar` can place it.
+    #[test]
+    fn a_sparse_entry_is_not_placeable() {
+        let (plan, _) = plan_of(vec![layer(vec![of_kind("holey", Kind::Sparse)])]);
+        assert!(plan.work().is_none());
+    }
+
     #[test]
     fn an_absent_table_plans_nothing() {
         let plan = Plan::build(None, &[descriptor(0)]);

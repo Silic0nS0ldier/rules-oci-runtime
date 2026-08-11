@@ -1550,3 +1550,49 @@ fn the_last_of_a_duplicated_path_is_the_one_kept() {
         },
     );
 }
+
+/// A GNU sparse entry's body is a map of data segments rather than a flat run
+/// of the stream, so `tar` has to place it and the span route cannot.
+fn append_sparse(builder: &mut tar::Builder<Vec<u8>>, path: &str, at: u64, body: &[u8], real: u64) {
+    fn octal(field: &mut [u8], value: u64) {
+        let text = format!("{:0width$o}\0", value, width = field.len() - 1);
+        field.copy_from_slice(text.as_bytes());
+    }
+
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(EntryType::GNUSparse);
+    header.set_mode(0o644);
+    // The size in the header is what the archive stores, not what the file is.
+    header.set_size(body.len() as u64);
+    header.set_path(path).expect("path");
+    {
+        let gnu = header.as_gnu_mut().expect("gnu header");
+        octal(&mut gnu.realsize, real);
+        octal(&mut gnu.sparse[0].offset, at);
+        octal(&mut gnu.sparse[0].numbytes, body.len() as u64);
+    }
+    header.set_cksum();
+    builder.append(&header, body).expect("sparse");
+}
+
+/// A sparse layer extracts with its hole in place, and the plan declines the
+/// span route rather than treating the stored bytes as the file.
+#[test]
+fn a_sparse_file_keeps_its_hole() {
+    let layers = [tar_of(|b| {
+        append_dir(b, "d/");
+        append_sparse(b, "d/holey", 1024, &[7u8; 512], 1536);
+    })];
+
+    // Not the span route: a sparse body is not a flat run of the stream, so
+    // the plan refuses to place it and the image drops to the walk.
+    for_each_route("sparse", &[Route::Streaming, Route::Planned], &layers, |route, rootfs| {
+        let body = fs::read(rootfs.join("d/holey")).expect("holey");
+        assert_eq!(body.len(), 1536, "{route:?}: the file is its real size");
+        assert!(
+            body[..1024].iter().all(|&byte| byte == 0),
+            "{route:?}: the hole reads as zeroes"
+        );
+        assert_eq!(&body[1024..], &[7u8; 512], "{route:?}: and the data follows it");
+    });
+}
