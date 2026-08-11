@@ -30,7 +30,7 @@ use crate::image::{Descriptor, Layout, parse_digest};
 use crate::log::{log, warning};
 use crate::zinfo;
 
-use pipeline::{ChunkReader, PIPELINE_DEPTH, buffer_pool, inflate_blob, inflate_indexed};
+use pipeline::{ChunkReader, PIPELINE_DEPTH, Sink, buffer_pool, inflate_blob, inflate_indexed};
 
 pub use pipeline::{Compression, compression_of};
 
@@ -197,8 +197,8 @@ impl RootfsExtractor {
         let ret = index.is_none().then_some(ret);
         let owned = descriptor.clone();
         let inflate = thread::spawn(move || match index {
-            Some(index) => inflate_indexed(file, &index, &owned, sender),
-            None => inflate_blob(file, &owned, sender, pool),
+            Some(index) => inflate_indexed(file, &index, &owned, Sink::new(sender)),
+            None => inflate_blob(file, &owned, Sink::new(sender), pool),
         });
 
         let mut reader = ChunkReader::new(receiver, ret);

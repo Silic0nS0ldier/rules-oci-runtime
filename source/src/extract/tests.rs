@@ -20,7 +20,8 @@ use crate::zinfo;
 
 use super::RootfsExtractor;
 use super::pipeline::{
-    CHUNK_BYTES, Chunk, ChunkReader, PIPELINE_DEPTH, buffer_pool, compression_of, read_and_hash,
+    CHUNK_BYTES, Chunk, ChunkReader, PIPELINE_DEPTH, Sink, buffer_pool, compression_of,
+    read_and_hash,
 };
 use std::sync::mpsc::sync_channel;
 
@@ -58,7 +59,11 @@ fn the_hashing_thread_sees_every_byte_it_hands_on() {
 
     let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
     let (pool, ret) = buffer_pool();
-    let state = read_and_hash(fs::File::open(&blob).expect("open"), sender, pool);
+    let state = read_and_hash(
+        fs::File::open(&blob).expect("open"),
+        Sink::new(sender),
+        pool,
+    );
 
     let mut passed_on = Vec::new();
     ChunkReader::new(receiver, Some(ret))

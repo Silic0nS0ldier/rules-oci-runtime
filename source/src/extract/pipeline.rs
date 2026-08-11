@@ -14,7 +14,7 @@ use std::thread;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::image::{Descriptor, verify_digest};
+use crate::image::{Descriptor, verify, verify_digest};
 use crate::sys::Blob;
 use crate::zinfo;
 
@@ -64,6 +64,36 @@ pub(super) fn buffer_pool() -> (Pool, SyncSender<Vec<u8>>) {
     (Pool(free), ret)
 }
 
+/// The producer's end of the pipeline: the two things an inflater does with
+/// the consumer, and the convention they share.
+///
+/// A consumer that has gone away is not a failure. It stopped because it has
+/// an error of its own to report, and that is the one worth having, so a
+/// producer finding the channel closed stops quietly rather than saying why.
+pub(super) struct Sink(SyncSender<io::Result<Chunk>>);
+
+impl Sink {
+    pub(super) fn new(chunks: SyncSender<io::Result<Chunk>>) -> Self {
+        Sink(chunks)
+    }
+
+    /// Hands on the first `len` bytes of `buf`. False when the consumer has
+    /// stopped and there is nothing left to hand it.
+    #[must_use]
+    fn chunk(&self, buf: Vec<u8>, len: usize) -> bool {
+        self.0.send(Ok(Chunk { buf, len })).is_ok()
+    }
+
+    /// Stops the consumer, so that it does not wait on bytes that are not
+    /// coming, and gives `err` back for the producer to report as it sees fit.
+    /// The consumer gets it as an `io::Error` because that is all a reader can
+    /// carry; the typed error goes to whoever joins the producer.
+    fn fail<E: std::fmt::Display>(&self, err: E) -> E {
+        let _ = self.0.send(Err(io::Error::other(err.to_string())));
+        err
+    }
+}
+
 #[derive(Default)]
 pub(super) struct HashState {
     pub(super) hasher: Sha256,
@@ -77,11 +107,7 @@ pub(super) struct HashState {
 ///
 /// The hash covers exactly the bytes the decompressor is given, so the digest
 /// still describes what was extracted rather than a second read of the file.
-pub(super) fn read_and_hash(
-    mut file: fs::File,
-    sender: SyncSender<io::Result<Chunk>>,
-    pool: Pool,
-) -> HashState {
+pub(super) fn read_and_hash(mut file: fs::File, sink: Sink, pool: Pool) -> HashState {
     let mut state = HashState::default();
     loop {
         let mut buf = pool.take();
@@ -90,13 +116,12 @@ pub(super) fn read_and_hash(
             Ok(read) => {
                 state.hasher.update(&buf[..read]);
                 state.bytes += read as u64;
-                // The consumer has stopped, and has an error of its own to report.
-                if sender.send(Ok(Chunk { buf, len: read })).is_err() {
+                if !sink.chunk(buf, read) {
                     return state;
                 }
             }
             Err(err) => {
-                let _ = sender.send(Err(err));
+                sink.fail(err);
                 return state;
             }
         }
@@ -111,19 +136,16 @@ pub(super) fn read_and_hash(
 pub(super) fn inflate_blob(
     file: fs::File,
     descriptor: &Descriptor,
-    sender: SyncSender<io::Result<Chunk>>,
+    sink: Sink,
     pool: Pool,
 ) -> Result<()> {
     let (raw_sender, raw_receiver) = sync_channel(PIPELINE_DEPTH);
     let (raw_pool, raw_ret) = buffer_pool();
-    let hashing = thread::spawn(move || read_and_hash(file, raw_sender, raw_pool));
+    let hashing = thread::spawn(move || read_and_hash(file, Sink::new(raw_sender), raw_pool));
     let counted = ChunkReader::new(raw_receiver, Some(raw_ret));
     let mut decoder = match decompressor(&descriptor.media_type, counted) {
         Ok(decoder) => decoder,
-        Err(err) => {
-            let _ = sender.send(Err(io::Error::other(err.to_string())));
-            return Err(err);
-        }
+        Err(err) => return Err(sink.fail(err)),
     };
 
     loop {
@@ -132,15 +154,13 @@ pub(super) fn inflate_blob(
             Ok(0) => break,
             Ok(read) => read,
             Err(err) => {
-                let message = err.to_string();
-                let _ = sender.send(Err(err));
                 return Err(Error::io(
                     format!("reading layer {}", descriptor.digest),
-                    io::Error::other(message),
+                    sink.fail(err),
                 ));
             }
         };
-        if sender.send(Ok(Chunk { buf, len: read })).is_err() {
+        if !sink.chunk(buf, read) {
             return Ok(());
         }
     }
@@ -160,15 +180,14 @@ pub(super) fn inflate_indexed(
     file: fs::File,
     index: &zinfo::Index,
     descriptor: &Descriptor,
-    sender: SyncSender<io::Result<Chunk>>,
+    sink: Sink,
 ) -> Result<()> {
     let blob = match Blob::of(&file) {
         Ok(blob) => blob,
         Err(err) => {
-            let _ = sender.send(Err(io::Error::other(err.to_string())));
             return Err(Error::io(
                 format!("reading layer {}", descriptor.digest),
-                err,
+                sink.fail(err),
             ));
         }
     };
@@ -182,8 +201,10 @@ pub(super) fn inflate_indexed(
     let stop = AtomicBool::new(false);
 
     let mut span_error = None;
-    let digest = thread::scope(|scope| {
-        let hashing = scope.spawn(|| Sha256::digest(blob));
+    let verified = thread::scope(|scope| {
+        // The same check the span route makes on the same mapping, so a blob
+        // is judged the one way however it is being read.
+        let hashing = scope.spawn(|| verify(descriptor, blob));
 
         // Workers claim span indices; completed spans are put back in order
         // here. The channel bound plus one finished span per worker caps how
@@ -217,15 +238,13 @@ pub(super) fn inflate_indexed(
                 match result {
                     Ok(span) => {
                         let len = span.len();
-                        if sender.send(Ok(Chunk { buf: span, len })).is_err() {
-                            // The writer stopped; it has an error of its own.
+                        if !sink.chunk(span, len) {
                             stop.store(true, Ordering::Relaxed);
                             break 'reorder;
                         }
                     }
                     Err(err) => {
-                        let _ = sender.send(Err(io::Error::other(err.to_string())));
-                        span_error = Some(err);
+                        span_error = Some(sink.fail(err));
                         stop.store(true, Ordering::Relaxed);
                         break 'reorder;
                     }
@@ -234,12 +253,17 @@ pub(super) fn inflate_indexed(
         }
         // Dropping the receiver at the end of the scope unblocks any worker
         // still sending, so the implicit joins cannot deadlock.
-        hashing.join().unwrap_or_default()
+        hashing.join().unwrap_or_else(|_| {
+            Err(Error::io(
+                "verifying a layer",
+                io::Error::other("the hashing thread panicked"),
+            ))
+        })
     });
 
     // The digest verdict comes first: a blob that fails it explains any span
     // error, since the index describes the blob the descriptor names.
-    verify_digest(descriptor, blob.len() as u64, &digest)?;
+    verified?;
     match span_error {
         Some(err) => Err(err),
         None => Ok(()),
