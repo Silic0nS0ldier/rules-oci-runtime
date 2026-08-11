@@ -827,10 +827,19 @@ fn append_file_moded(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8
 }
 
 /// A hostile layer has to be written by hand: `tar::Header` will not spell a
-/// path with `..` in it at all, and a real one is not built by this crate.
+/// path with `..` in it at all, and strips the `.` out of one spelled `./x`.
 fn append_file_named(builder: &mut tar::Builder<Vec<u8>>, name: &[u8], body: &[u8]) {
+    append_file_named_moded(builder, name, body, 0o644);
+}
+
+fn append_file_named_moded(
+    builder: &mut tar::Builder<Vec<u8>>,
+    name: &[u8],
+    body: &[u8],
+    mode: u32,
+) {
     let mut header = tar::Header::new_gnu();
-    header.set_mode(0o644);
+    header.set_mode(mode);
     header.set_size(body.len() as u64);
     header.as_gnu_mut().expect("gnu header").name[..name.len()].copy_from_slice(name);
     header.set_cksum();
@@ -2057,4 +2066,228 @@ fn xattr_names(path: &Utf8Path) -> Vec<String> {
         .filter(|name| !name.is_empty())
         .map(|name| String::from_utf8_lossy(name).into_owned())
         .collect()
+}
+
+/// Images made up by the test rather than by someone who thought of the case.
+///
+/// Every fixture above is a case a person came up with, and every divergence
+/// the routes have actually had was found by reading the code rather than by
+/// one of them. These generate small images out of a deliberately tiny
+/// alphabet of paths, so that collisions -- a file where a directory was, a
+/// whiteout over a path this layer also writes, a hard link to something a
+/// later layer replaces -- are the common case rather than the exception, and
+/// hold every route to the same answer.
+mod generated {
+    use super::*;
+
+    /// SplitMix64. Ten lines, no dependency, and the seed is the whole
+    /// reproduction for a failure.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
+            &from[self.below(from.len())]
+        }
+    }
+
+    /// Paths that collide, nest, and sit behind something that may turn out
+    /// not to be a directory.
+    const PATHS: [&str; 8] = ["a", "b", "d", "d/x", "d/y", "d/sub", "d/sub/z", "lnk"];
+
+    /// Where a symlink points, none of which is created as a directory here,
+    /// so entries underneath one are the interesting case.
+    const TARGETS: [&str; 4] = ["d", "d/sub", "a", "usr/lib"];
+
+    const MODES: [u32; 4] = [0o644, 0o755, 0o600, 0o4755];
+
+    /// A generated image, and what it holds, so a failure reads without
+    /// having to unpack the tar by hand.
+    struct Image {
+        layers: Vec<Vec<u8>>,
+        description: Vec<String>,
+    }
+
+    fn image(seed: u64) -> Image {
+        let mut rng = Rng(seed);
+        let mut layers = Vec::new();
+        let mut description = Vec::new();
+
+        for layer in 0..1 + rng.below(3) {
+            description.push(format!("layer {layer}:"));
+            let mut lines = Vec::new();
+            let tar = tar_of(|builder| {
+                for entry in 0..1 + rng.below(6) {
+                    lines.push(append_generated(builder, &mut rng, layer, entry));
+                }
+            });
+            description.extend(lines.into_iter().map(|line| format!("  {line}")));
+            layers.push(tar);
+        }
+        Image {
+            layers,
+            description,
+        }
+    }
+
+    /// Appends one entry and says what it was.
+    fn append_generated(
+        builder: &mut tar::Builder<Vec<u8>>,
+        rng: &mut Rng,
+        layer: usize,
+        entry: usize,
+    ) -> String {
+        let path = *rng.pick(&PATHS);
+        let body = format!("{layer}:{entry}");
+        match rng.below(16) {
+            0..=6 => {
+                let mode = *rng.pick(&MODES);
+                // A layer may spell a path any of the ways that name it, and
+                // `tar::Header` will not hold the spellings, so the name goes
+                // in as written.
+                let spelled = match rng.below(8) {
+                    0 => format!("./{path}"),
+                    1 => format!("/{path}"),
+                    _ => path.to_string(),
+                };
+                append_file_named_moded(builder, spelled.as_bytes(), body.as_bytes(), mode);
+                format!("file {spelled} mode={mode:o} body={body}")
+            }
+            7..=9 => {
+                append_dir(builder, &format!("{path}/"));
+                format!("dir  {path}")
+            }
+            10..=11 => {
+                let target = *rng.pick(&TARGETS);
+                append_symlink(builder, path, target);
+                format!("link {path} -> {target}")
+            }
+            12 => {
+                let target = *rng.pick(&PATHS);
+                append_hard_link(builder, path, target);
+                format!("hard {path} => {target}")
+            }
+            13..=14 => {
+                let marker = whiteout_of(path);
+                append_file(builder, &marker, b"");
+                format!("wh   {marker}")
+            }
+            _ => {
+                let dir = *rng.pick(&PATHS);
+                let marker = match rng.below(4) {
+                    0 => ".wh..wh..opq".to_string(),
+                    _ => format!("{dir}/.wh..wh..opq"),
+                };
+                append_file(builder, &marker, b"");
+                format!("opq  {marker}")
+            }
+        }
+    }
+
+    /// `.wh.` goes before the last component, not before the path.
+    fn whiteout_of(path: &str) -> String {
+        match path.rsplit_once('/') {
+            Some((dir, name)) => format!("{dir}/.wh.{name}"),
+            None => format!(".wh.{path}"),
+        }
+    }
+
+    /// Two routes cannot be held to the same message, but they can be held to
+    /// the same verdict.
+    fn error_kind(err: &Error) -> &'static str {
+        match err {
+            Error::Io { .. } => "io",
+            Error::UnsafeEntry { .. } => "unsafe entry",
+            Error::InvalidWhiteout { .. } => "invalid whiteout",
+            Error::UnsupportedXattrs { .. } => "unsupported xattrs",
+            Error::DigestMismatch { .. } => "digest mismatch",
+            Error::SizeMismatch { .. } => "size mismatch",
+            other => panic!("a generated image produced an unexpected error: {other:?}"),
+        }
+    }
+
+    /// Applies one generated image by every route and fails on the first pair
+    /// that differ. Returns whether the span route placed it, so the caller
+    /// can tell the fast route is being reached at all.
+    fn routes_agree_on(seed: u64) -> bool {
+        let image = image(seed);
+        let mut baseline: Option<(Route, Vec<String>)> = None;
+        let mut placed = false;
+
+        for route in Route::ALL {
+            let root = scratch(&format!("generated-{seed}-{route:?}"));
+            let (result, from_the_plan) = apply_by(route, &root, &image.layers);
+            placed |= from_the_plan && matches!(route, Route::Spans);
+
+            let outcome = match &result {
+                Ok(rootfs) => snapshot(rootfs),
+                Err(err) => vec![format!("error: {}", error_kind(err))],
+            };
+            match &baseline {
+                None => baseline = Some((route, outcome)),
+                Some((first, expected)) => assert_eq!(
+                    *expected,
+                    outcome,
+                    "seed {seed}: {first:?} and {route:?} disagree on\n{}",
+                    image.description.join("\n")
+                ),
+            }
+
+            let _ = fsutil::force_remove_dir_all(root.as_std_path());
+        }
+        placed
+    }
+
+    fn agree_over(seeds: std::ops::Range<u64>) {
+        let count = (seeds.end - seeds.start) as usize;
+        let reached: usize = seeds.map(|seed| routes_agree_on(seed) as usize).sum();
+        // A generator that has drifted into images the plan always declines
+        // would pass while testing nothing, which is how a harness comes to
+        // flatter the thing it measures.
+        assert!(
+            reached * 5 > count,
+            "the span route placed only {reached} of {count} generated images"
+        );
+    }
+
+    /// How many images each group generates. Enough by default that the suite
+    /// stays quick, and `OCI_RUNTIME_AGREEMENT_SEEDS` to search harder.
+    fn seeds(group: u64) -> std::ops::Range<u64> {
+        let each: u64 = std::env::var("OCI_RUNTIME_AGREEMENT_SEEDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64);
+        group * each..(group + 1) * each
+    }
+
+    #[test]
+    fn every_route_agrees_on_generated_images_0() {
+        agree_over(seeds(0));
+    }
+
+    #[test]
+    fn every_route_agrees_on_generated_images_1() {
+        agree_over(seeds(1));
+    }
+
+    #[test]
+    fn every_route_agrees_on_generated_images_2() {
+        agree_over(seeds(2));
+    }
+
+    #[test]
+    fn every_route_agrees_on_generated_images_3() {
+        agree_over(seeds(3));
+    }
 }
