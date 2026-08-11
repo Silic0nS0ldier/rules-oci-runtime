@@ -14,7 +14,7 @@ mod spans;
 mod tests;
 mod whiteout;
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -43,8 +43,10 @@ pub struct RootfsExtractor {
     parents: fsutil::ParentCache,
     plan: plan::Plan,
     /// What the layer currently being walked has placed. A whiteout hides the
-    /// layers below it, so it has to be able to tell them apart.
-    written: HashSet<PathBuf>,
+    /// layers below it, so it has to be able to tell them apart. Ordered, so
+    /// that a directory can be asked whether anything of this layer's is under
+    /// it, which is what keeps one it made to hold an entry.
+    written: BTreeSet<PathBuf>,
     /// Refuse an image that asks for extended attributes, rather than
     /// extracting one the container will not match.
     strict_xattrs: bool,
@@ -63,7 +65,7 @@ impl RootfsExtractor {
             index_dir: index_dir.map(Utf8Path::to_owned),
             deferred_modes: Vec::new(),
             plan: plan::Plan::default(),
-            written: HashSet::new(),
+            written: BTreeSet::new(),
             strict_xattrs,
         })
     }
