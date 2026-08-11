@@ -94,6 +94,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub read_only: bool,
 
+    /// Refuse an image whose layers set extended attributes, which are never
+    /// restored. Set false to extract it anyway.
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set, default_value_t = true)]
+    pub strict_xattrs: bool,
+
     /// Leave the bundle on disk after the container exits.
     #[arg(long)]
     pub keep_bundle: bool,
@@ -239,6 +244,15 @@ mod tests {
             "/o",
         ];
         assert!(Cli::try_parse_from(both).is_err());
+    }
+
+    /// An image asking for something the container will not get is refused
+    /// unless the caller says otherwise, so the default is the strict one.
+    #[test]
+    fn extended_attributes_are_strict_unless_waived() {
+        assert!(parse(&[]).strict_xattrs);
+        assert!(!parse(&["--strict-xattrs", "false"]).strict_xattrs);
+        assert!(parse(&["--strict-xattrs=true"]).strict_xattrs);
     }
 
     #[test]

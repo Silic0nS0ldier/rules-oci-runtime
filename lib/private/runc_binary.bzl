@@ -71,6 +71,8 @@ def _runc_binary_impl(ctx):
         args.extend(["--hostname", ctx.attr.hostname])
     if ctx.attr.read_only:
         args.append("--read-only")
+    if not ctx.attr.strict_xattrs:
+        args.append("--strict-xattrs=false")
 
     # The launcher is its own wrapper: it reads the sidecar config found next to
     # `argv[0]`, so no shell script is needed.
@@ -154,6 +156,19 @@ container starts, so `$BUILD_WORKSPACE_DIRECTORY:/src:ro` mounts the workspace.
         ),
         "read_only": attr.bool(
             doc = "Mount the container root filesystem read-only.",
+        ),
+        "strict_xattrs": attr.bool(
+            default = True,
+            doc = """Fail rather than run an image whose layers set extended attributes.
+
+Extended attributes are never restored. The one that matters in practice,
+`security.capability`, needs a privilege the extraction does not have when it
+runs rootless, so a container built from such an image does not match it: a
+binary that expected a capability will not have one. Failing says so, rather
+than leaving it to be discovered at runtime.
+
+Switch it off to extract the image anyway, dropping the attributes.
+""",
         ),
         "index": attr.bool(
             default = True,

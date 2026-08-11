@@ -47,6 +47,14 @@ impl RootfsExtractor {
                     .as_ref(),
             );
 
+            // A resolved image had every table read up front, so reporting
+            // here as well would say it twice.
+            if !self.plan.is_resolved() {
+                let names = crate::entries::xattr_names(&mut entry)
+                    .io_context(|| format!("reading entry attributes in layer {layer}"))?;
+                self.report_xattrs(layer, path.as_os_str().as_bytes(), &names)?;
+            }
+
             // `./` names the rootfs, so there is nothing to place: the mode it
             // carries is deferred like any other directory's, and a layer
             // naming the root as anything but a directory is refused.
