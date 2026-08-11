@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use camino::Utf8Path;
 
 use crate::entries::{Kind, Table};
+use crate::fsutil;
 use crate::image::{Descriptor, parse_digest};
 use crate::log::{log, warning};
 
@@ -96,7 +97,14 @@ impl Plan {
         Plan::resolve(layers, tables)
     }
 
-    fn resolve(layers: &[Descriptor], tables: Vec<Table>) -> Plan {
+    fn resolve(layers: &[Descriptor], mut tables: Vec<Table>) -> Plan {
+        // The paths the walk resolves and the paths the tables spell have to
+        // be one and the same, or the tree below describes an image nobody
+        // extracts.
+        if !canonicalise(&mut tables) {
+            return Plan::default();
+        }
+
         // A hard link is made against what is already on disk, so whatever it
         // names has to be placed even where a later layer replaces it. There
         // are single figures of these in a real image.
@@ -190,6 +198,43 @@ impl Plan {
     }
 }
 
+/// Rewrites every path in every table into the form the walk would resolve it
+/// to, so that `./etc/x` and `etc/x` are one path here as they are on disk.
+///
+/// False when a layer names something the walk refuses, or names the rootfs
+/// itself as anything but a directory. Both are errors, and the walk is where
+/// they are raised: planning only ever decides what need not be done.
+fn canonicalise(tables: &mut [Table]) -> bool {
+    let mut canonical = Vec::new();
+    for table in tables {
+        for entry in &mut table.entries {
+            if fsutil::names_the_root(&entry.path) {
+                if entry.kind != Kind::Directory {
+                    return false;
+                }
+                // The rootfs is already there and only its mode is deferred,
+                // so it is spelled the one way the tree can hold.
+                entry.path.clear();
+                entry.path.push(b'.');
+                continue;
+            }
+            if !fsutil::canonical_entry_path(&entry.path, &mut canonical) {
+                return false;
+            }
+            std::mem::swap(&mut entry.path, &mut canonical);
+            // A symlink target is followed from where the link stands rather
+            // than from the rootfs, so it is left as the layer spelled it.
+            if entry.kind == Kind::HardLink {
+                if !fsutil::canonical_entry_path(&entry.link, &mut canonical) {
+                    return false;
+                }
+                std::mem::swap(&mut entry.link, &mut canonical);
+            }
+        }
+    }
+    true
+}
+
 /// Groups the surviving entries for a caller that will place them directly.
 ///
 /// Returns `None` where the image holds something that only a walk of the
@@ -199,7 +244,10 @@ impl Plan {
 ///   be written from an offset and a length;
 /// - an entry that resolves through a symlink, where the path the layer spells
 ///   is not the path it lands on, and working that out means resolving against
-///   the tree as it is built.
+///   the tree as it is built;
+/// - a hard link naming something the final tree does not hold, or holds
+///   behind a symlink, where linking would follow the symlink to wherever it
+///   points and the walk checks that against the rootfs as it goes.
 fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
     let mut work = Work {
         files: vec![Vec::new(); tables.len()],
@@ -220,7 +268,13 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
             // A `BTreeMap` orders by path, so a link under another link is
             // already after it.
             Kind::Symlink => work.symlinks.push((layer as u32, entry as u32)),
-            Kind::HardLink => work.hard_links.push((layer as u32, entry as u32)),
+            Kind::HardLink => {
+                let target = tables[layer].entries[entry].link.as_slice();
+                if !tree.contains_key(target) || behind_a_link(tree, target) {
+                    return None;
+                }
+                work.hard_links.push((layer as u32, entry as u32))
+            }
         }
     }
     for (layer, entries) in work.files.iter_mut().enumerate() {
@@ -603,6 +657,91 @@ mod tests {
     fn an_absent_table_plans_nothing() {
         let plan = Plan::build(None, &[descriptor(0)]);
         assert!(!plan.is_shadowed(&descriptor(0).digest, b"anything"));
+    }
+
+    /// The tables spell a path as its layer does, while the walk resolves it.
+    /// A plan built on the raw spelling would not see that these are one file,
+    /// and the span route would then place both and collide.
+    mod one_path_however_it_is_spelled {
+        use super::*;
+
+        #[test]
+        fn a_later_layer_still_shadows_it() {
+            let (plan, d) = plan_of(vec![table(&["./etc/config"]), table(&["/etc/config"])]);
+            assert!(plan.is_shadowed(&d[0].digest, b"etc/config"));
+            assert!(!plan.is_shadowed(&d[1].digest, b"etc/config"));
+        }
+
+        #[test]
+        fn a_whiteout_still_hides_it() {
+            let (plan, d) = plan_of(vec![table(&["./dir/a"]), table(&["dir/.wh.a"])]);
+            assert!(plan.is_shadowed(&d[0].digest, b"dir/a"));
+        }
+
+        #[test]
+        fn the_directory_it_lives_in_is_created_once() {
+            assert_eq!(
+                dirs_of(vec![
+                    layer(vec![dir("./etc"), file("./etc/a")]),
+                    layer(vec![dir("etc"), file("etc/b")]),
+                ]),
+                ["etc"]
+            );
+        }
+    }
+
+    /// Refusing an entry is the walk's job, so an image holding one is left to
+    /// it rather than planned around.
+    mod what_only_the_walk_can_judge {
+        use super::*;
+
+        #[test]
+        fn a_path_that_climbs_out_of_the_rootfs() {
+            let (plan, _) = plan_of(vec![table(&["../escaped"])]);
+            assert!(!plan.is_resolved());
+        }
+
+        #[test]
+        fn a_hard_link_naming_something_outside_the_rootfs() {
+            let mut link = of_kind("stolen", Kind::HardLink);
+            link.link = b"../../etc/passwd".to_vec();
+            let (plan, _) = plan_of(vec![layer(vec![link])]);
+            assert!(!plan.is_resolved());
+        }
+
+        /// Linking follows a symlink on the way to the target, out of the
+        /// rootfs if that is where it points. The walk checks that against the
+        /// tree it has built; the plan can only decline.
+        #[test]
+        fn a_hard_link_reaching_through_a_symlink() {
+            let mut link = of_kind("stolen", Kind::HardLink);
+            link.link = b"lnk/passwd".to_vec();
+            let (plan, _) = plan_of(vec![layer(vec![symlink("lnk", "/etc"), link])]);
+            assert!(plan.work().is_none());
+        }
+
+        #[test]
+        fn a_hard_link_naming_a_path_the_image_never_places() {
+            let mut link = of_kind("dangling", Kind::HardLink);
+            link.link = b"absent".to_vec();
+            let (plan, _) = plan_of(vec![layer(vec![link])]);
+            assert!(plan.work().is_none());
+        }
+
+        #[test]
+        fn the_rootfs_named_as_anything_but_a_directory() {
+            let (plan, _) = plan_of(vec![layer(vec![file(".")])]);
+            assert!(!plan.is_resolved());
+        }
+    }
+
+    /// `tar -C dir .` writes the rootfs itself into every layer, so planning
+    /// has to survive it.
+    #[test]
+    fn the_archive_root_is_planned_as_the_rootfs_itself() {
+        let (plan, _) = plan_of(vec![layer(vec![dir("./"), dir("etc"), file("etc/a")])]);
+        assert!(plan.is_resolved());
+        assert!(plan.work().is_some());
     }
 
     /// Replacing a directory with anything else takes the tree under it away,

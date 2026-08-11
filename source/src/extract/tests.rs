@@ -845,6 +845,17 @@ fn append_file_moded(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8
     builder.append_data(&mut header, path, body).expect("file");
 }
 
+/// A hostile layer has to be written by hand: `tar::Header` will not spell a
+/// path with `..` in it at all, and a real one is not built by this crate.
+fn append_file_named(builder: &mut tar::Builder<Vec<u8>>, name: &[u8], body: &[u8]) {
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_size(body.len() as u64);
+    header.as_gnu_mut().expect("gnu header").name[..name.len()].copy_from_slice(name);
+    header.set_cksum();
+    builder.append(&header, body).expect("file");
+}
+
 fn append_of_type(builder: &mut tar::Builder<Vec<u8>>, path: &str, entry_type: EntryType) {
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(entry_type);
@@ -969,14 +980,12 @@ impl Route {
     const ALL: [Route; 3] = [Route::Streaming, Route::Planned, Route::Spans];
 }
 
-/// Applies `layers` by the given route, installing exactly the sidecars that
-/// route needs.
-fn extract_by(
+/// Installs `layers` as blobs, with exactly the sidecars `route` reads.
+fn install_for(
     route: Route,
     root: &Utf8Path,
     layers: &[Vec<u8>],
-    strict_xattrs: bool,
-) -> Result<Utf8PathBuf> {
+) -> (Utf8PathBuf, Vec<Descriptor>) {
     let index_dir = root.join("indexes");
     fs::create_dir_all(&index_dir).expect("index dir");
 
@@ -1000,6 +1009,18 @@ fn extract_by(
         }
         descriptors.push(descriptor);
     }
+    (index_dir, descriptors)
+}
+
+/// Applies `layers` by the given route, installing exactly the sidecars that
+/// route needs.
+fn extract_by(
+    route: Route,
+    root: &Utf8Path,
+    layers: &[Vec<u8>],
+    strict_xattrs: bool,
+) -> Result<Utf8PathBuf> {
+    let (index_dir, descriptors) = install_for(route, root, layers);
 
     // `install_blob` rewrites index.json each time, so the layout is opened
     // once every blob is in place.
@@ -1127,9 +1148,87 @@ fn assert_routes_agree(name: &str, routes: &[Route], layers: &[Vec<u8>]) {
     }
 }
 
+/// Applies `layers` by every route and fails unless each of them refuses the
+/// image.
+///
+/// No route is held to a plan shape here: an image the plan will not resolve
+/// falls back to the walk, and being refused there is the point.
+fn assert_routes_refuse(name: &str, layers: &[Vec<u8>]) {
+    for route in Route::ALL {
+        let root = scratch(&format!("{name}-{route:?}"));
+        let (index_dir, descriptors) = install_for(route, &root, layers);
+        let layout = Layout::open(&root).expect("layout");
+        let rootfs = root.join("rootfs");
+        let dir = match route {
+            Route::Streaming => None,
+            Route::Planned | Route::Spans => Some(index_dir.as_path()),
+        };
+
+        let mut extractor = RootfsExtractor::new(&rootfs, dir, true).expect("extractor");
+        let err = extractor
+            .plan(&descriptors)
+            .and_then(|()| extractor.apply(&layout, &descriptors))
+            .expect_err(&format!("{name}: {route:?} extracted what it must refuse"));
+        assert!(
+            matches!(err, Error::UnsafeEntry { .. }),
+            "{name}: {route:?} expected an unsafe entry, got {err:?}"
+        );
+        assert!(
+            !root.join("escaped").exists(),
+            "{name}: {route:?} wrote outside the rootfs"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+/// The sidecars describe the same hostile layer, and the routes that read them
+/// join the paths those sidecars hold straight onto the rootfs.
 #[test]
-fn every_route_agrees_on_a_layered_image() {
+fn no_route_places_an_entry_that_climbs_out_of_the_rootfs() {
+    assert_routes_refuse(
+        "route-escape",
+        &[tar_of(|b| {
+            append_dir(b, "etc/");
+            append_file_named(b, b"etc/../../escaped", b"nope");
+        })],
+    );
+}
+
+#[test]
+fn no_route_places_a_hard_link_that_climbs_out_of_the_rootfs() {
+    assert_routes_refuse(
+        "route-hard-link-escape",
+        &[tar_of(|b| {
+            append_file(b, "keep", b"keep");
+            append_hard_link(b, "stolen", "../../etc/passwd");
+        })],
+    );
+}
+
+/// One file spelled two ways is one file. A route that thought otherwise
+/// would place both copies, and the span route would then collide on a path
+/// the plan promised it owned.
+#[test]
+fn every_route_agrees_when_layers_spell_one_path_differently() {
     assert_routes_agree(
+        "route-spelling",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "./etc/");
+                append_file(b, "./etc/config", b"first");
+            }),
+            tar_of(|b| {
+                append_dir(b, "etc/");
+                append_file(b, "etc/config", b"second");
+            }),
+        ],
+    );
+}
+
+#[test]
+fn every_route_agrees_on_a_layered_image() {    assert_routes_agree(
         "route-layered",
         &Route::ALL,
         &[

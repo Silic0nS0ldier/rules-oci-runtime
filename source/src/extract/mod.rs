@@ -16,7 +16,6 @@ mod tests;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::mpsc::sync_channel;
@@ -115,9 +114,7 @@ impl RootfsExtractor {
         let root = self.rootfs.clone();
         let mut path = PathBuf::new();
         for (relative, mode) in self.plan.directories() {
-            path.clear();
-            path.push(root.as_std_path());
-            path.push(std::ffi::OsStr::from_bytes(relative));
+            fsutil::join_under(root.as_std_path(), relative, &mut path);
             match fs::create_dir(&path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}

@@ -370,17 +370,19 @@ fn place_symlink(root: &Path, entry: &Entry) -> Result<()> {
 fn place_hard_link(root: &Path, entry: &Entry) -> Result<()> {
     let mut path = PathBuf::new();
     resolve(root, &mut path, entry);
+    // The plan placed the target itself and checked that nothing on the way to
+    // it is a symlink, so this reaches the copy it named rather than following
+    // a link out of the rootfs.
     let mut source = PathBuf::new();
-    source.push(root);
-    source.push(std::ffi::OsStr::from_bytes(&entry.link));
+    crate::fsutil::join_under(root, &entry.link, &mut source);
     fs::hard_link(&source, &path)
         .io_context(|| format!("linking {:?}", String::from_utf8_lossy(&entry.path)))
 }
 
+/// Entry paths reach here in the one form every route agrees on, checked by
+/// the plan, so joining them cannot leave the rootfs.
 fn resolve(root: &Path, path: &mut PathBuf, entry: &Entry) {
-    path.clear();
-    path.push(root);
-    path.push(std::ffi::OsStr::from_bytes(&entry.path));
+    crate::fsutil::join_under(root, &entry.path, path);
 }
 
 fn verify(layer: &Layer) -> Result<()> {

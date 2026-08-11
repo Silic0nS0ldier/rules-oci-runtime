@@ -33,6 +33,7 @@ impl RootfsExtractor {
         let mut buffer = vec![0u8; CHUNK_BYTES];
         // Reused for every entry, so a layer costs two path allocations rather
         // than a handful per entry.
+        let mut relative = Vec::new();
         let mut path = PathBuf::new();
         let mut dst = PathBuf::new();
         self.written.clear();
@@ -58,7 +59,7 @@ impl RootfsExtractor {
             // `./` names the rootfs, so there is nothing to place: the mode it
             // carries is deferred like any other directory's, and a layer
             // naming the root as anything but a directory is refused.
-            if fsutil::names_the_root(&path) {
+            if fsutil::names_the_root(path.as_os_str().as_bytes()) {
                 if !entry.header().entry_type().is_dir() {
                     return Err(Error::UnsafeEntry {
                         layer: layer.to_string(),
@@ -70,12 +71,13 @@ impl RootfsExtractor {
                 continue;
             }
 
-            if !fsutil::resolve_under(root, &path, &mut dst) {
+            if !fsutil::canonical_entry_path(path.as_os_str().as_bytes(), &mut relative) {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),
                     path: path.display().to_string(),
                 });
             }
+            fsutil::join_under(root, &relative, &mut dst);
 
             let name = dst.file_name().unwrap_or_default().as_bytes();
             if name == OPAQUE_WHITEOUT.as_bytes() {
@@ -126,7 +128,7 @@ impl RootfsExtractor {
             // A body a later layer replaces is written and then thrown away,
             // so the plan takes it out before any of that happens.
             if matches!(entry_type, EntryType::Regular | EntryType::Continuous)
-                && self.plan.is_shadowed(layer, path.as_os_str().as_bytes())
+                && self.plan.is_shadowed(layer, &relative)
             {
                 continue;
             }
@@ -202,10 +204,13 @@ impl RootfsExtractor {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
                     // A hard link names an earlier entry of the same archive,
                     // so it is rooted at the rootfs like any other entry path.
-                    let mut source = PathBuf::new();
-                    if !fsutil::resolve_under(root, &target, &mut source) {
+                    let target = target.as_os_str().as_bytes();
+                    let mut canonical = Vec::new();
+                    if !fsutil::canonical_entry_path(target, &mut canonical) {
                         return Err(unsafe_entry());
                     }
+                    let mut source = PathBuf::new();
+                    fsutil::join_under(root, &canonical, &mut source);
                     if !self.parents.contains_parent_of(&source)? {
                         return Err(unsafe_entry());
                     }
