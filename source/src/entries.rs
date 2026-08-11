@@ -14,7 +14,10 @@ use std::io::{self, Read, Write};
 
 use crate::error::{Error, IoContext, Result};
 
-const MAGIC: &[u8; 4] = b"OTE1";
+const MAGIC: &[u8; 4] = b"OTE2";
+
+/// A layer carries extended attributes as one PAX record per attribute.
+const XATTR_PREFIX: &str = "SCHILY.xattr.";
 
 /// A layer with more entries than this is not one we can plan for in bounded
 /// memory, and is far past anything a real image contains.
@@ -78,6 +81,10 @@ pub struct Entry {
     pub path: Vec<u8>,
     /// Target of a symlink or hard link, empty otherwise.
     pub link: Vec<u8>,
+    /// Names of the extended attributes the entry carries, NUL separated and
+    /// empty for almost every entry. The values are not kept: nothing restores
+    /// them, and this is only here so that every route can say so.
+    pub xattrs: Vec<u8>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -92,7 +99,8 @@ impl Table {
         let mut archive = tar::Archive::new(tar);
         let mut entries = Vec::new();
         for entry in archive.entries().io_context(|| context.to_string())? {
-            let entry = entry.io_context(|| context.to_string())?;
+            let mut entry = entry.io_context(|| context.to_string())?;
+            let xattrs = xattr_names(&mut entry).io_context(|| context.to_string())?;
             let header = entry.header();
             let entry_type = header.entry_type();
             // Classified by what the extractor does with it, not by the type
@@ -128,6 +136,7 @@ impl Table {
                     .link_name_bytes()
                     .map(|link| link.into_owned())
                     .unwrap_or_default(),
+                xattrs,
             });
         }
         Ok(Table { entries })
@@ -147,6 +156,7 @@ impl Table {
             body.extend_from_slice(&entry.size.to_le_bytes());
             write_bytes(&mut body, &entry.path)?;
             write_bytes(&mut body, &entry.link)?;
+            write_bytes(&mut body, &entry.xattrs)?;
         }
 
         let mut encoder =
@@ -196,6 +206,7 @@ impl Table {
             let size = take_u64(&body, &mut at)?;
             let path = take_bytes(&body, &mut at)?;
             let link = take_bytes(&body, &mut at)?;
+            let xattrs = take_bytes(&body, &mut at)?;
             entries.push(Entry {
                 kind,
                 mode,
@@ -204,6 +215,7 @@ impl Table {
                 size,
                 path,
                 link,
+                xattrs,
             });
         }
         if at != body.len() {
@@ -221,8 +233,30 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// `tar` spells a directory with a trailing slash, which would leave the plan
-/// holding `d/` for the directory and `d` for the same place as an ancestor of
+/// The names of the entry's extended attributes, NUL separated.
+///
+/// Only the names: the values can be large, nothing restores them, and the
+/// names are all a reader needs to say what an image asked for and did not get.
+fn xattr_names(entry: &mut tar::Entry<'_, impl Read>) -> io::Result<Vec<u8>> {
+    let Some(extensions) = entry.pax_extensions()? else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for extension in extensions {
+        let extension = extension?;
+        let Ok(key) = extension.key() else { continue };
+        let Some(name) = key.strip_prefix(XATTR_PREFIX) else {
+            continue;
+        };
+        if !names.is_empty() {
+            names.push(0);
+        }
+        names.extend_from_slice(name.as_bytes());
+    }
+    Ok(names)
+}
+
+/// `tar` spells a directory with a trailing slash, which would leave the plan/// holding `d/` for the directory and `d` for the same place as an ancestor of
 /// what is under it. Worse, `d/` sorts inside its own subtree, so clearing the
 /// subtree takes the directory with it.
 fn without_trailing_slash(mut path: Vec<u8>) -> Vec<u8> {
@@ -371,6 +405,71 @@ mod tests {
             b"/",
             "the root has no shorter form to reduce to"
         );
+    }
+
+    /// The values are not kept, only the names, and only so that a reader can
+    /// say what the image asked for.
+    #[test]
+    fn extended_attribute_names_are_recorded_and_survive_serialisation() {
+        let capability = [1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut builder = tar::Builder::new(Vec::new());
+        pax_record(&mut builder, "plain", b"body", &[]);
+        pax_record(
+            &mut builder,
+            "capable",
+            b"body",
+            &[("security.capability", &capability), ("user.note", b"hello")],
+        );
+        let tar = builder.into_inner().expect("tar");
+
+        let table = Table::build(&tar[..]).expect("table");
+        assert_eq!(table.entries[0].xattrs, b"");
+        assert_eq!(
+            table.entries[1].xattrs,
+            b"security.capability\0user.note",
+            "names in the order the layer lists them, NUL separated"
+        );
+
+        let mut bytes = Vec::new();
+        table.write_to(&mut bytes).expect("write");
+        assert_eq!(Table::read_from(&bytes[..]).expect("read"), table);
+    }
+
+    /// Writes a PAX extended header ahead of the entry, which is the only way
+    /// a layer can carry an extended attribute. `tar::Builder` cannot.
+    fn pax_record(
+        builder: &mut tar::Builder<Vec<u8>>,
+        path: &str,
+        body: &[u8],
+        xattrs: &[(&str, &[u8])],
+    ) {
+        if !xattrs.is_empty() {
+            let mut records = Vec::new();
+            for (name, value) in xattrs {
+                let field = format!("SCHILY.xattr.{name}=");
+                let mut len = field.len() + value.len() + 2;
+                loop {
+                    let next = len.to_string().len() + 1 + field.len() + value.len() + 1;
+                    if next == len {
+                        break;
+                    }
+                    len = next;
+                }
+                records.extend_from_slice(format!("{len} {field}").as_bytes());
+                records.extend_from_slice(value);
+                records.push(b'\n');
+            }
+            let mut header = tar::Header::new_ustar();
+            header.set_entry_type(tar::EntryType::XHeader);
+            header.set_mode(0o644);
+            header.set_size(records.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &records[..]).expect("pax header");
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(body.len() as u64);
+        builder.append_data(&mut header, path, body).expect("entry");
     }
 
     #[test]

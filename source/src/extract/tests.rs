@@ -1639,3 +1639,91 @@ fn a_layer_rooted_at_dot_extracts_its_entries() {
         },
     );
 }
+
+/// Writes a PAX extended header ahead of `path`, which is how a layer carries
+/// extended attributes: one `SCHILY.xattr.<name>` record per attribute.
+fn append_with_xattrs(
+    builder: &mut tar::Builder<Vec<u8>>,
+    path: &str,
+    body: &[u8],
+    xattrs: &[(&str, &[u8])],
+) {
+    let mut records = Vec::new();
+    for (name, value) in xattrs {
+        let field = format!("SCHILY.xattr.{name}=");
+        // A record counts its own length, so the length grows the length.
+        let mut len = field.len() + value.len() + 2;
+        loop {
+            let candidate = len.to_string().len() + 1 + field.len() + value.len() + 1;
+            if candidate == len {
+                break;
+            }
+            len = candidate;
+        }
+        records.extend_from_slice(format!("{len} {field}").as_bytes());
+        records.extend_from_slice(value);
+        records.push(b'\n');
+    }
+
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(EntryType::XHeader);
+    header.set_mode(0o644);
+    header.set_size(records.len() as u64);
+    header.set_cksum();
+    builder.append(&header, &records[..]).expect("pax header");
+
+    append_file(builder, path, body);
+}
+
+/// A layer may carry extended attributes, and we restore none of them: the one
+/// that matters, `security.capability`, needs a privilege the extractor does
+/// not have when it runs rootless, which is the usual case.
+///
+/// What matters is that such a layer extracts rather than failing, since the
+/// attributes sit on entries an image cannot do without.
+#[test]
+fn extended_attributes_are_dropped_rather_than_fatal() {
+    let capability = [1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for_each_route(
+        "xattrs",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "bin/");
+            append_with_xattrs(b, "bin/capable", b"body", &[("security.capability", &capability)]);
+            append_with_xattrs(b, "bin/noted", b"body", &[("user.note", b"hello")]);
+            append_file(b, "bin/plain", b"body");
+        })],
+        |route, rootfs| {
+            for name in ["capable", "noted", "plain"] {
+                let path = rootfs.join("bin").join(name);
+                assert_eq!(
+                    fs::read_to_string(&path).expect(name),
+                    "body",
+                    "{route:?}: {name} extracts whatever it carries"
+                );
+                assert!(
+                    xattr_names(&path).is_empty(),
+                    "{route:?}: {name} keeps no attributes"
+                );
+            }
+        },
+    );
+}
+
+fn xattr_names(path: &Utf8Path) -> Vec<String> {
+    let c_path = std::ffi::CString::new(path.as_str()).expect("path");
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: both pointers are valid for the length passed.
+    let len = unsafe {
+        libc::llistxattr(c_path.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len())
+    };
+    if len <= 0 {
+        return Vec::new();
+    }
+    buffer.truncate(len as usize);
+    buffer
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect()
+}
