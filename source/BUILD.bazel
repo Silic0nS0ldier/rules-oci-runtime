@@ -1,6 +1,6 @@
 load("@rules_oci_runtime_source_crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_oci_runtime//lib:defs.bzl", "launcher_toolchain")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test", "rustfmt_test")
 
 exports_files(["rustfmt.toml"])
 
@@ -17,6 +17,12 @@ rust_test(
     name = "oci_runtime_test",
     timeout = "short",
     crate = ":oci_runtime",
+)
+
+rustfmt_test(
+    name = "oci_runtime_fmt_test",
+    timeout = "short",
+    targets = [":oci_runtime"],
 )
 
 launcher_toolchain(

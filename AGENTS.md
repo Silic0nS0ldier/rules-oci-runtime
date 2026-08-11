@@ -39,10 +39,10 @@ Note that testing (`bazel test //...`) must be run within _each_ Bazel module.
 
 ## Formatting
 
-The repo is **not** `cargo fmt` clean and is not meant to become clean in
-passing. Never format the whole crate — it buries the real change. Compare
-`cargo fmt --check` findings against the base branch and only address ones your
-change introduced.
+The launcher crate (`source/`) is `cargo fmt` clean and `//:oci_runtime_fmt_test`
+enforces it in CI. Run `cargo fmt` there before committing, and keep formatting
+churn out of feature commits — if a change is formatting only, commit it apart
+from the behavioural change.
 
 ## Benchmarking
 

@@ -5,9 +5,16 @@
 ```sh
 bazel test //...                          # rule tests and documentation freshness
 (cd source && bazel test //...)           # launcher unit tests
+(cd source && cargo fmt)                  # format the launcher crate
 (cd e2e/smoke && bazel test //...)        # end to end tests
 (cd e2e/conformance && bazel test //...)  # extraction compared against umoci
 bazel run //docs:update                   # regenerate docs/defs.md
+```
+
+Point `git blame` past the bulk `cargo fmt` commit:
+
+```sh
+git config blame.ignoreRevsFile .git-blame-ignore-revs
 ```
 
 The end to end modules run rootless containers, so they need unprivileged user
