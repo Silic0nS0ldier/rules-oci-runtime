@@ -18,8 +18,6 @@
 //! a large file does not stall the rest and later layers start as soon as
 //! there is capacity for them.
 
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,14 +25,14 @@ use std::thread;
 
 use camino::Utf8Path;
 
-use crate::entries::{Entry, Table};
-use crate::error::{Error, IoContext, Result};
+use crate::entries::Table;
+use crate::error::{Error, Result};
 use crate::image::{Descriptor, Layout};
 use crate::log::log;
 use crate::sys::Blob;
 use crate::zinfo;
 
-use super::file::{Occupied, create_file, finish_file, place_symlink};
+use super::file::{place_body, place_hard_link, place_link};
 use super::plan::{Plan, Work};
 
 /// Everything one layer contributes, held open for the length of the run.
@@ -101,8 +99,12 @@ pub fn extract(
     // Symlinks first: nothing resolves through one here, or the plan would
     // have refused the image, but a link under another link needs it standing.
     for &(layer, entry) in &work.symlinks {
-        let entry = &plan.table(layer as usize).entries[entry as usize];
-        place_link(root, entry)?;
+        let table = plan.table(layer as usize);
+        place_link(
+            root,
+            &layers[layer as usize].descriptor.digest,
+            &table.entries[entry as usize],
+        )?;
     }
 
     let units = plan_units(&layers, work, plan);
@@ -120,8 +122,12 @@ pub fn extract(
 
     // Hard links last: the files they name are on disk by now.
     for &(layer, entry) in &work.hard_links {
-        let entry = &plan.table(layer as usize).entries[entry as usize];
-        place_hard_link(root, entry)?;
+        let table = plan.table(layer as usize);
+        place_hard_link(
+            root,
+            &layers[layer as usize].descriptor.digest,
+            &table.entries[entry as usize],
+        )?;
     }
     Ok(())
 }
@@ -322,44 +328,9 @@ fn run_span(
                 std::io::Error::other("an entry lies outside the span it was planned into"),
             )
         })?;
-        write_file(root, path, entry, body)?;
+        place_body(root, path, &layer.descriptor.digest, entry, body)?;
     }
     Ok(())
-}
-
-fn write_file(root: &Path, path: &mut PathBuf, entry: &Entry, body: &[u8]) -> Result<()> {
-    resolve(root, path, entry);
-    let context = || format!("extracting {:?}", String::from_utf8_lossy(&entry.path));
-    // The plan says this path is placed once, so anything already standing
-    // here means the plan and the tree have parted company.
-    let (mut file, _) = create_file(path, entry.mode, Occupied::Refuse).io_context(context)?;
-    file.write_all(body).io_context(context)?;
-    finish_file(&file, entry.mode, entry.mtime).io_context(context)
-}
-
-fn place_link(root: &Path, entry: &Entry) -> Result<()> {
-    let mut path = PathBuf::new();
-    resolve(root, &mut path, entry);
-    place_symlink(&path, &entry.link, entry.mtime)
-        .io_context(|| format!("linking {:?}", String::from_utf8_lossy(&entry.path)))
-}
-
-fn place_hard_link(root: &Path, entry: &Entry) -> Result<()> {
-    let mut path = PathBuf::new();
-    resolve(root, &mut path, entry);
-    // The plan placed the target itself and checked that nothing on the way to
-    // it is a symlink, so this reaches the copy it named rather than following
-    // a link out of the rootfs.
-    let mut source = PathBuf::new();
-    crate::fsutil::join_under(root, &entry.link, &mut source);
-    fs::hard_link(&source, &path)
-        .io_context(|| format!("linking {:?}", String::from_utf8_lossy(&entry.path)))
-}
-
-/// Entry paths reach here in the one form every route agrees on, checked by
-/// the plan, so joining them cannot leave the rootfs.
-fn resolve(root: &Path, path: &mut PathBuf, entry: &Entry) {
-    crate::fsutil::join_under(root, &entry.path, path);
 }
 
 fn verify(layer: &Layer) -> Result<()> {

@@ -11,10 +11,21 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::error::{Error, Result};
+use crate::entries::Entry;
+use crate::error::{Error, IoContext, Result};
 use crate::fsutil;
+
+/// What an extraction failure says about the entry it happened on. Both
+/// routes report through this, so one failure does not read differently
+/// depending on which of them placed the entry.
+pub(super) fn extracting(layer: &str, path: &[u8]) -> String {
+    format!(
+        "extracting {:?} from layer {layer}",
+        String::from_utf8_lossy(path)
+    )
+}
 
 /// What to do about something already standing where an entry goes.
 #[derive(Clone, Copy)]
@@ -159,6 +170,51 @@ pub(super) fn place_symlink(dst: &Path, target: &[u8], mtime: u64) -> io::Result
     std::os::unix::fs::symlink(Path::new(std::ffi::OsStr::from_bytes(target)), dst)?;
     set_symlink_mtime(dst, mtime);
     Ok(())
+}
+
+/// Writes a regular file whose body is already in memory, which is what a
+/// worker has once it has inflated the span the body sits in.
+///
+/// The counterpart of [`unpack_regular`], and the one place the two routes
+/// differ about a path that is already taken: the plan resolved the whole
+/// image and says each path is placed once, so anything standing here means
+/// the plan and the tree have parted company.
+///
+/// This and the two below take the path from a table, which the plan has
+/// already put in the one form every route agrees on, so joining it under the
+/// rootfs cannot leave it.
+pub(super) fn place_body(
+    root: &Path,
+    path: &mut PathBuf,
+    layer: &str,
+    entry: &Entry,
+    body: &[u8],
+) -> Result<()> {
+    let context = || extracting(layer, &entry.path);
+    fsutil::join_under(root, &entry.path, path);
+    let (mut file, _) = create_file(path, entry.mode, Occupied::Refuse).io_context(context)?;
+    file.write_all(body).io_context(context)?;
+    finish_file(&file, entry.mode, entry.mtime).io_context(context)
+}
+
+/// The same for a symlink a table describes.
+pub(super) fn place_link(root: &Path, layer: &str, entry: &Entry) -> Result<()> {
+    let mut path = PathBuf::new();
+    fsutil::join_under(root, &entry.path, &mut path);
+    place_symlink(&path, &entry.link, entry.mtime).io_context(|| extracting(layer, &entry.path))
+}
+
+/// The same for a hard link a table describes.
+///
+/// The plan placed the target itself and checked that nothing on the way to it
+/// is a symlink, so this reaches the copy it named rather than following a link
+/// out of the rootfs.
+pub(super) fn place_hard_link(root: &Path, layer: &str, entry: &Entry) -> Result<()> {
+    let mut path = PathBuf::new();
+    fsutil::join_under(root, &entry.path, &mut path);
+    let mut source = PathBuf::new();
+    fsutil::join_under(root, &entry.link, &mut source);
+    fs::hard_link(&source, &path).io_context(|| extracting(layer, &entry.path))
 }
 
 /// Creates a directory, treating one that is already there as done: the walk

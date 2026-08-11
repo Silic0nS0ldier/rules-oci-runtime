@@ -11,7 +11,7 @@ use crate::fsutil;
 use crate::log::{log, warning};
 
 use super::RootfsExtractor;
-use super::file::{create_directory, place_symlink, prepare_directory, unpack_regular};
+use super::file::{create_directory, extracting, place_symlink, prepare_directory, unpack_regular};
 use super::pipeline::CHUNK_BYTES;
 use super::whiteout::{self, Whiteout};
 
@@ -152,7 +152,7 @@ impl RootfsExtractor {
             // a flat run of the stream, so `tar` still places those.
             if kind == Kind::File {
                 let replaced = unpack_regular(&mut entry, &dst, mode, &mut buffer)
-                    .io_context(|| format!("extracting {:?} from layer {layer}", path.display()))?;
+                    .io_context(|| extracting(layer, path.as_os_str().as_bytes()))?;
                 if replaced {
                     self.parents.forget(&dst);
                 }
@@ -185,9 +185,8 @@ impl RootfsExtractor {
                 Kind::Symlink => {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
                     let mtime = mtime_of(entry.header());
-                    place_symlink(&dst, target.as_os_str().as_bytes(), mtime).io_context(|| {
-                        format!("extracting {:?} from layer {layer}", path.display())
-                    })?;
+                    place_symlink(&dst, target.as_os_str().as_bytes(), mtime)
+                        .io_context(|| extracting(layer, path.as_os_str().as_bytes()))?;
                 }
                 Kind::HardLink => {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
@@ -203,17 +202,16 @@ impl RootfsExtractor {
                     if !self.parents.contains_parent_of(&source)? {
                         return Err(unsafe_entry());
                     }
-                    fs::hard_link(&source, &dst).io_context(|| {
-                        format!("extracting {:?} from layer {layer}", path.display())
-                    })?;
+                    fs::hard_link(&source, &dst)
+                        .io_context(|| extracting(layer, path.as_os_str().as_bytes()))?;
                 }
                 // Sparse files still need `tar` to place the holes.
                 _ => {
                     entry.set_preserve_permissions(true);
                     entry.set_preserve_mtime(true);
-                    let unpacked = entry.unpack_in(root).io_context(|| {
-                        format!("extracting {:?} from layer {layer}", path.display())
-                    })?;
+                    let unpacked = entry
+                        .unpack_in(root)
+                        .io_context(|| extracting(layer, path.as_os_str().as_bytes()))?;
                     if !unpacked {
                         return Err(unsafe_entry());
                     }
