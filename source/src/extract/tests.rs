@@ -963,6 +963,39 @@ fn every_route_agrees_when_a_skipped_body_would_have_cleared_a_directory() {
     );
 }
 
+/// An opaque marker clears what the layers below left in a directory. A
+/// directory this layer made only to hold something it wrote is not one of
+/// those, and nothing names it, so it was cleared along with the file inside
+/// it.
+#[test]
+fn an_opaque_whiteout_keeps_a_directory_holding_this_layer_s_work() {
+    for_each_route(
+        "opaque-keeps-implicit-parent",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/old", b"old");
+            }),
+            tar_of(|b| {
+                append_file(b, "d/sub/z", b"z");
+                append_file(b, "d/.wh..wh..opq", b"");
+            }),
+        ],
+        |route, rootfs| {
+            assert_eq!(
+                fs::read_to_string(rootfs.join("d/sub/z")).unwrap_or_default(),
+                "z",
+                "{route:?} cleared what this layer wrote"
+            );
+            assert!(
+                !rootfs.join("d/old").exists(),
+                "{route:?} kept what the marker hides"
+            );
+        },
+    );
+}
+
 /// The ways a layer set can reach the rootfs. Which one runs is decided by
 /// what sidecars sit beside the blobs, so a fixture can be put through all
 /// three and the results compared.

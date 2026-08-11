@@ -247,9 +247,11 @@ impl RootfsExtractor {
 
     /// Removes everything under `dir` that this layer did not put there.
     ///
-    /// A path this layer wrote stays, and so does the directory holding it,
-    /// which is why this walks down rather than clearing the level and
-    /// stopping.
+    /// A path this layer wrote stays, and so does the directory holding it —
+    /// including one no entry names, made only to hold what went in it. What
+    /// the layer wrote is taken from the record rather than from the disk: a
+    /// body the plan skipped counts as written, and the directory it would
+    /// have gone in is still one to keep.
     fn clear_lower_layers(&mut self, dir: &Path) -> Result<()> {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -260,14 +262,15 @@ impl RootfsExtractor {
         for entry in entries {
             let entry = entry.io_context(|| format!("listing {}", dir.display()))?;
             let path = entry.path();
+            let is_dir = entry
+                .file_type()
+                .io_context(|| format!("inspecting {}", path.display()))?
+                .is_dir();
+            if is_dir && (self.written.contains(&path) || self.wrote_under(&path)) {
+                keep.push(path);
+                continue;
+            }
             if self.written.contains(&path) {
-                if entry
-                    .file_type()
-                    .io_context(|| format!("inspecting {}", path.display()))?
-                    .is_dir()
-                {
-                    keep.push(path);
-                }
                 continue;
             }
             fsutil::remove_any(&path)?;
@@ -276,6 +279,14 @@ impl RootfsExtractor {
             self.clear_lower_layers(&path)?;
         }
         Ok(())
+    }
+
+    /// True when this layer has placed anything under `dir`.
+    fn wrote_under(&self, dir: &Path) -> bool {
+        self.written
+            .range(dir.to_path_buf()..)
+            .take_while(|path| path.starts_with(dir))
+            .any(|path| path != dir)
     }
 }
 
