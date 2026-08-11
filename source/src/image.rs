@@ -208,6 +208,13 @@ impl Layout {
         File::open(&path).io_context(|| format!("opening blob {path}"))
     }
 
+    /// Opens a blob as bytes, for a caller that needs random access over the
+    /// whole of it. The digest is still the caller's to check.
+    pub fn map_blob(&self, descriptor: &Descriptor) -> Result<crate::sys::Blob> {
+        let file = self.open_blob(descriptor)?;
+        crate::sys::Blob::of(&file).io_context(|| format!("reading blob {}", descriptor.digest))
+    }
+
     /// Reads a small (metadata) blob and verifies its size and digest.
     pub fn read_metadata_blob(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
         let path = self.blob_path(&descriptor.digest)?;
@@ -346,15 +353,22 @@ impl Layout {
 
 /// Checks in-memory bytes against the size and digest recorded in a descriptor.
 pub fn verify(descriptor: &Descriptor, bytes: &[u8]) -> Result<()> {
-    if descriptor.size != 0 && descriptor.size != bytes.len() as u64 {
+    verify_digest(descriptor, bytes.len() as u64, &Sha256::digest(bytes))
+}
+
+/// The same check for a caller that has hashed the bytes already, which is how
+/// the pipeline hashes a blob alongside the work it accompanies rather than in
+/// a pass of its own.
+pub fn verify_digest(descriptor: &Descriptor, size: u64, digest: &[u8]) -> Result<()> {
+    if descriptor.size != 0 && descriptor.size != size {
         return Err(Error::SizeMismatch {
             digest: descriptor.digest.clone(),
             expected: descriptor.size,
-            actual: bytes.len() as u64,
+            actual: size,
         });
     }
     let parsed = parse_digest(&descriptor.digest)?;
-    let actual = hex_encode(&Sha256::digest(bytes));
+    let actual = hex_encode(digest);
     if actual != parsed.hex {
         return Err(Error::DigestMismatch {
             digest: descriptor.digest.clone(),

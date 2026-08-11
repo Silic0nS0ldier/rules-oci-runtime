@@ -86,6 +86,43 @@ impl Drop for Mapping {
     }
 }
 
+/// A whole file as bytes, mapped where the kernel allows it and read into
+/// memory where it does not.
+///
+/// Random access over a blob is what the span route and the index builder both
+/// need, and neither can do anything with a mapping that was refused, so the
+/// fallback belongs with the mapping rather than at each of them.
+pub struct Blob {
+    mapped: Option<Mapping>,
+    read: Vec<u8>,
+}
+
+impl Blob {
+    pub fn of(mut file: &File) -> std::io::Result<Self> {
+        let len = file.metadata().map_or(0, |metadata| metadata.len()) as usize;
+        if let Some(mapped) = Mapping::of(file, len) {
+            return Ok(Blob {
+                mapped: Some(mapped),
+                read: Vec::new(),
+            });
+        }
+        let mut read = Vec::with_capacity(len);
+        file.read_to_end(&mut read)?;
+        Ok(Blob { mapped: None, read })
+    }
+}
+
+impl std::ops::Deref for Blob {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &self.mapped {
+            Some(mapped) => mapped,
+            None => &self.read,
+        }
+    }
+}
+
 pub fn euid() -> u32 {
     // SAFETY: geteuid is always successful and has no preconditions.
     unsafe { libc::geteuid() }

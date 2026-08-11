@@ -14,7 +14,8 @@ use std::thread;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::image::{Descriptor, hex_encode, parse_digest};
+use crate::image::{Descriptor, verify_digest};
+use crate::sys::Blob;
 use crate::zinfo;
 
 /// Size of each buffer handed from the decompressor to the writer.
@@ -147,21 +148,7 @@ pub(super) fn inflate_blob(
     // decoder, and with it the receiving end, has to go before this joins.
     drop(decoder);
     let state = hashing.join().unwrap_or_default();
-    if descriptor.size != 0 && descriptor.size != state.bytes {
-        return Err(Error::SizeMismatch {
-            digest: descriptor.digest.clone(),
-            expected: descriptor.size,
-            actual: state.bytes,
-        });
-    }
-    let actual = hex_encode(&state.hasher.finalize());
-    if actual != parse_digest(&descriptor.digest)?.hex {
-        return Err(Error::DigestMismatch {
-            digest: descriptor.digest.clone(),
-            actual,
-        });
-    }
-    Ok(())
+    verify_digest(descriptor, state.bytes, &state.hasher.finalize())
 }
 
 /// Runs on the decompression thread when the layer has a checkpoint index:
@@ -170,29 +157,22 @@ pub(super) fn inflate_blob(
 /// blob is mapped; hashing it for the digest check then happens over the same
 /// pages on a thread of its own, instead of alongside a read.
 pub(super) fn inflate_indexed(
-    mut file: fs::File,
+    file: fs::File,
     index: &zinfo::Index,
     descriptor: &Descriptor,
     sender: SyncSender<io::Result<Chunk>>,
 ) -> Result<()> {
-    let len = file.metadata().map_or(0, |m| m.len()) as usize;
-    let mapped = crate::sys::Mapping::of(&file, len);
-    // Nothing to map, or the kernel would not: the spans still need the whole
-    // blob, so fall back to a copy of it.
-    let mut read = Vec::new();
-    if mapped.is_none()
-        && let Err(err) = file.read_to_end(&mut read)
-    {
-        let _ = sender.send(Err(io::Error::other(err.to_string())));
-        return Err(Error::io(
-            format!("reading layer {}", descriptor.digest),
-            err,
-        ));
-    }
-    let blob: &[u8] = match &mapped {
-        Some(mapping) => mapping,
-        None => &read,
+    let blob = match Blob::of(&file) {
+        Ok(blob) => blob,
+        Err(err) => {
+            let _ = sender.send(Err(io::Error::other(err.to_string())));
+            return Err(Error::io(
+                format!("reading layer {}", descriptor.digest),
+                err,
+            ));
+        }
     };
+    let blob: &[u8] = &blob;
 
     let spans = index.checkpoints.len();
     let workers = thread::available_parallelism()
@@ -259,20 +239,7 @@ pub(super) fn inflate_indexed(
 
     // The digest verdict comes first: a blob that fails it explains any span
     // error, since the index describes the blob the descriptor names.
-    if descriptor.size != 0 && descriptor.size != blob.len() as u64 {
-        return Err(Error::SizeMismatch {
-            digest: descriptor.digest.clone(),
-            expected: descriptor.size,
-            actual: blob.len() as u64,
-        });
-    }
-    let actual = hex_encode(&digest);
-    if actual != parse_digest(&descriptor.digest)?.hex {
-        return Err(Error::DigestMismatch {
-            digest: descriptor.digest.clone(),
-            actual,
-        });
-    }
+    verify_digest(descriptor, blob.len() as u64, &digest)?;
     match span_error {
         Some(err) => Err(err),
         None => Ok(()),
