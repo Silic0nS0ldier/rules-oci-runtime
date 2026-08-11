@@ -19,7 +19,6 @@ use crate::image::{Descriptor, Layout, hex_encode, parse_digest};
 use crate::zinfo;
 
 use super::RootfsExtractor;
-use super::entry::is_supported;
 use super::pipeline::{
     CHUNK_BYTES, Chunk, ChunkReader, PIPELINE_DEPTH, buffer_pool, compression_of, read_and_hash,
 };
@@ -46,17 +45,6 @@ fn known_layer_media_types_map_to_compression() {
         Some(Compression::Gzip)
     );
     assert_eq!(compression_of("application/vnd.oci.image.config.v1+json"), None);
-}
-
-#[test]
-fn device_entries_are_not_extracted() {
-    assert!(!is_supported(EntryType::Char));
-    assert!(!is_supported(EntryType::Block));
-    assert!(!is_supported(EntryType::Fifo));
-    assert!(is_supported(EntryType::Regular));
-    assert!(is_supported(EntryType::Symlink));
-    assert!(is_supported(EntryType::Link));
-    assert!(is_supported(EntryType::Directory));
 }
 
 #[test]

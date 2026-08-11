@@ -95,7 +95,7 @@ pub(super) fn unpack_regular<R: Read>(
 
     // `mode` is what the file was created with, but the umask applies to
     // creation and not to this, so it is still needed to get the mode asked for.
-    finish_file(&file, mode, entry.header().mtime().ok())?;
+    finish_file(&file, mode, crate::entries::mtime_of(entry.header()))?;
     Ok(replaced)
 }
 
@@ -103,11 +103,9 @@ pub(super) fn unpack_regular<R: Read>(
 ///
 /// The mode is applied again because the umask applies to creation but not to
 /// this, and it is the only way to end up with what the layer asked for.
-pub(super) fn finish_file(file: &fs::File, mode: u32, mtime: Option<u64>) -> io::Result<()> {
+pub(super) fn finish_file(file: &fs::File, mode: u32, mtime: u64) -> io::Result<()> {
     file.set_permissions(fs::Permissions::from_mode(mode))?;
-    if let Some(mtime) = mtime {
-        set_mtime(file, mtime);
-    }
+    set_mtime(file, mtime);
     Ok(())
 }
 
@@ -157,11 +155,9 @@ fn set_symlink_mtime(path: &Path, mtime: u64) {
 /// Links `dst` to wherever the entry pointed, and gives it the timestamp the
 /// entry carried. A symlink target is followed from where the link stands, so
 /// it is written exactly as the layer spelled it.
-pub(super) fn place_symlink(dst: &Path, target: &[u8], mtime: Option<u64>) -> io::Result<()> {
+pub(super) fn place_symlink(dst: &Path, target: &[u8], mtime: u64) -> io::Result<()> {
     std::os::unix::fs::symlink(Path::new(std::ffi::OsStr::from_bytes(target)), dst)?;
-    if let Some(mtime) = mtime {
-        set_symlink_mtime(dst, mtime);
-    }
+    set_symlink_mtime(dst, mtime);
     Ok(())
 }
 

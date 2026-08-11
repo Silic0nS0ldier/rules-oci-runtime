@@ -40,6 +40,32 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// What the extractor will do with the entry a header describes.
+    ///
+    /// Classified by that rather than by the type alone: a continuous file is
+    /// a plain file, while a sparse one ends up as a file but is not stored as
+    /// one. The walk and the table have to agree here, or the plan reasons
+    /// about an entry the walk then treats as something else.
+    pub fn of(header: &tar::Header) -> Self {
+        let entry_type = header.entry_type();
+        if entry_type.is_dir() {
+            Kind::Directory
+        } else if entry_type.is_symlink() {
+            Kind::Symlink
+        } else if entry_type.is_hard_link() {
+            Kind::HardLink
+        } else if entry_type == tar::EntryType::GNUSparse {
+            Kind::Sparse
+        } else if matches!(
+            entry_type,
+            tar::EntryType::Regular | tar::EntryType::Continuous
+        ) {
+            Kind::File
+        } else {
+            Kind::Unsupported
+        }
+    }
+
     fn code(self) -> u8 {
         match self {
             Kind::File => 0,
@@ -102,33 +128,13 @@ impl Table {
             let mut entry = entry.io_context(|| context.to_string())?;
             let xattrs = xattr_names(&mut entry).io_context(|| context.to_string())?;
             let header = entry.header();
-            let entry_type = header.entry_type();
-            // Classified by what the extractor does with it, not by the type
-            // alone: a continuous file is a plain file, while a sparse one
-            // ends up as a file but is not stored as one.
-            let kind = if entry_type.is_dir() {
-                Kind::Directory
-            } else if entry_type.is_symlink() {
-                Kind::Symlink
-            } else if entry_type.is_hard_link() {
-                Kind::HardLink
-            } else if entry_type == tar::EntryType::GNUSparse {
-                Kind::Sparse
-            } else if matches!(
-                entry_type,
-                tar::EntryType::Regular | tar::EntryType::Continuous
-            ) {
-                Kind::File
-            } else {
-                Kind::Unsupported
-            };
             if entries.len() as u32 == MAX_ENTRIES {
                 return Err(Error::io(context, io::Error::other("too many entries")));
             }
             entries.push(Entry {
-                kind,
-                mode: header.mode().unwrap_or(0o755) & 0o7777,
-                mtime: header.mtime().unwrap_or(0),
+                kind: Kind::of(header),
+                mode: mode_of(header),
+                mtime: mtime_of(header),
                 offset: entry.raw_file_position(),
                 size: entry.size(),
                 path: without_trailing_slash(entry.path_bytes().into_owned()),
@@ -233,6 +239,18 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// The mode an entry asks for, without the bits above the permission bits and
+/// with what `create_dir` would have used when the header does not say.
+pub fn mode_of(header: &tar::Header) -> u32 {
+    header.mode().unwrap_or(0o755) & 0o7777
+}
+
+/// The timestamp an entry asks for. A header that will not give one leaves the
+/// epoch, which is at least the same answer whichever route reads it.
+pub fn mtime_of(header: &tar::Header) -> u64 {
+    header.mtime().unwrap_or(0)
+}
+
 /// The names of the entry's extended attributes, NUL separated.
 ///
 /// Only the names: the values can be large, nothing restores them, and the
@@ -322,6 +340,35 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walk places entries and the table records them, and both ask this.
+    /// A type either route classified for itself is one they could answer
+    /// differently.
+    #[test]
+    fn entries_are_classified_by_what_the_extractor_does_with_them() {
+        let kind_of = |entry_type| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(entry_type);
+            Kind::of(&header)
+        };
+        assert_eq!(kind_of(tar::EntryType::Regular), Kind::File);
+        assert_eq!(kind_of(tar::EntryType::Continuous), Kind::File);
+        assert_eq!(kind_of(tar::EntryType::Directory), Kind::Directory);
+        assert_eq!(kind_of(tar::EntryType::Symlink), Kind::Symlink);
+        assert_eq!(kind_of(tar::EntryType::Link), Kind::HardLink);
+        assert_eq!(kind_of(tar::EntryType::GNUSparse), Kind::Sparse);
+        // Device nodes and fifos need privileges the extractor does not have.
+        assert_eq!(kind_of(tar::EntryType::Char), Kind::Unsupported);
+        assert_eq!(kind_of(tar::EntryType::Block), Kind::Unsupported);
+        assert_eq!(kind_of(tar::EntryType::Fifo), Kind::Unsupported);
+    }
+
+    #[test]
+    fn a_mode_is_taken_without_the_bits_above_the_permission_bits() {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o104755);
+        assert_eq!(mode_of(&header), 0o4755);
+    }
 
     fn sample() -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
