@@ -485,6 +485,21 @@ mod tests {
         assert!(!plan.is_shadowed(&d[1].digest, b"dir/.wh.a"));
     }
 
+    /// An opaque whiteout empties a directory; it does not delete it. The
+    /// directory sorts at the front of its own subtree, so clearing the
+    /// subtree used to take it as well.
+    #[test]
+    fn an_opaque_whiteout_leaves_the_directory_it_empties() {
+        assert_eq!(
+            dirs_of(vec![
+                layer(vec![dir("dir"), dir("dir/sub")]),
+                layer(vec![dir("dir"), file("dir/.wh..wh..opq")]),
+            ]),
+            ["dir"],
+            "the directory stays and only what was under it goes"
+        );
+    }
+
     #[test]
     fn an_opaque_whiteout_shadows_the_directory_it_names() {
         let (plan, d) = plan_of(vec![
