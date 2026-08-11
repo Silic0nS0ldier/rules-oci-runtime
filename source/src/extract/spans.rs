@@ -36,8 +36,8 @@ use super::file::{place_body, place_hard_link, place_link};
 use super::plan::{Plan, Work};
 
 /// Everything one layer contributes, held open for the length of the run.
-struct Layer {
-    descriptor: Descriptor,
+struct Layer<'a> {
+    descriptor: &'a Descriptor,
     blob: Blob,
     index: zinfo::Index,
 }
@@ -132,17 +132,17 @@ pub fn extract(
     Ok(())
 }
 
-fn open_layers(
+fn open_layers<'a>(
     layout: &Layout,
-    descriptors: &[Descriptor],
+    descriptors: &'a [Descriptor],
     indexes: Vec<zinfo::Index>,
-) -> Result<Vec<Layer>> {
+) -> Result<Vec<Layer<'a>>> {
     descriptors
         .iter()
         .zip(indexes)
         .map(|(descriptor, index)| {
             Ok(Layer {
-                descriptor: descriptor.clone(),
+                descriptor,
                 blob: layout.map_blob(descriptor)?,
                 index,
             })
