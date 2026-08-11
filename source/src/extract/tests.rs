@@ -1294,3 +1294,39 @@ fn a_whiteout_does_not_hide_its_own_layer() {
         },
     );
 }
+
+/// "A `.wh.` file, without a basename to delete, is invalid and
+/// implementations SHOULD return an error when encountering such an entry."
+/// Taking the empty name at face value pointed it at the directory the marker
+/// sits in, which was then removed.
+#[test]
+fn a_whiteout_naming_nothing_is_refused() {
+    // The span route is not among them: the plan refuses to place the entry,
+    // which drops the image to the walk, and the walk is what reports it.
+    for route in [Route::Streaming, Route::Planned] {
+        let root = scratch(&format!("bare-wh-{route:?}"));
+        let err = extract_by(
+            route,
+            &root,
+            &[
+                tar_of(|b| {
+                    append_dir(b, "d/");
+                    append_file(b, "d/keep", b"keep");
+                }),
+                tar_of(|b| append_file(b, "d/.wh.", b"")),
+            ],
+        )
+        .expect_err("a whiteout naming nothing must be refused");
+
+        assert!(
+            matches!(err, Error::InvalidWhiteout { .. }),
+            "{route:?}: expected an invalid whiteout, got {err:?}"
+        );
+        assert!(
+            root.join("rootfs/d/keep").exists(),
+            "{route:?}: the directory the marker sits in is not the target"
+        );
+
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}

@@ -200,6 +200,11 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
     };
     for (path, node) in tree {
         let (layer, entry) = node.owner;
+        // A `.wh.` naming nothing is invalid and the walk rejects it, so the
+        // plan must not quietly place it as an ordinary file instead.
+        if basename(path) == WHITEOUT_PREFIX {
+            return None;
+        }
         match node.kind {
             Kind::Directory | Kind::Unsupported => continue,
             Kind::Sparse => return None,
@@ -319,8 +324,7 @@ fn directories(tree: &BTreeMap<&[u8], Node>) -> Vec<(Vec<u8>, u32)> {
 }
 
 /// Every strict ancestor of `path`, shallowest first.
-fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
-    path.iter()
+fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {    path.iter()
         .enumerate()
         .filter(|(_, byte)| **byte == b'/')
         .map(move |(at, _)| &path[..at])
@@ -344,6 +348,13 @@ enum Whiteout {
     Opaque(Vec<u8>),
     /// `.wh.name`: hides the one path it names.
     Named(Vec<u8>),
+}
+
+fn basename(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&byte| byte == b'/') {
+        Some(at) => &path[at + 1..],
+        None => path,
+    }
 }
 
 fn whiteout(path: &[u8]) -> Option<Whiteout> {
@@ -554,6 +565,14 @@ mod tests {
             !plan.is_shadowed(&d[0].digest, b"target"),
             "the copy the link was made against has to be placed"
         );
+    }
+
+    /// The walk refuses a `.wh.` that names nothing, so the plan must not
+    /// place it as an ordinary file and reach a different answer.
+    #[test]
+    fn a_whiteout_naming_nothing_is_not_placeable() {
+        let (plan, _) = plan_of(vec![layer(vec![dir("d"), file("d/.wh.")])]);
+        assert!(plan.work().is_none());
     }
 
     #[test]

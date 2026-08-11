@@ -45,6 +45,11 @@ pub enum Error {
         layer: String,
         path: String,
     },
+    /// A whiteout entry with no basename after the `.wh.` prefix.
+    InvalidWhiteout {
+        layer: String,
+        path: String,
+    },
     /// The container had no command: the image sets neither `Entrypoint` nor `Cmd`.
     NoCommand,
     /// A launcher symlink could not find the runfiles tree holding its image.
@@ -114,6 +119,10 @@ impl fmt::Display for Error {
             Error::UnsafeEntry { layer, path } => write!(
                 f,
                 "layer {layer} contains entry {path:?} that escapes the root filesystem"
+            ),
+            Error::InvalidWhiteout { layer, path } => write!(
+                f,
+                "layer {layer} contains whiteout entry {path:?} that names nothing to remove"
             ),
             Error::NoCommand => write!(
                 f,
