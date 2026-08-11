@@ -140,40 +140,47 @@ impl RootfsExtractor {
     /// layer at a time, which is what has to happen when the plan cannot say
     /// where an entry ends up without building the tree to find out.
     pub fn apply(&mut self, layout: &Layout, descriptors: &[Descriptor]) -> Result<()> {
-        if self.plan.work().is_some() {
-            // Every layer needs a checkpoint index, since a span is where a
-            // worker starts inflating. One checkpoint is enough: it means the
-            // layer is one span.
-            let indexes: Option<Vec<zinfo::Index>> = self
+        if self.plan.work().is_some()
+            && let Some(indexes) = self.indexes_for(descriptors)
+        {
+            self.create_planned_directories()?;
+            let work = self.plan.work().expect("the work this route needs");
+            return spans::extract(&self.rootfs, layout, descriptors, &self.plan, work, indexes);
+        }
+        // One at a time: the walk is done with a layer before it starts the
+        // next, and a whole image's checkpoint windows are tens of megabytes.
+        for descriptor in descriptors {
+            let index = self
                 .index_dir
                 .as_deref()
-                .map(|dir| descriptors.iter().map(|d| index_at(dir, d)).collect())
-                .unwrap_or_default();
-            if let Some(indexes) = indexes {
-                self.create_planned_directories()?;
-                let work = self.plan.work().expect("the work this route needs");
-                return spans::extract(
-                    &self.rootfs,
-                    layout,
-                    descriptors,
-                    &self.plan,
-                    work,
-                    indexes,
-                );
-            }
-        }
-        for descriptor in descriptors {
-            self.apply_layer(layout, descriptor)?;
+                .and_then(|dir| index_at(dir, descriptor));
+            self.apply_layer(layout, descriptor, index)?;
         }
         Ok(())
+    }
+
+    /// A checkpoint index for every layer, or `None` when any layer lacks one.
+    /// A span is where a worker starts inflating, so the route that places
+    /// entries from the plan cannot run without them all. One checkpoint is
+    /// enough: it means the layer is one span.
+    fn indexes_for(&self, descriptors: &[Descriptor]) -> Option<Vec<zinfo::Index>> {
+        let dir = self.index_dir.as_deref()?;
+        descriptors.iter().map(|d| index_at(dir, d)).collect()
     }
 
     /// Decompression is CPU bound and writing the rootfs is IO bound, so a
     /// second thread inflates the blob while this one writes the entries. The
     /// two overlap rather than run back to back, which on a large layer is
     /// worth roughly the whole decompression time.
-    pub fn apply_layer(&mut self, layout: &Layout, descriptor: &Descriptor) -> Result<()> {
-        let index = self.layer_index(descriptor);
+    pub fn apply_layer(
+        &mut self,
+        layout: &Layout,
+        descriptor: &Descriptor,
+        index: Option<zinfo::Index>,
+    ) -> Result<()> {
+        // One checkpoint is the whole blob, so there is nothing for this route
+        // to resume from: it inflates from the start either way.
+        let index = index.filter(|index| index.checkpoints.len() > 1);
         match &index {
             Some(index) => log!(
                 "Extracting layer {} ({}) using {} checkpoints",
@@ -220,13 +227,6 @@ impl RootfsExtractor {
                 io::Error::other("the decompression thread panicked"),
             )),
         }
-    }
-
-    /// The checkpoint index for this layer, when there is one and the
-    /// streaming pipeline can put it to use. One checkpoint is the whole blob,
-    /// which buys that path nothing.
-    fn layer_index(&self, descriptor: &Descriptor) -> Option<zinfo::Index> {
-        index_at(self.index_dir.as_deref()?, descriptor).filter(|index| index.checkpoints.len() > 1)
     }
 
     /// Applies the recorded directory permissions, deepest first.

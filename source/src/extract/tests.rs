@@ -197,7 +197,7 @@ fn extract_indexed(
     let layout = Layout::open(root)?;
     let rootfs = root.join("rootfs");
     let mut extractor = RootfsExtractor::new(&rootfs, index_dir, false)?;
-    extractor.apply_layer(&layout, descriptor)?;
+    extractor.apply(&layout, std::slice::from_ref(descriptor))?;
     extractor.finish()?;
     Ok(rootfs)
 }
@@ -786,8 +786,10 @@ fn extract_planned(root: &Utf8Path, layers: &[Vec<u8>]) -> Result<Utf8PathBuf> {
     let rootfs = root.join("rootfs");
     let mut extractor = RootfsExtractor::new(&rootfs, Some(&index_dir), false)?;
     extractor.plan(&descriptors)?;
+    // No checkpoint index goes with these, which is what keeps the walk
+    // walking even though the plan resolved.
     for descriptor in &descriptors {
-        extractor.apply_layer(&layout, descriptor)?;
+        extractor.apply_layer(&layout, descriptor, None)?;
     }
     extractor.finish()?;
     Ok(rootfs)
