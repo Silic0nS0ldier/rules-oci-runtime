@@ -20,8 +20,6 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -37,7 +35,7 @@ use crate::log::log;
 use crate::sys::Mapping;
 use crate::zinfo;
 
-use super::file::{finish_file, set_symlink_mtime};
+use super::file::{Occupied, create_file, finish_file, place_symlink};
 use super::plan::{Plan, Work};
 
 /// Everything one layer contributes, held open for the length of the run.
@@ -105,7 +103,7 @@ pub fn extract(
     // have refused the image, but a link under another link needs it standing.
     for &(layer, entry) in &work.symlinks {
         let entry = &plan.table(layer as usize).entries[entry as usize];
-        place_symlink(root, entry)?;
+        place_link(root, entry)?;
     }
 
     let units = plan_units(&layers, work, plan);
@@ -345,26 +343,18 @@ fn run_span(
 fn write_file(root: &Path, path: &mut PathBuf, entry: &Entry, body: &[u8]) -> Result<()> {
     resolve(root, path, entry);
     let context = || format!("extracting {:?}", String::from_utf8_lossy(&entry.path));
-    // Exclusive, so this neither follows a symlink standing here nor writes
-    // over something the plan did not account for.
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(entry.mode)
-        .open(&path)
-        .io_context(context)?;
+    // The plan says this path is placed once, so anything already standing
+    // here means the plan and the tree have parted company.
+    let (mut file, _) = create_file(path, entry.mode, Occupied::Refuse).io_context(context)?;
     file.write_all(body).io_context(context)?;
     finish_file(&file, entry.mode, Some(entry.mtime)).io_context(context)
 }
 
-fn place_symlink(root: &Path, entry: &Entry) -> Result<()> {
+fn place_link(root: &Path, entry: &Entry) -> Result<()> {
     let mut path = PathBuf::new();
     resolve(root, &mut path, entry);
-    let target = Path::new(std::ffi::OsStr::from_bytes(&entry.link));
-    std::os::unix::fs::symlink(target, &path)
-        .io_context(|| format!("linking {:?}", String::from_utf8_lossy(&entry.path)))?;
-    set_symlink_mtime(&path, entry.mtime);
-    Ok(())
+    place_symlink(&path, &entry.link, Some(entry.mtime))
+        .io_context(|| format!("linking {:?}", String::from_utf8_lossy(&entry.path)))
 }
 
 fn place_hard_link(root: &Path, entry: &Entry) -> Result<()> {

@@ -1,8 +1,10 @@
 //! Placing a single filesystem object, once its path has been checked.
 //!
-//! These replace the parts of `tar`'s own `unpack_in` the extractor needs.
-//! Every path reaching them has already been resolved and had its parent
-//! created, so none of them re-derives that.
+//! These replace the parts of `tar`'s own `unpack_in` the extractor needs, and
+//! are what both routes place through: the walk hands them entries out of a
+//! tar stream, the span route entries out of a table. Every path reaching them
+//! has already been resolved and had its parent created, so none of them
+//! re-derives that.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -13,6 +15,48 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::fsutil;
+
+/// What to do about something already standing where an entry goes.
+#[derive(Clone, Copy)]
+pub(super) enum Occupied {
+    /// Replace it. The walk builds the tree a layer at a time, and a later
+    /// layer takes a path from an earlier one.
+    Replace,
+    /// Refuse it. The plan resolved the whole image and says each path is
+    /// placed once, so anything already there means the plan and the tree
+    /// disagree.
+    Refuse,
+}
+
+/// Creates a file with the mode its entry asked for, reporting whether
+/// something had to be removed to make room for it.
+///
+/// Creating with the final mode avoids a window in which the file is more
+/// permissive than the layer asked for. Permissions are checked when the file
+/// is opened, so a read-only mode does not stop the writes that follow.
+///
+/// The first attempt is exclusive, which costs nothing when the path is free,
+/// as it is for every file in the first and largest layer. It also refuses to
+/// follow a symlink already sitting there, so the path only has to be cleared
+/// on the rare occasion a later layer replaces something, rather than being
+/// stat'd and unlinked for every file in the image.
+pub(super) fn create_file(
+    dst: &Path,
+    mode: u32,
+    occupied: Occupied,
+) -> io::Result<(fs::File, bool)> {
+    match open_exclusive(dst, mode) {
+        Ok(file) => Ok((file, false)),
+        Err(err)
+            if err.kind() == io::ErrorKind::AlreadyExists
+                && matches!(occupied, Occupied::Replace) =>
+        {
+            fsutil::remove_any(dst).map_err(io::Error::other)?;
+            Ok((open_exclusive(dst, mode)?, true))
+        }
+        Err(err) => Err(err),
+    }
+}
 
 /// Writes a regular file, replacing `tar`'s own unpacking so that the copy can
 /// use a buffer sized for the pipeline rather than std's default. This only
@@ -26,25 +70,7 @@ pub(super) fn unpack_regular<R: Read>(
     mode: u32,
     buffer: &mut [u8],
 ) -> io::Result<bool> {
-    // Creating with the final mode avoids a window in which the file is more
-    // permissive than the layer asked for. Permissions are checked when the
-    // file is opened, so a read-only mode does not stop the writes below.
-    //
-    // The first attempt is exclusive, which costs nothing when the path is
-    // free, as it is for every file in the first and largest layer. It also
-    // refuses to follow a symlink already sitting there, so the path only has
-    // to be cleared on the rare occasion a later layer replaces something,
-    // rather than being stat'd and unlinked for every file in the image.
-    let mut replaced = false;
-    let mut file = match open_exclusive(dst, mode) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            fsutil::remove_any(dst).map_err(io::Error::other)?;
-            replaced = true;
-            open_exclusive(dst, mode)?
-        }
-        Err(err) => return Err(err),
-    };
+    let (mut file, replaced) = create_file(dst, mode, Occupied::Replace)?;
 
     let mut filled = 0;
     loop {
@@ -107,7 +133,7 @@ fn set_mtime(file: &fs::File, mtime: u64) {
 
 /// The same for a symlink, which has no descriptor to hang the call on and
 /// must not be followed to the file it names.
-pub(super) fn set_symlink_mtime(path: &Path, mtime: u64) {
+fn set_symlink_mtime(path: &Path, mtime: u64) {
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return;
     };
@@ -126,6 +152,28 @@ pub(super) fn set_symlink_mtime(path: &Path, mtime: u64) {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
+}
+
+/// Links `dst` to wherever the entry pointed, and gives it the timestamp the
+/// entry carried. A symlink target is followed from where the link stands, so
+/// it is written exactly as the layer spelled it.
+pub(super) fn place_symlink(dst: &Path, target: &[u8], mtime: Option<u64>) -> io::Result<()> {
+    std::os::unix::fs::symlink(Path::new(std::ffi::OsStr::from_bytes(target)), dst)?;
+    if let Some(mtime) = mtime {
+        set_symlink_mtime(dst, mtime);
+    }
+    Ok(())
+}
+
+/// Creates a directory, treating one that is already there as done: the walk
+/// meets a directory every layer names, and the plan creates the tree before
+/// any layer runs.
+pub(super) fn create_directory(dst: &Path) -> Result<()> {
+    match fs::create_dir(dst) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(Error::io(format!("creating {}", dst.display()), err)),
+    }
 }
 
 /// Keeps existing directories (including symlinks to directories) intact so

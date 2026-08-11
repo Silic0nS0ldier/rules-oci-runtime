@@ -12,7 +12,7 @@ use crate::fsutil;
 use crate::log::{log, warning};
 
 use super::RootfsExtractor;
-use super::file::{prepare_directory, set_symlink_mtime, unpack_regular};
+use super::file::{create_directory, place_symlink, prepare_directory, unpack_regular};
 use super::pipeline::CHUNK_BYTES;
 use super::whiteout::{self, Whiteout};
 
@@ -168,15 +168,9 @@ impl RootfsExtractor {
                     self.parents.forget(&dst);
                 }
                 self.deferred_modes.push((dst.clone(), mode));
-                match fs::create_dir(&dst) {
-                    Ok(()) => {}
-                    // `prepare_directory` cleared anything that was not a
-                    // directory, so what is left is one to keep.
-                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(err) => {
-                        return Err(Error::io(format!("creating {}", dst.display()), err));
-                    }
-                }
+                // `prepare_directory` cleared anything that was not a
+                // directory, so what is left is one to keep.
+                create_directory(&dst)?;
                 continue;
             }
 
@@ -194,12 +188,10 @@ impl RootfsExtractor {
             match entry_type {
                 EntryType::Symlink => {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
-                    std::os::unix::fs::symlink(&target, &dst).io_context(|| {
+                    let mtime = entry.header().mtime().ok();
+                    place_symlink(&dst, target.as_os_str().as_bytes(), mtime).io_context(|| {
                         format!("extracting {:?} from layer {layer}", path.display())
                     })?;
-                    if let Ok(mtime) = entry.header().mtime() {
-                        set_symlink_mtime(&dst, mtime);
-                    }
                 }
                 EntryType::Link => {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
