@@ -36,6 +36,22 @@ pub fn resolve_under(root: &Path, path: &Path, dst: &mut PathBuf) -> bool {
     components > 0
 }
 
+/// True when `path` names the rootfs itself rather than anything under it,
+/// which is what `tar -C dir .` writes as the first entry of a layer.
+///
+/// `..` is not this, however many `.` are around it: that names somewhere the
+/// layer has no business reaching.
+pub fn names_the_root(path: &Path) -> bool {
+    let mut components = path.components().peekable();
+    components.peek().is_some()
+        && components.all(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::CurDir
+            )
+        })
+}
+
 /// Removes a tree even when directories were extracted without write permission.
 pub fn force_remove_dir_all(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
@@ -332,6 +348,25 @@ mod tests {
         assert_eq!(dst, PathBuf::from("/tmp/rootfs/usr/bin/env"));
         assert!(resolve_under(root, Path::new("etc"), &mut dst));
         assert_eq!(dst, PathBuf::from("/tmp/rootfs/etc"));
+    }
+
+    /// `tar -C dir .` writes the archive root into the layer, and the spec's
+    /// worked example lists it first. It is not an escape.
+    #[test]
+    fn the_archive_root_names_the_rootfs() {
+        assert!(names_the_root(Path::new(".")));
+        assert!(names_the_root(Path::new("./")));
+        assert!(names_the_root(Path::new("/")));
+        assert!(names_the_root(Path::new("./.")));
+    }
+
+    #[test]
+    fn nothing_that_climbs_out_names_the_rootfs() {
+        assert!(!names_the_root(Path::new("..")));
+        assert!(!names_the_root(Path::new("./..")));
+        assert!(!names_the_root(Path::new("../..")));
+        assert!(!names_the_root(Path::new("./etc")));
+        assert!(!names_the_root(Path::new("")), "an empty path names nothing");
     }
 
     #[test]
