@@ -116,13 +116,7 @@ impl RootfsExtractor {
         let mut path = PathBuf::new();
         for (relative, mode) in self.plan.directories() {
             fsutil::join_under(root.as_std_path(), relative, &mut path);
-            match fs::create_dir(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(err) => {
-                    return Err(Error::io(format!("creating {}", path.display()), err));
-                }
-            }
+            file::create_directory(&path)?;
             self.deferred_modes.push((path.clone(), *mode));
         }
         log!("Created {} directories", self.plan.directories().len());
