@@ -226,10 +226,6 @@ impl RootfsExtractor {
 }
 
 /// Reads the checkpoint index recorded for a layer, if there is a usable one.
-///
-/// An index is an optimisation, so anything wrong with it means falling back
-/// rather than failing: whichever path ends up reading the layer decides what
-/// it actually contains.
 fn index_at(dir: &Utf8Path, descriptor: &Descriptor) -> Option<zinfo::Index> {
     if compression_of(&descriptor.media_type) != Some(Compression::Gzip) {
         return None;
@@ -238,20 +234,6 @@ fn index_at(dir: &Utf8Path, descriptor: &Descriptor) -> Option<zinfo::Index> {
         return None;
     }
     let hex = parse_digest(&descriptor.digest).ok()?.hex;
-    let path = dir.join(format!("{hex}.zinfo"));
-    let file = match fs::File::open(&path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            warning!("ignoring layer index {path}: {err}");
-            return None;
-        }
-    };
-    match zinfo::Index::read_from(io::BufReader::new(file)) {
-        Ok(index) => Some(index),
-        Err(err) => {
-            warning!("ignoring layer index {path}: {err}");
-            None
-        }
-    }
+    let path = crate::sidecar::checkpoints_at(dir, &hex);
+    crate::sidecar::read(&path, zinfo::Index::read_from)
 }

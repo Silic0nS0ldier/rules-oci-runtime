@@ -8,6 +8,7 @@ mod image;
 mod launcher;
 mod log;
 mod runtime;
+mod sidecar;
 mod spec;
 mod sys;
 mod zinfo;
@@ -218,8 +219,8 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
             let blob = layout.blob_path(&layer.digest)?;
             work.push((
                 blob,
-                output.join(format!("{hex}.zinfo")),
-                output.join(format!("{hex}.entries")),
+                sidecar::checkpoints_at(output, &hex),
+                sidecar::entries_at(output, &hex),
             ));
         }
     }
