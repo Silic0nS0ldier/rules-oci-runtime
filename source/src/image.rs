@@ -54,7 +54,8 @@ impl Platform {
     /// Descriptor platforms are matched loosely: a missing field means "any".
     pub fn matches(&self, candidate: &Platform) -> bool {
         let os_ok = candidate.os.is_empty() || candidate.os == self.os;
-        let arch_ok = candidate.architecture.is_empty() || candidate.architecture == self.architecture;
+        let arch_ok =
+            candidate.architecture.is_empty() || candidate.architecture == self.architecture;
         let ours = default_variant_removed(&self.architecture, self.variant.as_deref());
         let theirs = default_variant_removed(&candidate.architecture, candidate.variant.as_deref());
         let variant_ok = match theirs {
@@ -577,7 +578,10 @@ mod tests {
         )
         .expect("image config");
         assert_eq!(blob.config.env.as_deref(), Some(&["A=1".to_string()][..]));
-        assert_eq!(blob.config.cmd.as_deref(), Some(&["/bin/sh".to_string()][..]));
+        assert_eq!(
+            blob.config.cmd.as_deref(),
+            Some(&["/bin/sh".to_string()][..])
+        );
         assert_eq!(blob.config.working_dir.as_deref(), Some("/w"));
         assert!(blob.config.entrypoint.is_none());
     }

@@ -67,7 +67,11 @@ pub struct RunArgs {
     pub env: Vec<String>,
 
     /// Bind mounts. `$VAR` and `${VAR}` are expanded in the source path.
-    #[arg(long = "mount", short = 'v', value_name = "SOURCE:DESTINATION[:OPTIONS]")]
+    #[arg(
+        long = "mount",
+        short = 'v',
+        value_name = "SOURCE:DESTINATION[:OPTIONS]"
+    )]
     pub mounts: Vec<String>,
 
     /// Working directory inside the container, overriding the image.
@@ -108,7 +112,11 @@ pub struct RunArgs {
     pub verbose: bool,
 
     /// Command to run, replacing the image `Cmd`.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
     pub command: Vec<String>,
 }
 
@@ -217,7 +225,9 @@ mod tests {
 
     #[test]
     fn env_and_mounts_accumulate() {
-        let args = parse(&["--env", "A=1", "-e", "B=2", "--mount", "/a:/b", "-v", "/c:/d:ro"]);
+        let args = parse(&[
+            "--env", "A=1", "-e", "B=2", "--mount", "/a:/b", "-v", "/c:/d:ro",
+        ]);
         assert_eq!(args.env, vec!["A=1", "B=2"]);
         assert_eq!(args.mounts, vec!["/a:/b", "/c:/d:ro"]);
     }

@@ -67,12 +67,10 @@ impl ContainerRuntime for Runc {
         })?;
 
         let _forwarder = sys::SignalForwarder::install(child.id() as i32);
-        let status = child
-            .wait()
-            .map_err(|source| Error::RuntimeSpawn {
-                program: self.binary.to_string(),
-                source,
-            })?;
+        let status = child.wait().map_err(|source| Error::RuntimeSpawn {
+            program: self.binary.to_string(),
+            source,
+        })?;
         Ok(sys::exit_code(status))
     }
 
@@ -110,7 +108,10 @@ mod tests {
             state_dir: Utf8Path::new("/tmp/state"),
         };
         let command = runc.command(&request);
-        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args, vec!["--root".to_string(), "/tmp/state".to_string()]);
     }
 

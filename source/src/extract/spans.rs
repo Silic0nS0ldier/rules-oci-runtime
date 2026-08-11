@@ -221,13 +221,7 @@ fn workers(units: usize) -> usize {
         .min(MAX_WORKERS)
 }
 
-fn run(
-    units: &[Unit],
-    layers: &[Layer],
-    work: &Work,
-    plan: &Plan,
-    root: &Path,
-) -> Result<()> {
+fn run(units: &[Unit], layers: &[Layer], work: &Work, plan: &Plan, root: &Path) -> Result<()> {
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     // Reported by position in the queue rather than by whoever failed first,
@@ -308,7 +302,9 @@ fn run_span(
                 std::io::Error::other("an entry runs past the end of the layer"),
             ));
         }
-        filled += layer.index.extract_span_into(&layer.blob, at, buffer, filled)?;
+        filled += layer
+            .index
+            .extract_span_into(&layer.blob, at, buffer, filled)?;
         at += 1;
     }
 

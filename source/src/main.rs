@@ -153,7 +153,12 @@ fn index(args: IndexArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn index_blob(blob: &Utf8Path, checkpoints: &Utf8Path, entries: &Utf8Path, span: u64) -> Result<()> {
+fn index_blob(
+    blob: &Utf8Path,
+    checkpoints: &Utf8Path,
+    entries: &Utf8Path,
+    span: u64,
+) -> Result<()> {
     let file =
         std::fs::File::open(blob).map_err(|source| Error::io(format!("opening {blob}"), source))?;
     let bytes =
@@ -241,7 +246,9 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
             scope.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((blob, checkpoints, entries)) = work.get(i) else { break };
+                    let Some((blob, checkpoints, entries)) = work.get(i) else {
+                        break;
+                    };
                     let result = index_blob(blob, checkpoints, entries, span);
                     *results[i].lock().expect("index result") = Some(result);
                 }
@@ -421,9 +428,8 @@ mod tests {
             let config_descriptor =
                 install_blob(&root, "application/vnd.oci.image.config.v1+json", b"{}");
             assert_ne!(first, second, "the two layers must be distinct blobs");
-            let manifest = format!(
-                r#"{{"config": {config_descriptor}, "layers": [{first}, {second}]}}"#
-            );
+            let manifest =
+                format!(r#"{{"config": {config_descriptor}, "layers": [{first}, {second}]}}"#);
             let manifest_descriptor = install_blob(
                 &root,
                 "application/vnd.oci.image.manifest.v1+json",

@@ -121,7 +121,10 @@ impl fmt::Display for Error {
                 f,
                 "invalid mount {spec:?}, expected SOURCE:DESTINATION[:OPTIONS]"
             ),
-            Error::InvalidEnv(value) => write!(f, "invalid environment entry {value:?}, expected NAME=VALUE"),
+            Error::InvalidEnv(value) => write!(
+                f,
+                "invalid environment entry {value:?}, expected NAME=VALUE"
+            ),
             Error::UnsafeEntry { layer, path } => write!(
                 f,
                 "layer {layer} contains entry {path:?} that escapes the root filesystem"

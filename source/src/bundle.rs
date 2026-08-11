@@ -45,7 +45,8 @@ impl Bundle {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .io_context(|| format!("securing {root}"))?;
         let bundle = Bundle { root, keep };
-        fs::create_dir_all(bundle.rootfs()).io_context(|| format!("creating {}", bundle.rootfs()))?;
+        fs::create_dir_all(bundle.rootfs())
+            .io_context(|| format!("creating {}", bundle.rootfs()))?;
         fs::create_dir_all(bundle.state_dir())
             .io_context(|| format!("creating {}", bundle.state_dir()))?;
         Ok(bundle)
@@ -238,7 +239,10 @@ mod tests {
     fn bundles_are_private_to_the_owner() {
         let parent = scratch("bundle-perms");
         let bundle = Bundle::create(&parent, "abc", false).expect("bundle");
-        let mode = fs::metadata(bundle.dir()).expect("metadata").permissions().mode();
+        let mode = fs::metadata(bundle.dir())
+            .expect("metadata")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o700);
         let _ = fsutil::force_remove_dir_all(parent.as_std_path());
     }

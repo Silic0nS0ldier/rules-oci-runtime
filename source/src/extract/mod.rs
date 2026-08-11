@@ -152,7 +152,14 @@ impl RootfsExtractor {
             if let Some(indexes) = indexes {
                 self.create_planned_directories()?;
                 let work = self.plan.work().expect("the work this route needs");
-                return spans::extract(&self.rootfs, layout, descriptors, &self.plan, work, indexes);
+                return spans::extract(
+                    &self.rootfs,
+                    layout,
+                    descriptors,
+                    &self.plan,
+                    work,
+                    indexes,
+                );
             }
         }
         for descriptor in descriptors {
@@ -174,7 +181,11 @@ impl RootfsExtractor {
                 descriptor.media_type,
                 index.checkpoints.len()
             ),
-            None => log!("Extracting layer {} ({})", descriptor.digest, descriptor.media_type),
+            None => log!(
+                "Extracting layer {} ({})",
+                descriptor.digest,
+                descriptor.media_type
+            ),
         }
 
         let file = layout.open_blob(descriptor)?;
@@ -215,8 +226,7 @@ impl RootfsExtractor {
     /// streaming pipeline can put it to use. One checkpoint is the whole blob,
     /// which buys that path nothing.
     fn layer_index(&self, descriptor: &Descriptor) -> Option<zinfo::Index> {
-        index_at(self.index_dir.as_deref()?, descriptor)
-            .filter(|index| index.checkpoints.len() > 1)
+        index_at(self.index_dir.as_deref()?, descriptor).filter(|index| index.checkpoints.len() > 1)
     }
 
     /// Applies the recorded directory permissions, deepest first.

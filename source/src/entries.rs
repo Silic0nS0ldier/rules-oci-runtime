@@ -274,11 +274,15 @@ pub fn xattr_names(entry: &mut tar::Entry<'_, impl Read>) -> io::Result<Vec<u8>>
     Ok(names)
 }
 
-/// `tar` spells a directory with a trailing slash, which would leave the plan/// holding `d/` for the directory and `d` for the same place as an ancestor of
+/// `tar` spells a directory with a trailing slash, which would leave the plan
+/// holding `d/` for the directory and `d` for the same place as an ancestor of
 /// what is under it. Worse, `d/` sorts inside its own subtree, so clearing the
 /// subtree takes the directory with it.
 fn without_trailing_slash(mut path: Vec<u8>) -> Vec<u8> {
-    let kept = path.iter().rposition(|&byte| byte != b'/').map_or(0, |at| at + 1);
+    let kept = path
+        .iter()
+        .rposition(|&byte| byte != b'/')
+        .map_or(0, |at| at + 1);
     // A path of nothing but slashes names the root, which has no shorter form.
     if kept > 0 {
         path.truncate(kept);
@@ -458,22 +462,26 @@ mod tests {
     /// say what the image asked for.
     #[test]
     fn extended_attribute_names_are_recorded_and_survive_serialisation() {
-        let capability = [1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let capability = [
+            1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let mut builder = tar::Builder::new(Vec::new());
         pax_record(&mut builder, "plain", b"body", &[]);
         pax_record(
             &mut builder,
             "capable",
             b"body",
-            &[("security.capability", &capability), ("user.note", b"hello")],
+            &[
+                ("security.capability", &capability),
+                ("user.note", b"hello"),
+            ],
         );
         let tar = builder.into_inner().expect("tar");
 
         let table = Table::build(&tar[..]).expect("table");
         assert_eq!(table.entries[0].xattrs, b"");
         assert_eq!(
-            table.entries[1].xattrs,
-            b"security.capability\0user.note",
+            table.entries[1].xattrs, b"security.capability\0user.note",
             "names in the order the layer lists them, NUL separated"
         );
 
@@ -520,7 +528,8 @@ mod tests {
     }
 
     #[test]
-    fn a_table_survives_serialisation() {        let table = Table::build(&sample()[..]).expect("table");
+    fn a_table_survives_serialisation() {
+        let table = Table::build(&sample()[..]).expect("table");
         let mut bytes = Vec::new();
         table.write_to(&mut bytes).expect("write");
         assert_eq!(Table::read_from(&bytes[..]).expect("read"), table);
@@ -569,7 +578,9 @@ mod tests {
         header.set_entry_type(tar::EntryType::Fifo);
         header.set_mode(0o644);
         header.set_size(0);
-        builder.append_data(&mut header, "pipe", io::empty()).expect("fifo");
+        builder
+            .append_data(&mut header, "pipe", io::empty())
+            .expect("fifo");
         let tar = builder.into_inner().expect("tar");
 
         let table = Table::build(&tar[..]).expect("table");

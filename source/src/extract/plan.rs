@@ -568,7 +568,8 @@ fn directories(tree: &BTreeMap<&[u8], Node>) -> Vec<(Vec<u8>, u32)> {
 }
 
 /// Every strict ancestor of `path`, shallowest first.
-fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {    path.iter()
+fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
         .enumerate()
         .filter(|(_, byte)| **byte == b'/')
         .map(move |(at, _)| &path[..at])
@@ -729,7 +730,11 @@ mod tests {
     fn of_kind(path: &str, kind: Kind) -> Entry {
         Entry {
             kind,
-            mode: if kind == Kind::Directory { 0o755 } else { 0o644 },
+            mode: if kind == Kind::Directory {
+                0o755
+            } else {
+                0o644
+            },
             ..file(path)
         }
     }
@@ -787,7 +792,10 @@ mod tests {
 
     #[test]
     fn a_whiteout_shadows_what_it_hides() {
-        let (plan, d) = plan_of(vec![table(&["dir/a", "dir/b", "other"]), table(&["dir/.wh.a"])]);
+        let (plan, d) = plan_of(vec![
+            table(&["dir/a", "dir/b", "other"]),
+            table(&["dir/.wh.a"]),
+        ]);
         assert!(plan.is_shadowed(&d[0].digest, b"dir/a"));
         assert!(!plan.is_shadowed(&d[0].digest, b"dir/b"));
         assert!(!plan.is_shadowed(&d[0].digest, b"other"));
@@ -834,8 +842,11 @@ mod tests {
 
     #[test]
     fn a_whiteout_of_a_directory_shadows_what_is_under_it() {
-        let (plan, d) = plan_of(vec![table(&["dir/a", "dir", "dirty"]), table(&["\
-.wh.dir"])]);
+        let (plan, d) = plan_of(vec![
+            table(&["dir/a", "dir", "dirty"]),
+            table(&["\
+.wh.dir"]),
+        ]);
         assert!(plan.is_shadowed(&d[0].digest, b"dir/a"));
         assert!(plan.is_shadowed(&d[0].digest, b"dir"));
         assert!(!plan.is_shadowed(&d[0].digest, b"dirty"));
@@ -1020,7 +1031,12 @@ mod tests {
         #[test]
         fn a_symlink_takes_the_tree_under_it() {
             let (plan, d) = plan_of(vec![
-                layer(vec![dir("lib"), file("lib/a"), file("lib/sub/b"), file("libre")]),
+                layer(vec![
+                    dir("lib"),
+                    file("lib/a"),
+                    file("lib/sub/b"),
+                    file("libre"),
+                ]),
                 layer(vec![symlink("lib", "usr/lib")]),
             ]);
             assert!(plan.is_shadowed(&d[0].digest, b"lib/a"));
@@ -1116,7 +1132,11 @@ mod tests {
     #[test]
     fn directories_are_listed_parents_first() {
         let dirs = dirs_of(vec![layer(vec![dir("a/b/c"), file("a/b/c/d"), dir("a")])]);
-        assert_eq!(dirs, ["a", "a/b", "a/b/c"], "including the ones nothing names");
+        assert_eq!(
+            dirs,
+            ["a", "a/b", "a/b/c"],
+            "including the ones nothing names"
+        );
     }
 
     #[test]

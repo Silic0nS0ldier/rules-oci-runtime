@@ -146,7 +146,10 @@ impl BindMount {
             .filter(|option| !option.is_empty())
             .map(str::to_string)
             .collect();
-        if options.iter().any(|option| option.contains(char::is_whitespace)) {
+        if options
+            .iter()
+            .any(|option| option.contains(char::is_whitespace))
+        {
             return Err(Error::InvalidMount(value.to_string()));
         }
 
@@ -363,7 +366,12 @@ fn default_mounts(rootless: bool) -> Vec<Mount> {
             "shm",
             &["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"],
         ),
-        mount("/dev/mqueue", "mqueue", "mqueue", &["nosuid", "noexec", "nodev"]),
+        mount(
+            "/dev/mqueue",
+            "mqueue",
+            "mqueue",
+            &["nosuid", "noexec", "nodev"],
+        ),
     ];
 
     if rootless {
@@ -415,8 +423,8 @@ mod tests {
 
     #[test]
     fn user_command_replaces_image_cmd() {
-        let args = resolve_args(&image(None, Some(&["/bin/sh"])), &strings(&["/bin/true"]))
-            .expect("args");
+        let args =
+            resolve_args(&image(None, Some(&["/bin/sh"])), &strings(&["/bin/true"])).expect("args");
         assert_eq!(args, strings(&["/bin/true"]));
     }
 
@@ -480,7 +488,8 @@ mod tests {
 
     #[test]
     fn explicit_term_is_not_overridden() {
-        let env = resolve_env(&ImageConfig::default(), &strings(&["TERM=dumb"]), true).expect("env");
+        let env =
+            resolve_env(&ImageConfig::default(), &strings(&["TERM=dumb"]), true).expect("env");
         assert!(env.contains(&"TERM=dumb".to_string()));
         assert_eq!(env.iter().filter(|e| e.starts_with("TERM=")).count(), 1);
     }
@@ -517,7 +526,14 @@ mod tests {
 
     #[test]
     fn malformed_mounts_are_rejected() {
-        for value in ["", "/src", "/src:", ":/dst", "/src:relative", "/src:/dst:a b"] {
+        for value in [
+            "",
+            "/src",
+            "/src:",
+            ":/dst",
+            "/src:relative",
+            "/src:/dst:a b",
+        ] {
             assert!(
                 matches!(BindMount::parse(value), Err(Error::InvalidMount(_))),
                 "expected {value:?} to be rejected"
@@ -546,9 +562,17 @@ mod tests {
         assert_eq!(spec.linux.uid_mappings[0].host_id, 1000);
         assert_eq!(spec.linux.gid_mappings[0].host_id, 1001);
         assert!(spec.linux.namespaces.iter().any(|ns| ns.r#type == "user"));
-        assert!(spec.linux.namespaces.iter().all(|ns| ns.r#type != "network"));
-        assert!(spec.mounts.iter().any(|m| m.destination == "/sys"
-            && m.options.contains(&"rbind".to_string())));
+        assert!(
+            spec.linux
+                .namespaces
+                .iter()
+                .all(|ns| ns.r#type != "network")
+        );
+        assert!(
+            spec.mounts
+                .iter()
+                .any(|m| m.destination == "/sys" && m.options.contains(&"rbind".to_string()))
+        );
     }
 
     #[test]
@@ -571,7 +595,11 @@ mod tests {
 
         assert!(spec.linux.uid_mappings.is_empty());
         assert!(spec.linux.namespaces.iter().all(|ns| ns.r#type != "user"));
-        assert!(spec.mounts.iter().any(|m| m.destination == "/sys" && m.r#type == "sysfs"));
+        assert!(
+            spec.mounts
+                .iter()
+                .any(|m| m.destination == "/sys" && m.r#type == "sysfs")
+        );
     }
 
     #[test]
@@ -592,7 +620,12 @@ mod tests {
                 workdir: None,
             })
             .expect("spec");
-            assert!(spec.linux.namespaces.iter().all(|ns| ns.r#type != "network"));
+            assert!(
+                spec.linux
+                    .namespaces
+                    .iter()
+                    .all(|ns| ns.r#type != "network")
+            );
         }
     }
 

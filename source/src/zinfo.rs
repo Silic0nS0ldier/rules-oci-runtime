@@ -506,7 +506,8 @@ mod tests {
     }
 
     #[test]
-    fn a_second_gzip_member_gets_its_own_checkpoint() {        let first = sample_data(300 << 10);
+    fn a_second_gzip_member_gets_its_own_checkpoint() {
+        let first = sample_data(300 << 10);
         let second = sample_data(200 << 10);
         let mut blob = gzip(&first);
         let member_start = blob.len() as u64;

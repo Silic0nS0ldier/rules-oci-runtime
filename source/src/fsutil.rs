@@ -86,7 +86,10 @@ pub fn force_remove_dir_all(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(crate::error::Error::io(format!("removing {}", path.display()), err)),
+        Err(err) => Err(crate::error::Error::io(
+            format!("removing {}", path.display()),
+            err,
+        )),
     }
 }
 

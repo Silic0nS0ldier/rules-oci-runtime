@@ -44,7 +44,10 @@ fn known_layer_media_types_map_to_compression() {
         compression_of("application/vnd.docker.image.rootfs.diff.tar.gzip"),
         Some(Compression::Gzip)
     );
-    assert_eq!(compression_of("application/vnd.oci.image.config.v1+json"), None);
+    assert_eq!(
+        compression_of("application/vnd.oci.image.config.v1+json"),
+        None
+    );
 }
 
 #[test]
@@ -327,7 +330,8 @@ fn a_link_entry_without_a_target_is_refused() {
 }
 
 #[test]
-fn an_entry_cannot_escape_through_a_symlinked_parent() {        // A layer can ship a symlink out of the rootfs and then an entry
+fn an_entry_cannot_escape_through_a_symlinked_parent() {
+    // A layer can ship a symlink out of the rootfs and then an entry
     // underneath it. The parent of that entry does not exist and cannot be
     // resolved, which used to count as safe, so creating it followed the
     // symlink and wrote the file outside the rootfs.
@@ -795,7 +799,9 @@ fn append_dir(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
     header.set_entry_type(EntryType::Directory);
     header.set_mode(0o755);
     header.set_size(0);
-    builder.append_data(&mut header, path, io::empty()).expect("dir");
+    builder
+        .append_data(&mut header, path, io::empty())
+        .expect("dir");
 }
 
 fn append_file(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8]) {
@@ -809,14 +815,18 @@ fn append_symlink(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &str)
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(EntryType::Symlink);
     header.set_size(0);
-    builder.append_link(&mut header, path, target).expect("symlink");
+    builder
+        .append_link(&mut header, path, target)
+        .expect("symlink");
 }
 
 fn append_hard_link(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &str) {
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(EntryType::Link);
     header.set_size(0);
-    builder.append_link(&mut header, path, target).expect("hard link");
+    builder
+        .append_link(&mut header, path, target)
+        .expect("hard link");
 }
 
 fn append_file_moded(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8], mode: u32) {
@@ -851,7 +861,9 @@ fn append_of_type(builder: &mut tar::Builder<Vec<u8>>, path: &str, entry_type: E
     header.set_entry_type(entry_type);
     header.set_mode(0o644);
     header.set_size(0);
-    builder.append_data(&mut header, path, io::empty()).expect("entry");
+    builder
+        .append_data(&mut header, path, io::empty())
+        .expect("entry");
 }
 
 /// A later layer turning a directory into a symlink is the case the plan has
@@ -1134,14 +1146,21 @@ fn extract_by(
         Route::Planned => {
             assert!(extractor.plan.is_resolved(), "the plan must resolve");
             assert!(
-                descriptors.iter().all(|d| index_at(&index_dir, d).is_none()),
+                descriptors
+                    .iter()
+                    .all(|d| index_at(&index_dir, d).is_none()),
                 "the planned route must have no checkpoint index to fall back on"
             );
         }
         Route::Spans => {
-            assert!(extractor.plan.work().is_some(), "the plan must produce work");
             assert!(
-                descriptors.iter().all(|d| index_at(&index_dir, d).is_some()),
+                extractor.plan.work().is_some(),
+                "the plan must produce work"
+            );
+            assert!(
+                descriptors
+                    .iter()
+                    .all(|d| index_at(&index_dir, d).is_some()),
                 "every layer needs a checkpoint index for the span route"
             );
         }
@@ -1371,7 +1390,8 @@ fn every_route_agrees_when_layers_spell_one_path_differently() {
 }
 
 #[test]
-fn every_route_agrees_on_a_layered_image() {    assert_routes_agree(
+fn every_route_agrees_on_a_layered_image() {
+    assert_routes_agree(
         "route-layered",
         &Route::ALL,
         &[
@@ -1479,7 +1499,6 @@ fn every_route_agrees_when_a_layer_writes_through_a_symlink() {
         ],
     );
 }
-
 
 /// An opaque whiteout hides what is *in* a directory. The directory itself
 /// stays, and a route that resolves the tree up front has to keep it too.
@@ -1672,7 +1691,10 @@ fn set_user_id_survives_extraction() {
             append_file_moded(b, "d/setuid", b"u", 0o4755);
         })],
         |route, rootfs| {
-            let mode = fs::metadata(rootfs.join("d/setuid")).expect("stat").permissions().mode();
+            let mode = fs::metadata(rootfs.join("d/setuid"))
+                .expect("stat")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o7777, 0o4755, "{route:?}: the mode the layer ships");
         },
     );
@@ -1694,7 +1716,10 @@ fn a_file_replacing_a_directory_keeps_its_own_mode() {
             tar_of(|b| append_file_moded(b, "d", b"file", 0o600)),
         ],
         |route, rootfs| {
-            let mode = fs::metadata(rootfs.join("d")).expect("stat").permissions().mode();
+            let mode = fs::metadata(rootfs.join("d"))
+                .expect("stat")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o7777, 0o600, "{route:?}: the mode the layer ships");
         },
     );
@@ -1792,8 +1817,14 @@ fn an_unsupported_entry_does_not_stop_the_layer() {
             append_file(b, "d/after", b"after");
         })],
         |route, rootfs| {
-            assert!(!rootfs.join("d/pipe").exists(), "{route:?}: the fifo is skipped");
-            assert!(!rootfs.join("d/node").exists(), "{route:?}: the device is skipped");
+            assert!(
+                !rootfs.join("d/pipe").exists(),
+                "{route:?}: the fifo is skipped"
+            );
+            assert!(
+                !rootfs.join("d/node").exists(),
+                "{route:?}: the device is skipped"
+            );
             assert_eq!(
                 fs::read_to_string(rootfs.join("d/after")).expect("after"),
                 "after",
@@ -1829,7 +1860,9 @@ fn a_hard_link_to_a_symlink_links_the_symlink() {
             );
             assert_eq!(
                 fs::symlink_metadata(&linked).expect("stat").ino(),
-                fs::symlink_metadata(rootfs.join("d/link")).expect("stat").ino(),
+                fs::symlink_metadata(rootfs.join("d/link"))
+                    .expect("stat")
+                    .ino(),
                 "{route:?}: the two names share one inode"
             );
         },
@@ -1907,15 +1940,24 @@ fn a_sparse_file_keeps_its_hole() {
 
     // Not the span route: a sparse body is not a flat run of the stream, so
     // the plan refuses to place it and the image drops to the walk.
-    for_each_route("sparse", &[Route::Streaming, Route::Planned], &layers, |route, rootfs| {
-        let body = fs::read(rootfs.join("d/holey")).expect("holey");
-        assert_eq!(body.len(), 1536, "{route:?}: the file is its real size");
-        assert!(
-            body[..1024].iter().all(|&byte| byte == 0),
-            "{route:?}: the hole reads as zeroes"
-        );
-        assert_eq!(&body[1024..], &[7u8; 512], "{route:?}: and the data follows it");
-    });
+    for_each_route(
+        "sparse",
+        &[Route::Streaming, Route::Planned],
+        &layers,
+        |route, rootfs| {
+            let body = fs::read(rootfs.join("d/holey")).expect("holey");
+            assert_eq!(body.len(), 1536, "{route:?}: the file is its real size");
+            assert!(
+                body[..1024].iter().all(|&byte| byte == 0),
+                "{route:?}: the hole reads as zeroes"
+            );
+            assert_eq!(
+                &body[1024..],
+                &[7u8; 512],
+                "{route:?}: and the data follows it"
+            );
+        },
+    );
 }
 
 /// `tar -C dir .` puts the archive root in the layer as `./`, and the spec's
@@ -2041,10 +2083,17 @@ fn extended_attributes_are_dropped_when_the_image_is_taken_anyway() {
 }
 
 fn xattr_layers() -> Vec<Vec<u8>> {
-    let capability = [1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let capability = [
+        1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
     vec![tar_of(|b| {
         append_dir(b, "bin/");
-        append_with_xattrs(b, "bin/capable", b"body", &[("security.capability", &capability)]);
+        append_with_xattrs(
+            b,
+            "bin/capable",
+            b"body",
+            &[("security.capability", &capability)],
+        );
         append_with_xattrs(b, "bin/noted", b"body", &[("user.note", b"hello")]);
         append_file(b, "bin/plain", b"body");
     })]
@@ -2054,9 +2103,8 @@ fn xattr_names(path: &Utf8Path) -> Vec<String> {
     let c_path = std::ffi::CString::new(path.as_str()).expect("path");
     let mut buffer = vec![0u8; 4096];
     // SAFETY: both pointers are valid for the length passed.
-    let len = unsafe {
-        libc::llistxattr(c_path.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len())
-    };
+    let len =
+        unsafe { libc::llistxattr(c_path.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
     if len <= 0 {
         return Vec::new();
     }
