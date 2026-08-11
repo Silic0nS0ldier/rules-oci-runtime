@@ -1,0 +1,5 @@
+# Bazel modules of their own, each tested from its own directory. Without this
+# the root module's `//...` descends into their convenience symlinks, which
+# point back here.
+source
+e2e

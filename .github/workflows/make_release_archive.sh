@@ -63,6 +63,7 @@ root="${stage}/${prefix}"
 # Development only, and `docs/BUILD.bazel` would drag in the `@stardoc` dev
 # dependency that consumers never fetch.
 rm -rf \
+    "${root}/.bazelignore" \
     "${root}/.bazelrc" \
     "${root}/.bazelversion" \
     "${root}/.devcontainer" \
