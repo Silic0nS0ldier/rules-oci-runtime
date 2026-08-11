@@ -239,7 +239,9 @@ fn canonicalise(tables: &mut [Table]) -> bool {
 ///   the tree as it is built;
 /// - a hard link naming something the final tree does not hold, or holds
 ///   behind a symlink, where linking would follow the symlink to wherever it
-///   points and the walk checks that against the rootfs as it goes.
+///   points and the walk checks that against the rootfs as it goes;
+/// - a hard link whose target is replaced after it, where the copy the walk
+///   linked is not the copy that survives.
 fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
     let mut work = Work {
         files: vec![Vec::new(); tables.len()],
@@ -262,7 +264,16 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
             Kind::Symlink => work.symlinks.push((layer as u32, entry as u32)),
             Kind::HardLink => {
                 let target = tables[layer].entries[entry].link.as_slice();
-                if !tree.contains_key(target) || behind_a_link(tree, target) {
+                let at = tree.get(target)?;
+                if behind_a_link(tree, target) {
+                    return None;
+                }
+                // The walk links the copy standing at the target when the
+                // entry appears, and a later layer replacing that path
+                // unlinks it rather than writing through it. Links are placed
+                // here only once every file is on disk, so the copy that
+                // survives is the only one there is to link.
+                if at.owner > (layer, entry) {
                     return None;
                 }
                 work.hard_links.push((layer as u32, entry as u32))
@@ -691,11 +702,49 @@ mod tests {
             assert!(plan.work().is_none());
         }
 
+        /// The walk links the copy standing at the target when the entry
+        /// appears, and a later layer replacing that path unlinks it rather
+        /// than writing through it. Links are placed after every file, by
+        /// which time only the surviving copy is there to link.
+        #[test]
+        fn a_hard_link_whose_target_a_later_layer_replaces() {
+            let mut link = of_kind("link", Kind::HardLink);
+            link.link = b"target".to_vec();
+            let (plan, _) = plan_of(vec![
+                layer(vec![file("target"), link]),
+                layer(vec![file("target")]),
+            ]);
+            assert!(plan.work().is_none());
+        }
+
+        /// The same layer, later in it: the walk has already replaced the
+        /// copy by the time it links, so this is the same case.
+        #[test]
+        fn a_hard_link_whose_target_its_own_layer_replaces_afterwards() {
+            let mut link = of_kind("link", Kind::HardLink);
+            link.link = b"target".to_vec();
+            let (plan, _) = plan_of(vec![layer(vec![file("target"), link, file("target")])]);
+            assert!(plan.work().is_none());
+        }
+
         #[test]
         fn the_rootfs_named_as_anything_but_a_directory() {
             let (plan, _) = plan_of(vec![layer(vec![file(".")])]);
             assert!(!plan.is_resolved());
         }
+    }
+
+    /// A target replaced before the link is the copy the walk links, so there
+    /// is nothing for the span route to get wrong.
+    #[test]
+    fn a_hard_link_made_against_the_surviving_copy_is_placeable() {
+        let mut link = of_kind("link", Kind::HardLink);
+        link.link = b"target".to_vec();
+        let (plan, _) = plan_of(vec![
+            layer(vec![file("target")]),
+            layer(vec![file("target"), link]),
+        ]);
+        assert!(plan.work().is_some());
     }
 
     /// `tar -C dir .` writes the rootfs itself into every layer, so planning

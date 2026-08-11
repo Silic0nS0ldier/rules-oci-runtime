@@ -1260,6 +1260,36 @@ fn every_route_agrees_on_hard_links() {
     );
 }
 
+/// A hard link is made against the copy standing when the entry appears. A
+/// later layer replacing that path unlinks it and writes a new file, so the
+/// link keeps the contents it was made against and stops sharing an inode.
+///
+/// The span route places links once every file is on disk, by which time only
+/// the surviving copy is there to link, so it declines the image instead.
+#[test]
+fn a_hard_link_keeps_the_copy_it_was_made_against() {
+    let layers = [
+        tar_of(|b| {
+            append_file(b, "target", b"first");
+            append_hard_link(b, "link", "target");
+        }),
+        tar_of(|b| append_file(b, "target", b"second")),
+    ];
+    let routes = [Route::Streaming, Route::Planned];
+    for_each_route("hard-link-replaced", &routes, &layers, |route, rootfs| {
+        assert_eq!(
+            fs::read_to_string(rootfs.join("link")).expect("link"),
+            "first",
+            "{route:?} linked the wrong copy"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("target")).expect("target"),
+            "second",
+            "{route:?} kept the wrong copy"
+        );
+    });
+}
+
 #[test]
 fn every_route_agrees_when_a_directory_becomes_a_symlink() {
     assert_routes_agree(
