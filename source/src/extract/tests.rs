@@ -1042,6 +1042,28 @@ fn extract_by(
     Ok(rootfs)
 }
 
+/// Applies `layers` by the given route without holding it to a plan shape,
+/// and says whether the plan ended up placing the entries itself.
+fn apply_by(route: Route, root: &Utf8Path, layers: &[Vec<u8>]) -> (Result<Utf8PathBuf>, bool) {
+    let (index_dir, descriptors) = install_for(route, root, layers);
+    let rootfs = root.join("rootfs");
+    let dir = match route {
+        Route::Streaming => None,
+        Route::Planned | Route::Spans => Some(index_dir.as_path()),
+    };
+
+    let mut placed = false;
+    let applied = (|| {
+        let layout = Layout::open(root)?;
+        let mut extractor = RootfsExtractor::new(&rootfs, dir, true)?;
+        extractor.plan(&descriptors)?;
+        placed = extractor.plan.work().is_some();
+        extractor.apply(&layout, &descriptors)?;
+        extractor.finish()
+    })();
+    (applied.map(|()| rootfs), placed)
+}
+
 /// A rootfs reduced to sorted lines, so two of them can be compared and the
 /// first difference read directly.
 ///
@@ -1137,19 +1159,8 @@ fn assert_routes_agree(name: &str, routes: &[Route], layers: &[Vec<u8>]) {
 fn assert_routes_refuse(name: &str, layers: &[Vec<u8>]) {
     for route in Route::ALL {
         let root = scratch(&format!("{name}-{route:?}"));
-        let (index_dir, descriptors) = install_for(route, &root, layers);
-        let layout = Layout::open(&root).expect("layout");
-        let rootfs = root.join("rootfs");
-        let dir = match route {
-            Route::Streaming => None,
-            Route::Planned | Route::Spans => Some(index_dir.as_path()),
-        };
-
-        let mut extractor = RootfsExtractor::new(&rootfs, dir, true).expect("extractor");
-        let err = extractor
-            .plan(&descriptors)
-            .and_then(|()| extractor.apply(&layout, &descriptors))
-            .expect_err(&format!("{name}: {route:?} extracted what it must refuse"));
+        let (result, _) = apply_by(route, &root, layers);
+        let err = result.expect_err(&format!("{name}: {route:?} extracted what it must refuse"));
         assert!(
             matches!(err, Error::UnsafeEntry { .. }),
             "{name}: {route:?} expected an unsafe entry, got {err:?}"
@@ -1159,6 +1170,47 @@ fn assert_routes_refuse(name: &str, layers: &[Vec<u8>]) {
             "{name}: {route:?} wrote outside the rootfs"
         );
 
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+/// The plan builds the directory tree before any layer runs, and a whiteout
+/// later in the image removes what it built. The layer's own directory entry
+/// puts it back, so the walk cannot take the tree for granted.
+#[test]
+fn every_route_agrees_when_a_whiteout_takes_a_directory_a_later_entry_restores() {
+    assert_routes_agree(
+        "route-whiteout-then-directory",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/gone", b"gone");
+            }),
+            tar_of(|b| {
+                append_file(b, ".wh.d", b"");
+                append_dir(b, "d/");
+            }),
+        ],
+    );
+}
+
+/// A layer cannot have a file at a path and a directory underneath it. The
+/// plan creates no directory behind something that is not one, so without
+/// this the fast routes quietly placed the file and dropped the rest.
+#[test]
+fn no_route_places_a_directory_under_a_file() {
+    let layers = [tar_of(|b| {
+        append_file(b, "d", b"file");
+        append_dir(b, "d/sub/");
+    })];
+    for route in Route::ALL {
+        let root = scratch(&format!("dir-under-file-{route:?}"));
+        let (result, _) = apply_by(route, &root, &layers);
+        assert!(
+            matches!(result, Err(Error::Io { .. })),
+            "{route:?}: expected the directory to be refused, got {result:?}"
+        );
         let _ = fsutil::force_remove_dir_all(root.as_std_path());
     }
 }

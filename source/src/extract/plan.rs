@@ -255,9 +255,12 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
             return None;
         }
         match node.kind {
+            // Nothing here is created under something that is not a directory,
+            // so whatever is there has to be resolved against the tree as it
+            // is built. That is the walk's job for the whole image.
+            _ if behind_a_link(tree, path) => return None,
             Kind::Directory | Kind::Unsupported => continue,
             Kind::Sparse => return None,
-            _ if behind_a_link(tree, path) => return None,
             Kind::File => work.files[layer].push(entry as u32),
             // A `BTreeMap` orders by path, so a link under another link is
             // already after it.
