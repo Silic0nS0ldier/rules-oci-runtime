@@ -1516,6 +1516,28 @@ fn set_user_id_survives_extraction() {
     );
 }
 
+/// A directory's mode is applied once every layer has run, by which time a
+/// later layer may have put a file at that path. The file gets the mode its
+/// own entry asked for, not the one the directory wanted.
+#[test]
+fn a_file_replacing_a_directory_keeps_its_own_mode() {
+    for_each_route(
+        "file-over-directory",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/gone", b"gone");
+            }),
+            tar_of(|b| append_file_moded(b, "d", b"file", 0o600)),
+        ],
+        |route, rootfs| {
+            let mode = fs::metadata(rootfs.join("d")).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o7777, 0o600, "{route:?}: the mode the layer ships");
+        },
+    );
+}
+
 #[test]
 fn every_route_agrees_on_empty_files_and_layers() {
     assert_routes_agree(

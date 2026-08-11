@@ -213,6 +213,13 @@ impl RootfsExtractor {
         self.deferred_modes
             .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
         for (path, mode) in &self.deferred_modes {
+            // A later layer may have put something else at the path, and this
+            // is a directory's mode: applying it to whatever took its place
+            // would give that the directory's permissions instead of its own.
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                _ => continue,
+            }
             // Keep traversal rights: without them cleanup and later runs would fail.
             let mode = mode | 0o700;
             if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(mode))
