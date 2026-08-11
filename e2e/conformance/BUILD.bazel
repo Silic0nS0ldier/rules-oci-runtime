@@ -1,0 +1,45 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+alias(
+    name = "umoci",
+    actual = select({
+        "@platforms//cpu:arm64": "@umoci_linux_arm64//file",
+        "@platforms//cpu:x86_64": "@umoci_linux_amd64//file",
+    }),
+)
+
+CASES = [
+    "dot_rooted_layers",
+    "whiteouts",
+    "links_and_modes",
+    "same_layer_whiteout",
+]
+
+[
+    sh_test(
+        name = case,
+        srcs = ["cases.sh"],
+        args = [case],
+        data = [
+            ":umoci",
+            "@rules_oci_runtime_source//:oci_runtime",
+        ],
+        env = {
+            "LAUNCHER": "$(rlocationpath @rules_oci_runtime_source//:oci_runtime)",
+            "UMOCI": "$(rlocationpath :umoci)",
+        },
+        # `umoci unpack --rootless` and the launcher both want user namespaces,
+        # which the Bazel sandbox does not nest.
+        tags = [
+            "external",
+            "no-sandbox",
+        ],
+        timeout = "short",
+    )
+    for case in CASES
+]
+
+test_suite(
+    name = "conformance",
+    tests = CASES,
+)

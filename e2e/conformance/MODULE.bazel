@@ -1,0 +1,38 @@
+module(name = "rules_oci_runtime_e2e_conformance")
+
+bazel_dep(name = "rules_oci_runtime")
+local_path_override(
+    module_name = "rules_oci_runtime",
+    path = "../..",
+)
+
+# Builds the launcher from source: the tests drive the binary directly rather
+# than through `runc_binary`, because they extract a layout without running it.
+bazel_dep(name = "rules_oci_runtime_source")
+local_path_override(
+    module_name = "rules_oci_runtime_source",
+    path = "../../source",
+)
+
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# umoci is the reference implementation the extracted trees are compared
+# against. Pinned by digest from the release's own `umoci.sha256sum`.
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+UMOCI_VERSION = "0.6.0"
+
+http_file(
+    name = "umoci_linux_amd64",
+    executable = True,
+    sha256 = "b51c267ec394499e42c6fde47f240b7b7dba57ea49df0b5acd304378b82a3b71",
+    urls = ["https://github.com/opencontainers/umoci/releases/download/v{v}/umoci.linux.amd64".format(v = UMOCI_VERSION)],
+)
+
+http_file(
+    name = "umoci_linux_arm64",
+    executable = True,
+    sha256 = "5cfd17f2e7a4bcf9ed67ea1b955ca893d200349b9ce6a3d3707dba415f458a1f",
+    urls = ["https://github.com/opencontainers/umoci/releases/download/v{v}/umoci.linux.arm64".format(v = UMOCI_VERSION)],
+)
