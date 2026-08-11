@@ -1,39 +1,69 @@
 //! Filesystem helpers shared by extraction and cleanup.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::error::{IoContext, Result};
 
-/// Rebuilds `dst` as `root` joined with the safe components of `path`, or
-/// returns false when the entry tries to escape (absolute paths are rooted at
-/// the rootfs, `..` is never allowed) or names nothing at all.
+const CURRENT_DIR: &[u8] = b".";
+const PARENT_DIR: &[u8] = b"..";
+
+/// The components `path` names, with the ones that name nowhere dropped.
+fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.split(|&byte| byte == b'/')
+        .filter(|component| !component.is_empty() && *component != CURRENT_DIR)
+}
+
+/// The components an entry names under the rootfs, or `None` when it names
+/// nothing at all or climbs out (absolute paths are rooted at the rootfs,
+/// `..` is never allowed).
 ///
-/// The destination is what every caller actually wants, so it is built
-/// directly into a buffer they own: a layer is tens of thousands of entries,
-/// and a component list per entry is tens of thousands of allocations that
-/// only exist to be joined back together.
-pub fn resolve_under(root: &Path, path: &Path, dst: &mut PathBuf) -> bool {
+/// A layer spells one file several ways: `etc/passwd`, `./etc/passwd` and
+/// `/etc/passwd` all name it. Every route has to agree on which, or a path a
+/// later layer replaces is not recognised as the same path.
+pub fn safe_components(path: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
+    let mut names_something = false;
+    for component in components(path) {
+        if component == PARENT_DIR {
+            return None;
+        }
+        names_something = true;
+    }
+    names_something.then(|| components(path))
+}
+
+/// Rebuilds `path` in `out` as the single form every route agrees on, or
+/// returns false when the entry names nothing or tries to escape.
+///
+/// The result is what the caller actually wants, so it is built directly into
+/// a buffer they own: a layer is tens of thousands of entries, and a component
+/// list per entry is tens of thousands of allocations that only exist to be
+/// joined back together.
+pub fn canonical_entry_path(path: &[u8], out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let Some(components) = safe_components(path) else {
+        return false;
+    };
+    for component in components {
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(component);
+    }
+    true
+}
+
+/// Rebuilds `dst` as `root` joined with a path [`canonical_entry_path`] has
+/// already accepted.
+pub fn join_under(root: &Path, relative: &[u8], dst: &mut PathBuf) {
     dst.clear();
     dst.push(root);
-    let mut components = 0;
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::CurDir => continue,
-            Component::ParentDir => return false,
-            Component::Normal(part) => {
-                if part.is_empty() {
-                    continue;
-                }
-                dst.push(part);
-                components += 1;
-            }
-        }
-    }
-    components > 0
+    dst.push(OsStr::from_bytes(relative));
 }
 
 /// True when `path` names the rootfs itself rather than anything under it,
@@ -41,15 +71,8 @@ pub fn resolve_under(root: &Path, path: &Path, dst: &mut PathBuf) -> bool {
 ///
 /// `..` is not this, however many `.` are around it: that names somewhere the
 /// layer has no business reaching.
-pub fn names_the_root(path: &Path) -> bool {
-    let mut components = path.components().peekable();
-    components.peek().is_some()
-        && components.all(|component| {
-            matches!(
-                component,
-                Component::Prefix(_) | Component::RootDir | Component::CurDir
-            )
-        })
+pub fn names_the_root(path: &[u8]) -> bool {
+    !path.is_empty() && components(path).next().is_none()
 }
 
 /// Removes a tree even when directories were extracted without write permission.
@@ -298,30 +321,33 @@ mod tests {
     use super::*;
 
     fn resolved(path: &str) -> Option<String> {
-        let mut dst = PathBuf::new();
-        resolve_under(Path::new("/tmp/rootfs"), Path::new(path), &mut dst)
-            .then(|| dst.to_string_lossy().into_owned())
+        let mut canonical = Vec::new();
+        canonical_entry_path(path.as_bytes(), &mut canonical)
+            .then(|| String::from_utf8(canonical).expect("utf8"))
     }
 
     #[test]
     fn absolute_paths_are_rooted_at_the_rootfs() {
-        assert_eq!(resolved("/etc/passwd").as_deref(), Some("/tmp/rootfs/etc/passwd"));
+        assert_eq!(resolved("/etc/passwd").as_deref(), Some("etc/passwd"));
     }
 
     #[test]
     fn leading_dot_slash_is_stripped() {
-        assert_eq!(
-            resolved("./usr/bin/env").as_deref(),
-            Some("/tmp/rootfs/usr/bin/env")
-        );
+        assert_eq!(resolved("./usr/bin/env").as_deref(), Some("usr/bin/env"));
     }
 
     #[test]
     fn redundant_separators_are_collapsed() {
-        assert_eq!(
-            resolved("usr//bin///env").as_deref(),
-            Some("/tmp/rootfs/usr/bin/env")
-        );
+        assert_eq!(resolved("usr//bin///env").as_deref(), Some("usr/bin/env"));
+    }
+
+    /// The same file spelled three ways has to come out as one path, or the
+    /// plan cannot tell that a later layer replaces it.
+    #[test]
+    fn the_spellings_of_one_path_agree() {
+        assert_eq!(resolved("etc/passwd"), resolved("./etc/passwd"));
+        assert_eq!(resolved("etc/passwd"), resolved("/etc/passwd"));
+        assert_eq!(resolved("etc/passwd"), resolved("etc/./passwd"));
     }
 
     #[test]
@@ -342,11 +368,14 @@ mod tests {
     /// longer one's tail behind.
     #[test]
     fn a_reused_buffer_is_rebuilt_rather_than_appended_to() {
-        let root = Path::new("/tmp/rootfs");
+        let mut canonical = b"somewhere/else/entirely".to_vec();
+        assert!(canonical_entry_path(b"usr/bin/env", &mut canonical));
+        assert_eq!(canonical, b"usr/bin/env");
+        assert!(canonical_entry_path(b"etc", &mut canonical));
+        assert_eq!(canonical, b"etc");
+
         let mut dst = PathBuf::from("/somewhere/else/entirely");
-        assert!(resolve_under(root, Path::new("usr/bin/env"), &mut dst));
-        assert_eq!(dst, PathBuf::from("/tmp/rootfs/usr/bin/env"));
-        assert!(resolve_under(root, Path::new("etc"), &mut dst));
+        join_under(Path::new("/tmp/rootfs"), &canonical, &mut dst);
         assert_eq!(dst, PathBuf::from("/tmp/rootfs/etc"));
     }
 
@@ -354,19 +383,19 @@ mod tests {
     /// worked example lists it first. It is not an escape.
     #[test]
     fn the_archive_root_names_the_rootfs() {
-        assert!(names_the_root(Path::new(".")));
-        assert!(names_the_root(Path::new("./")));
-        assert!(names_the_root(Path::new("/")));
-        assert!(names_the_root(Path::new("./.")));
+        assert!(names_the_root(b"."));
+        assert!(names_the_root(b"./"));
+        assert!(names_the_root(b"/"));
+        assert!(names_the_root(b"./."));
     }
 
     #[test]
     fn nothing_that_climbs_out_names_the_rootfs() {
-        assert!(!names_the_root(Path::new("..")));
-        assert!(!names_the_root(Path::new("./..")));
-        assert!(!names_the_root(Path::new("../..")));
-        assert!(!names_the_root(Path::new("./etc")));
-        assert!(!names_the_root(Path::new("")), "an empty path names nothing");
+        assert!(!names_the_root(b".."));
+        assert!(!names_the_root(b"./.."));
+        assert!(!names_the_root(b"../.."));
+        assert!(!names_the_root(b"./etc"));
+        assert!(!names_the_root(b""), "an empty path names nothing");
     }
 
     #[test]
