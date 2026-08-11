@@ -338,13 +338,13 @@ fn write_file(root: &Path, path: &mut PathBuf, entry: &Entry, body: &[u8]) -> Re
     // here means the plan and the tree have parted company.
     let (mut file, _) = create_file(path, entry.mode, Occupied::Refuse).io_context(context)?;
     file.write_all(body).io_context(context)?;
-    finish_file(&file, entry.mode, Some(entry.mtime)).io_context(context)
+    finish_file(&file, entry.mode, entry.mtime).io_context(context)
 }
 
 fn place_link(root: &Path, entry: &Entry) -> Result<()> {
     let mut path = PathBuf::new();
     resolve(root, &mut path, entry);
-    place_symlink(&path, &entry.link, Some(entry.mtime))
+    place_symlink(&path, &entry.link, entry.mtime)
         .io_context(|| format!("linking {:?}", String::from_utf8_lossy(&entry.path)))
 }
 

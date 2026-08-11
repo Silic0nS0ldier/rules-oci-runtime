@@ -5,8 +5,7 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use tar::EntryType;
-
+use crate::entries::{Kind, mode_of, mtime_of};
 use crate::error::{Error, IoContext, Result};
 use crate::fsutil;
 use crate::log::{log, warning};
@@ -58,14 +57,14 @@ impl RootfsExtractor {
             // carries is deferred like any other directory's, and a layer
             // naming the root as anything but a directory is refused.
             if fsutil::names_the_root(path.as_os_str().as_bytes()) {
-                if !entry.header().entry_type().is_dir() {
+                if Kind::of(entry.header()) != Kind::Directory {
                     return Err(Error::UnsafeEntry {
                         layer: layer.to_string(),
                         path: path.display().to_string(),
                     });
                 }
-                let mode = entry.header().mode().unwrap_or(0o755) & 0o7777;
-                self.deferred_modes.push((root.to_path_buf(), mode));
+                self.deferred_modes
+                    .push((root.to_path_buf(), mode_of(entry.header())));
                 continue;
             }
 
@@ -111,12 +110,12 @@ impl RootfsExtractor {
                 None => {}
             }
 
-            let entry_type = entry.header().entry_type();
-            if !is_supported(entry_type) {
+            let kind = Kind::of(entry.header());
+            if kind == Kind::Unsupported {
                 warning!(
                     "skipping unsupported entry {:?} of type {:?} in layer {layer}",
                     path.display(),
-                    entry_type
+                    entry.header().entry_type()
                 );
                 continue;
             }
@@ -128,16 +127,14 @@ impl RootfsExtractor {
 
             // A body a later layer replaces is written and then thrown away,
             // so the plan takes it out before any of that happens.
-            if matches!(entry_type, EntryType::Regular | EntryType::Continuous)
-                && self.plan.is_shadowed(layer, &relative)
-            {
+            if kind.is_file() && self.plan.is_shadowed(layer, &relative) {
                 continue;
             }
 
             // A resolved image had its directory tree built before any layer
             // ran, and a directory entry can only ask for one that is already
             // there.
-            if entry_type.is_dir() && self.plan.is_resolved() {
+            if kind == Kind::Directory && self.plan.is_resolved() {
                 continue;
             }
 
@@ -148,13 +145,13 @@ impl RootfsExtractor {
                 });
             }
 
-            let mode = entry.header().mode().unwrap_or(0o755) & 0o7777;
+            let mode = mode_of(entry.header());
 
             // Regular files are the bulk of a layer, and tar copies them
             // through a buffer of std's default size, which is one write
-            // syscall per 8 KiB. Ours is 32 times larger.
-            if matches!(entry_type, EntryType::Regular | EntryType::Continuous) {
-                entry.set_preserve_mtime(true);
+            // syscall per 8 KiB. Ours is 32 times larger. A sparse body is not
+            // a flat run of the stream, so `tar` still places those.
+            if kind == Kind::File {
                 let replaced = unpack_regular(&mut entry, &dst, mode, &mut buffer)
                     .io_context(|| format!("extracting {:?} from layer {layer}", path.display()))?;
                 if replaced {
@@ -163,7 +160,7 @@ impl RootfsExtractor {
                 continue;
             }
 
-            if entry_type.is_dir() {
+            if kind == Kind::Directory {
                 if prepare_directory(&dst)? {
                     self.parents.forget(&dst);
                 }
@@ -185,15 +182,15 @@ impl RootfsExtractor {
                 path: path.display().to_string(),
             };
 
-            match entry_type {
-                EntryType::Symlink => {
+            match kind {
+                Kind::Symlink => {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
-                    let mtime = entry.header().mtime().ok();
+                    let mtime = mtime_of(entry.header());
                     place_symlink(&dst, target.as_os_str().as_bytes(), mtime).io_context(|| {
                         format!("extracting {:?} from layer {layer}", path.display())
                     })?;
                 }
-                EntryType::Link => {
+                Kind::HardLink => {
                     let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
                     // A hard link names an earlier entry of the same archive,
                     // so it is rooted at the rootfs like any other entry path.
@@ -288,18 +285,6 @@ pub(super) fn relative_display(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
-}
-
-pub(super) fn is_supported(entry_type: EntryType) -> bool {
-    matches!(
-        entry_type,
-        EntryType::Regular
-            | EntryType::Directory
-            | EntryType::Symlink
-            | EntryType::Link
-            | EntryType::Continuous
-            | EntryType::GNUSparse
-    )
 }
 
 /// The target of a link entry, or `None` when the header does not name one.
