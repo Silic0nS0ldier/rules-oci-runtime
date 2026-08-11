@@ -19,7 +19,7 @@ use crate::image::{Descriptor, Layout, hex_encode, parse_digest};
 use crate::zinfo;
 
 use super::RootfsExtractor;
-use super::entry::{OPAQUE_WHITEOUT, WHITEOUT_PREFIX, is_supported};
+use super::entry::is_supported;
 use super::pipeline::{
     CHUNK_BYTES, Chunk, ChunkReader, PIPELINE_DEPTH, buffer_pool, compression_of, read_and_hash,
 };
@@ -110,13 +110,6 @@ fn recycled_buffers_do_not_leak_the_previous_chunk() {
     // Draining a chunk hands its buffer back with the stale tail intact.
     let recycled = pool.take();
     assert_eq!(&recycled[..4], b"aaaa");
-}
-
-#[test]
-fn whiteout_names_are_recognised() {
-    assert!(OPAQUE_WHITEOUT.starts_with(WHITEOUT_PREFIX));
-    assert_eq!(".wh.foo".strip_prefix(WHITEOUT_PREFIX), Some("foo"));
-    assert_eq!("foo".strip_prefix(WHITEOUT_PREFIX), None);
 }
 
 const GZIP_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
@@ -1325,6 +1318,27 @@ fn every_route_agrees_on_an_opaque_whiteout() {
             tar_of(|b| {
                 append_dir(b, "d/");
                 append_file(b, "d/.wh..wh..opq", b"");
+            }),
+        ],
+    );
+}
+
+/// The marker names the rootfs itself, which is not a path under it, so the
+/// plan had nothing to clear from and kept what the walk removed.
+#[test]
+fn every_route_agrees_on_an_opaque_whiteout_at_the_top_of_a_layer() {
+    assert_routes_agree(
+        "route-opaque-root",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "etc/");
+                append_file(b, "etc/gone", b"gone");
+                append_file(b, "gone", b"gone");
+            }),
+            tar_of(|b| {
+                append_file(b, ".wh..wh..opq", b"");
+                append_file(b, "kept", b"kept");
             }),
         ],
     );

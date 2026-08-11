@@ -26,11 +26,14 @@ use crate::fsutil;
 use crate::image::{Descriptor, parse_digest};
 use crate::log::{log, warning};
 
-const WHITEOUT_PREFIX: &[u8] = b".wh.";
-const OPAQUE_WHITEOUT: &[u8] = b".wh..wh..opq";
+use super::whiteout::{self, Whiteout};
 
 /// What `create_dir` would have given a directory nothing names.
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
+
+/// The rootfs itself, which a layer names as `.` or `/` and which the tree
+/// holds the one way.
+const ROOT_ENTRY: &[u8] = b".";
 
 /// The entries each layer can skip, keyed by layer digest, and the directory
 /// tree they all need.
@@ -125,7 +128,7 @@ impl Plan {
             for entry in table.entries.iter() {
                 // Only bodies are worth skipping, and a whiteout marker has to
                 // reach the extractor or nothing gets removed.
-                if !entry.kind.is_file() || whiteout(&entry.path).is_some() {
+                if !entry.kind.is_file() || whiteout::of(&entry.path).is_some() {
                     continue;
                 }
                 if linked.contains(entry.path.as_slice()) {
@@ -215,7 +218,7 @@ fn canonicalise(tables: &mut [Table]) -> bool {
                 // The rootfs is already there and only its mode is deferred,
                 // so it is spelled the one way the tree can hold.
                 entry.path.clear();
-                entry.path.push(b'.');
+                entry.path.extend_from_slice(ROOT_ENTRY);
                 continue;
             }
             if !fsutil::canonical_entry_path(&entry.path, &mut canonical) {
@@ -257,7 +260,7 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
         let (layer, entry) = node.owner;
         // A `.wh.` naming nothing is invalid and the walk rejects it, so the
         // plan must not quietly place it as an ordinary file instead.
-        if basename(path) == WHITEOUT_PREFIX {
+        if matches!(whiteout::of(path), Some(Whiteout::Invalid)) {
             return None;
         }
         match node.kind {
@@ -305,7 +308,7 @@ fn replay(tables: &[Table]) -> BTreeMap<&[u8], Node> {
     let mut bound = Vec::new();
     for (l, table) in tables.iter().enumerate() {
         for (e, entry) in table.entries.iter().enumerate() {
-            match whiteout(&entry.path) {
+            match whiteout::of(&entry.path) {
                 // A whiteout hides the layers below it and never its own, so
                 // where the marker sits in the layer does not matter.
                 Some(Whiteout::Opaque(dir)) => remove_under(&mut tree, &dir, &mut bound, l),
@@ -318,7 +321,10 @@ fn replay(tables: &[Table]) -> BTreeMap<&[u8], Node> {
                     }
                     remove_under(&mut tree, &target, &mut bound, l);
                 }
-                None => {
+                // A marker naming nothing removes nothing. It stays an entry
+                // like any other, which is how `placeable` sees it and
+                // declines the image to the walk that refuses it.
+                None | Some(Whiteout::Invalid) => {
                     let node = Node {
                         kind: entry.kind,
                         owner: (l, e),
@@ -404,54 +410,22 @@ fn behind_a_link(tree: &BTreeMap<&[u8], Node>, path: &[u8]) -> bool {
     })
 }
 
-enum Whiteout {
-    /// `.wh..wh..opq`: hides everything the lower layers put in this directory.
-    Opaque(Vec<u8>),
-    /// `.wh.name`: hides the one path it names.
-    Named(Vec<u8>),
-}
-
-fn basename(path: &[u8]) -> &[u8] {
-    match path.iter().rposition(|&byte| byte == b'/') {
-        Some(at) => &path[at + 1..],
-        None => path,
-    }
-}
-
-fn whiteout(path: &[u8]) -> Option<Whiteout> {
-    let (dir, name) = match path.iter().rposition(|&b| b == b'/') {
-        Some(at) => (&path[..at], &path[at + 1..]),
-        None => (&path[..0], path),
-    };
-    if name == OPAQUE_WHITEOUT {
-        return Some(Whiteout::Opaque(dir.to_vec()));
-    }
-    let target = name.strip_prefix(WHITEOUT_PREFIX)?;
-    // `.wh.` with nothing after it names nothing.
-    if target.is_empty() {
-        return None;
-    }
-    // The marker sits in the middle of the path, so what it names has to be
-    // put back together rather than sliced out.
-    let mut named = Vec::with_capacity(dir.len() + 1 + target.len());
-    if !dir.is_empty() {
-        named.extend_from_slice(dir);
-        named.push(b'/');
-    }
-    named.extend_from_slice(target);
-    Some(Whiteout::Named(named))
-}
-
 /// Drops every entry beneath `dir` that a layer before `below` put there,
 /// without touching a sibling whose name merely starts the same way.
+///
+/// An empty `dir` is the rootfs itself, which every path is under. The rootfs
+/// is not removed with them: the walk empties the directory the marker names
+/// rather than deleting it.
 ///
 /// Every entry that is not a directory replays through here, so the bound it
 /// seeks from is built in a buffer the caller keeps rather than a fresh pair
 /// of allocations per path.
 fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8>, below: usize) {
     bound.clear();
-    bound.extend_from_slice(dir);
-    bound.push(b'/');
+    if !dir.is_empty() {
+        bound.extend_from_slice(dir);
+        bound.push(b'/');
+    }
 
     // Everything under `dir` sorts from the bound onwards and is contiguous,
     // so the first path that is not under it ends the range.
@@ -463,7 +437,7 @@ fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8
         if !path.starts_with(bound) {
             break;
         }
-        if node.owner.0 < below {
+        if node.owner.0 < below && *path != ROOT_ENTRY {
             doomed.push(path);
         }
     }
@@ -863,12 +837,27 @@ mod tests {
         assert_eq!(dirs, ["kept"]);
     }
 
+    /// The marker names the rootfs, which is not a path under it, so the tree
+    /// has no key to clear from and used to keep everything.
     #[test]
-    fn whiteout_names_are_recognised() {        assert!(matches!(whiteout(b"dir/.wh..wh..opq"), Some(Whiteout::Opaque(d)) if d == b"dir"));
-        assert!(matches!(whiteout(b".wh..wh..opq"), Some(Whiteout::Opaque(d)) if d.is_empty()));
-        assert!(matches!(whiteout(b"dir/.wh.name"), Some(Whiteout::Named(n)) if n == b"dir/name"));
-        assert!(matches!(whiteout(b".wh.name"), Some(Whiteout::Named(n)) if n == b"name"));
-        assert!(whiteout(b"dir/name").is_none());
-        assert!(whiteout(b"dir/.wh.").is_none());
+    fn an_opaque_whiteout_at_the_top_of_a_layer_clears_the_whole_tree() {
+        let (plan, d) = plan_of(vec![
+            table(&["a", "dir/b"]),
+            layer(vec![file(".wh..wh..opq"), file("kept")]),
+        ]);
+        assert!(plan.is_shadowed(&d[0].digest, b"a"));
+        assert!(plan.is_shadowed(&d[0].digest, b"dir/b"));
+        assert!(!plan.is_shadowed(&d[1].digest, b"kept"));
+    }
+
+    /// It empties the rootfs rather than removing it, so the mode a layer
+    /// gives the rootfs still stands.
+    #[test]
+    fn an_opaque_whiteout_at_the_top_of_a_layer_leaves_the_rootfs() {
+        let dirs = dirs_of(vec![
+            layer(vec![dir("."), dir("gone")]),
+            layer(vec![file(".wh..wh..opq")]),
+        ]);
+        assert_eq!(dirs, ["."]);
     }
 }
