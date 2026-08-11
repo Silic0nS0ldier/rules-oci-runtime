@@ -240,10 +240,17 @@ fn replay(tables: &[Table]) -> BTreeMap<&[u8], Node> {
     for (l, table) in tables.iter().enumerate() {
         for (e, entry) in table.entries.iter().enumerate() {
             match whiteout(&entry.path) {
-                Some(Whiteout::Opaque(dir)) => remove_under(&mut tree, &dir, &mut bound),
+                // A whiteout hides the layers below it and never its own, so
+                // where the marker sits in the layer does not matter.
+                Some(Whiteout::Opaque(dir)) => remove_under(&mut tree, &dir, &mut bound, l),
                 Some(Whiteout::Named(target)) => {
-                    tree.remove(target.as_slice());
-                    remove_under(&mut tree, &target, &mut bound);
+                    if tree
+                        .get(target.as_slice())
+                        .is_some_and(|node| node.owner.0 < l)
+                    {
+                        tree.remove(target.as_slice());
+                    }
+                    remove_under(&mut tree, &target, &mut bound, l);
                 }
                 None => {
                     let node = Node {
@@ -269,7 +276,7 @@ fn replay(tables: &[Table]) -> BTreeMap<&[u8], Node> {
                         // Everything else clears the path first, which takes
                         // the tree underneath it as well.
                         _ => {
-                            remove_under(&mut tree, &entry.path, &mut bound);
+                            remove_under(&mut tree, &entry.path, &mut bound, l + 1);
                             tree.insert(&entry.path, node);
                         }
                     }
@@ -363,13 +370,13 @@ fn whiteout(path: &[u8]) -> Option<Whiteout> {
     Some(Whiteout::Named(named))
 }
 
-/// Drops every entry beneath `dir`, without touching a sibling whose name
-/// merely starts the same way.
+/// Drops every entry beneath `dir` that a layer before `below` put there,
+/// without touching a sibling whose name merely starts the same way.
 ///
 /// Every entry that is not a directory replays through here, so the bound it
 /// seeks from is built in a buffer the caller keeps rather than a fresh pair
 /// of allocations per path.
-fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8>) {
+fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8>, below: usize) {
     bound.clear();
     bound.extend_from_slice(dir);
     bound.push(b'/');
@@ -377,14 +384,16 @@ fn remove_under(tree: &mut BTreeMap<&[u8], Node>, dir: &[u8], bound: &mut Vec<u8
     // Everything under `dir` sorts from the bound onwards and is contiguous,
     // so the first path that is not under it ends the range.
     let mut doomed: Vec<&[u8]> = Vec::new();
-    for (path, _) in tree.range::<[u8], _>((
+    for (path, node) in tree.range::<[u8], _>((
         std::ops::Bound::Included(bound.as_slice()),
         std::ops::Bound::Unbounded,
     )) {
         if !path.starts_with(bound) {
             break;
         }
-        doomed.push(path);
+        if node.owner.0 < below {
+            doomed.push(path);
+        }
     }
     for path in doomed {
         tree.remove(path);

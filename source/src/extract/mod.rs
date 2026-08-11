@@ -13,6 +13,7 @@ mod spans;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -41,6 +42,9 @@ pub struct RootfsExtractor {
     deferred_modes: Vec<(PathBuf, u32)>,
     parents: fsutil::ParentCache,
     plan: plan::Plan,
+    /// What the layer currently being walked has placed. A whiteout hides the
+    /// layers below it, so it has to be able to tell them apart.
+    written: HashSet<PathBuf>,
 }
 
 impl RootfsExtractor {
@@ -52,6 +56,7 @@ impl RootfsExtractor {
             index_dir: index_dir.map(Utf8Path::to_owned),
             deferred_modes: Vec::new(),
             plan: plan::Plan::default(),
+            written: HashSet::new(),
         })
     }
 

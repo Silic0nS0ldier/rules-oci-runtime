@@ -1210,3 +1210,87 @@ fn every_route_agrees_on_an_opaque_whiteout() {
         ],
     );
 }
+
+/// Runs the fixture by each route and hands the resulting rootfs to `check`.
+///
+/// Routes agreeing with each other is not the same as either being right, so a
+/// conformance case says what the tree must hold rather than only that the
+/// routes match.
+fn for_each_route(
+    name: &str,
+    routes: &[Route],
+    layers: &[Vec<u8>],
+    check: impl Fn(Route, &Utf8Path),
+) {
+    for &route in routes {
+        let root = scratch(&format!("{name}-{route:?}"));
+        let rootfs = extract_by(route, &root, layers)
+            .unwrap_or_else(|err| panic!("{name}: {route:?} failed to extract: {err}"));
+        check(route, &rootfs);
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+/// The spec's own example: an opaque whiteout is "applied first, before
+/// creating the new version of `a/b`, regardless of the ordering in which the
+/// whiteout file was encountered". Here it is encountered last.
+#[test]
+fn an_opaque_whiteout_applies_before_the_entries_beside_it() {
+    for_each_route(
+        "opq-ordering",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "a/");
+                append_dir(b, "a/b/");
+                append_dir(b, "a/b/c/");
+                append_file(b, "a/b/c/bar", b"bar");
+            }),
+            tar_of(|b| {
+                append_dir(b, "a/");
+                append_dir(b, "a/b/");
+                append_dir(b, "a/b/c/");
+                append_file(b, "a/b/c/foo", b"foo");
+                append_file(b, "a/.wh..wh..opq", b"");
+            }),
+        ],
+        |route, rootfs| {
+            assert!(
+                !rootfs.join("a/b/c/bar").exists(),
+                "{route:?}: the lower layer's file is hidden"
+            );
+            assert_eq!(
+                fs::read_to_string(rootfs.join("a/b/c/foo")).expect("foo"),
+                "foo",
+                "{route:?}: the marker's own layer is not hidden by it"
+            );
+        },
+    );
+}
+
+/// "Files that are present in the same layer as a whiteout file can only be
+/// hidden by whiteout files in subsequent layers."
+#[test]
+fn a_whiteout_does_not_hide_its_own_layer() {
+    for_each_route(
+        "wh-same-layer",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_file(b, "d/gone", b"lower");
+            }),
+            tar_of(|b| {
+                append_file(b, "d/gone", b"upper");
+                append_file(b, "d/.wh.gone", b"");
+            }),
+        ],
+        |route, rootfs| {
+            assert_eq!(
+                fs::read_to_string(rootfs.join("d/gone")).expect("gone"),
+                "upper",
+                "{route:?}: the whiteout hides the lower layer, not its own"
+            );
+        },
+    );
+}
