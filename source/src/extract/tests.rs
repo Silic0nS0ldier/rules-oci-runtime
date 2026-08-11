@@ -942,6 +942,27 @@ fn a_planned_image_still_applies_its_whiteouts() {
     let _ = fsutil::force_remove_dir_all(root.as_std_path());
 }
 
+/// A body a later layer replaces is skipped, and writing it would have taken
+/// the directory standing at that path with it. Only bodies are skipped, so
+/// the directories underneath were never planned away: they were left for the
+/// write that no longer happens, and a later directory entry keeps a directory
+/// it finds standing.
+#[test]
+fn every_route_agrees_when_a_skipped_body_would_have_cleared_a_directory() {
+    assert_routes_agree(
+        "route-skipped-body-clears",
+        &Route::ALL,
+        &[
+            tar_of(|b| {
+                append_dir(b, "d/");
+                append_dir(b, "d/sub/");
+            }),
+            tar_of(|b| append_file(b, "d", b"file")),
+            tar_of(|b| append_dir(b, "d/")),
+        ],
+    );
+}
+
 /// The ways a layer set can reach the rootfs. Which one runs is decided by
 /// what sidecars sit beside the blobs, so a fixture can be put through all
 /// three and the results compared.

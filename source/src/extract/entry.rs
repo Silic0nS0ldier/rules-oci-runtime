@@ -125,17 +125,23 @@ impl RootfsExtractor {
             // work of the layers below whatever the plan does with the entry.
             self.written.insert(dst.clone());
 
-            // A body a later layer replaces is written and then thrown away,
-            // so the plan takes it out before any of that happens.
-            if kind.is_file() && self.plan.is_shadowed(layer, &relative) {
-                continue;
-            }
-
             if !self.parents.prepare(&dst)? {
                 return Err(Error::UnsafeEntry {
                     layer: layer.to_string(),
                     path: path.display().to_string(),
                 });
+            }
+
+            // A body a later layer replaces is written and then thrown away,
+            // so the plan takes it out before any of that happens. What
+            // writing it would have cleared away still goes: only bodies are
+            // skipped, so a directory standing here was never planned away
+            // and would be left for a write that no longer happens.
+            if kind.is_file() && self.plan.is_shadowed(layer, &relative) {
+                if fsutil::remove_any(&dst)? {
+                    self.parents.forget(&dst);
+                }
+                continue;
             }
 
             let mode = mode_of(entry.header());
