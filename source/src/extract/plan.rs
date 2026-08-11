@@ -24,7 +24,7 @@ use camino::Utf8Path;
 use crate::entries::{Kind, Table};
 use crate::fsutil;
 use crate::image::{Descriptor, parse_digest};
-use crate::log::{log, warning};
+use crate::log::log;
 
 use super::whiteout::{self, Whiteout};
 
@@ -80,21 +80,10 @@ impl Plan {
             let Ok(digest) = parse_digest(&layer.digest) else {
                 return Plan::default();
             };
-            let path = dir.join(format!("{}.entries", digest.hex));
-            let file = match std::fs::File::open(&path) {
-                Ok(file) => file,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Plan::default(),
-                Err(err) => {
-                    warning!("ignoring entry table {path}: {err}");
-                    return Plan::default();
-                }
-            };
-            match Table::read_from(std::io::BufReader::new(file)) {
-                Ok(table) => tables.push(table),
-                Err(err) => {
-                    warning!("ignoring entry table {path}: {err}");
-                    return Plan::default();
-                }
+            let path = crate::sidecar::entries_at(dir, &digest.hex);
+            match crate::sidecar::read(&path, Table::read_from) {
+                Some(table) => tables.push(table),
+                None => return Plan::default(),
             }
         }
         Plan::resolve(layers, tables)
