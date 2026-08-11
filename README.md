@@ -62,6 +62,22 @@ A single Rust binary, the launcher, does all of the work:
 
 Containers share the host network namespace, and each run gets a unique container ID, so concurrent runs of the same target do not interfere.
 
+### Extended attributes
+
+Extended attributes are not restored. The one images use in practice,
+`security.capability`, needs a privilege the extraction does not have when it
+runs rootless, which is the usual case, and no rootless extractor can restore
+it. A container built from such an image therefore does not match it: a binary
+that expected a capability will not have one.
+
+Rather than leave that to be found at runtime, an image whose layers set
+extended attributes is refused. Pass `--strict-xattrs=false`, or set
+`strict_xattrs = False` on the rule, to extract it anyway and drop them; under
+`--verbose` each one is named as it is dropped.
+
+They are rare. Across twelve popular images and roughly 152,000 entries, six
+entries carried one, all of them `security.capability`.
+
 ## Debugging
 
 2 debugging oriented flags exist within the launcher;
@@ -165,6 +181,7 @@ Flags accepted before the container command override the rule attributes:
 | `--tty auto\|true\|false` | Allocate a terminal. Defaults to `auto`. |
 | `--rootless auto\|true\|false` | Use a user namespace. Defaults to `auto`. |
 | `--read-only` | Mount the container root filesystem read-only. |
+| `--strict-xattrs BOOL` | Refuse an image that sets extended attributes. Defaults to `true`. |
 | `--keep-bundle` | Leave the generated bundle on disk for inspection. |
 | `--verbose` | Same as `RULES_OCI_RUNTIME_VERBOSE=1`. |
 

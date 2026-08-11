@@ -45,10 +45,17 @@ pub struct RootfsExtractor {
     /// What the layer currently being walked has placed. A whiteout hides the
     /// layers below it, so it has to be able to tell them apart.
     written: HashSet<PathBuf>,
+    /// Refuse an image that asks for extended attributes, rather than
+    /// extracting one the container will not match.
+    strict_xattrs: bool,
 }
 
 impl RootfsExtractor {
-    pub fn new(rootfs: &Utf8Path, index_dir: Option<&Utf8Path>) -> Result<Self> {
+    pub fn new(
+        rootfs: &Utf8Path,
+        index_dir: Option<&Utf8Path>,
+        strict_xattrs: bool,
+    ) -> Result<Self> {
         fs::create_dir_all(rootfs).io_context(|| format!("creating {rootfs}"))?;
         Ok(RootfsExtractor {
             parents: fsutil::ParentCache::new(rootfs.as_std_path())?,
@@ -57,7 +64,31 @@ impl RootfsExtractor {
             deferred_modes: Vec::new(),
             plan: plan::Plan::default(),
             written: HashSet::new(),
+            strict_xattrs,
         })
+    }
+
+    /// Nothing restores extended attributes. The one that matters,
+    /// `security.capability`, needs a privilege the extractor does not have
+    /// when it runs rootless, which is the usual case.
+    ///
+    /// Reported once per entry, from whichever source saw it: the tables when
+    /// the image resolved, the tar headers when it did not.
+    pub(super) fn report_xattrs(&self, layer: &str, path: &[u8], names: &[u8]) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let attributes = String::from_utf8_lossy(names).replace('\0', ", ");
+        let path = String::from_utf8_lossy(path).into_owned();
+        if self.strict_xattrs {
+            return Err(Error::UnsupportedXattrs {
+                layer: layer.to_string(),
+                path,
+                attributes,
+            });
+        }
+        log!("Not restoring extended attributes on /{path}: {attributes}");
+        Ok(())
     }
 
     /// Resolves the image before extracting it, so that entries a later layer
@@ -71,6 +102,14 @@ impl RootfsExtractor {
         self.plan = plan::Plan::build(self.index_dir.as_deref(), layers);
         if !self.plan.is_resolved() {
             return Ok(());
+        }
+
+        // The tables describe every layer, so this is the whole image in one
+        // pass; the walk reports the same thing when there are no tables.
+        for (descriptor, table) in layers.iter().zip(self.plan.tables()) {
+            for entry in &table.entries {
+                self.report_xattrs(&descriptor.digest, &entry.path, &entry.xattrs)?;
+            }
         }
 
         let root = self.rootfs.clone();

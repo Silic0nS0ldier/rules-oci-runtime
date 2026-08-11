@@ -177,6 +177,10 @@ impl Plan {
         &self.tables[layer]
     }
 
+    pub fn tables(&self) -> &[Table] {
+        &self.tables
+    }
+
     /// True when this layer's copy of `path` is replaced or removed by a later
     /// one, and so never has to be written.
     pub fn is_shadowed(&self, digest: &str, path: &[u8]) -> bool {

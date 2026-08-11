@@ -50,6 +50,12 @@ pub enum Error {
         layer: String,
         path: String,
     },
+    /// An entry carries extended attributes, which are never restored.
+    UnsupportedXattrs {
+        layer: String,
+        path: String,
+        attributes: String,
+    },
     /// The container had no command: the image sets neither `Entrypoint` nor `Cmd`.
     NoCommand,
     /// A launcher symlink could not find the runfiles tree holding its image.
@@ -123,6 +129,16 @@ impl fmt::Display for Error {
             Error::InvalidWhiteout { layer, path } => write!(
                 f,
                 "layer {layer} contains whiteout entry {path:?} that names nothing to remove"
+            ),
+            Error::UnsupportedXattrs {
+                layer,
+                path,
+                attributes,
+            } => write!(
+                f,
+                "layer {layer} sets extended attributes on {path:?} ({attributes}) that cannot be restored, \
+                 so the container would not match the image; pass --strict-xattrs=false, \
+                 or set strict_xattrs = False on the rule, to extract it anyway"
             ),
             Error::NoCommand => write!(
                 f,

@@ -207,7 +207,7 @@ fn extract_indexed(
 ) -> Result<Utf8PathBuf> {
     let layout = Layout::open(root)?;
     let rootfs = root.join("rootfs");
-    let mut extractor = RootfsExtractor::new(&rootfs, index_dir)?;
+    let mut extractor = RootfsExtractor::new(&rootfs, index_dir, false)?;
     extractor.apply_layer(&layout, descriptor)?;
     extractor.finish()?;
     Ok(rootfs)
@@ -794,7 +794,7 @@ fn extract_planned(root: &Utf8Path, layers: &[Vec<u8>]) -> Result<Utf8PathBuf> {
     // manifest the caller passes to the extractor, not in the layout.
     let layout = Layout::open(root)?;
     let rootfs = root.join("rootfs");
-    let mut extractor = RootfsExtractor::new(&rootfs, Some(&index_dir))?;
+    let mut extractor = RootfsExtractor::new(&rootfs, Some(&index_dir), false)?;
     extractor.plan(&descriptors)?;
     for descriptor in &descriptors {
         extractor.apply_layer(&layout, descriptor)?;
@@ -971,7 +971,12 @@ impl Route {
 
 /// Applies `layers` by the given route, installing exactly the sidecars that
 /// route needs.
-fn extract_by(route: Route, root: &Utf8Path, layers: &[Vec<u8>]) -> Result<Utf8PathBuf> {
+fn extract_by(
+    route: Route,
+    root: &Utf8Path,
+    layers: &[Vec<u8>],
+    strict_xattrs: bool,
+) -> Result<Utf8PathBuf> {
     let index_dir = root.join("indexes");
     fs::create_dir_all(&index_dir).expect("index dir");
 
@@ -1004,7 +1009,7 @@ fn extract_by(route: Route, root: &Utf8Path, layers: &[Vec<u8>]) -> Result<Utf8P
         Route::Streaming => None,
         Route::Planned | Route::Spans => Some(index_dir.as_path()),
     };
-    let mut extractor = RootfsExtractor::new(&rootfs, dir)?;
+    let mut extractor = RootfsExtractor::new(&rootfs, dir, strict_xattrs)?;
     extractor.plan(&descriptors)?;
 
     // A route that quietly falls back to another one would compare equal for
@@ -1106,7 +1111,7 @@ fn assert_routes_agree(name: &str, routes: &[Route], layers: &[Vec<u8>]) {
 
     for &route in routes {
         let root = scratch(&format!("{name}-{route:?}"));
-        let rootfs = extract_by(route, &root, layers)
+        let rootfs = extract_by(route, &root, layers, true)
             .unwrap_or_else(|err| panic!("{name}: {route:?} failed to extract: {err}"));
         let tree = snapshot(&rootfs);
 
@@ -1239,7 +1244,7 @@ fn for_each_route(
 ) {
     for &route in routes {
         let root = scratch(&format!("{name}-{route:?}"));
-        let rootfs = extract_by(route, &root, layers)
+        let rootfs = extract_by(route, &root, layers, true)
             .unwrap_or_else(|err| panic!("{name}: {route:?} failed to extract: {err}"));
         check(route, &rootfs);
         let _ = fsutil::force_remove_dir_all(root.as_std_path());
@@ -1330,6 +1335,7 @@ fn a_whiteout_naming_nothing_is_refused() {
                 }),
                 tar_of(|b| append_file(b, "d/.wh.", b"")),
             ],
+            true,
         )
         .expect_err("a whiteout naming nothing must be refused");
 
@@ -1675,39 +1681,58 @@ fn append_with_xattrs(
     append_file(builder, path, body);
 }
 
-/// A layer may carry extended attributes, and we restore none of them: the one
-/// that matters, `security.capability`, needs a privilege the extractor does
-/// not have when it runs rootless, which is the usual case.
-///
-/// What matters is that such a layer extracts rather than failing, since the
-/// attributes sit on entries an image cannot do without.
+/// A layer asking for extended attributes gets none, so by default the image
+/// is refused rather than extracted into a container that will not match it.
 #[test]
-fn extended_attributes_are_dropped_rather_than_fatal() {
-    let capability = [1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    for_each_route(
-        "xattrs",
-        &Route::ALL,
-        &[tar_of(|b| {
-            append_dir(b, "bin/");
-            append_with_xattrs(b, "bin/capable", b"body", &[("security.capability", &capability)]);
-            append_with_xattrs(b, "bin/noted", b"body", &[("user.note", b"hello")]);
-            append_file(b, "bin/plain", b"body");
-        })],
-        |route, rootfs| {
-            for name in ["capable", "noted", "plain"] {
-                let path = rootfs.join("bin").join(name);
-                assert_eq!(
-                    fs::read_to_string(&path).expect(name),
-                    "body",
-                    "{route:?}: {name} extracts whatever it carries"
-                );
-                assert!(
-                    xattr_names(&path).is_empty(),
-                    "{route:?}: {name} keeps no attributes"
-                );
+fn a_layer_setting_extended_attributes_is_refused() {
+    for route in Route::ALL {
+        let root = scratch(&format!("xattr-strict-{route:?}"));
+        let err = extract_by(route, &root, &xattr_layers(), true)
+            .expect_err("an image asking for attributes must be refused");
+        match err {
+            Error::UnsupportedXattrs { attributes, .. } => {
+                assert_eq!(attributes, "security.capability")
             }
-        },
-    );
+            other => panic!("{route:?}: expected unsupported attributes, got {other:?}"),
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+/// Told to carry on, the layer extracts whole and simply keeps no attributes.
+/// They sit on entries an image cannot do without, so dropping the attribute
+/// must not drop the file.
+#[test]
+fn extended_attributes_are_dropped_when_the_image_is_taken_anyway() {
+    for route in Route::ALL {
+        let root = scratch(&format!("xattr-lenient-{route:?}"));
+        let rootfs = extract_by(route, &root, &xattr_layers(), false)
+            .unwrap_or_else(|err| panic!("{route:?} failed to extract: {err}"));
+
+        for name in ["capable", "noted", "plain"] {
+            let path = rootfs.join("bin").join(name);
+            assert_eq!(
+                fs::read_to_string(&path).expect(name),
+                "body",
+                "{route:?}: {name} extracts whatever it carries"
+            );
+            assert!(
+                xattr_names(&path).is_empty(),
+                "{route:?}: {name} keeps no attributes"
+            );
+        }
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+fn xattr_layers() -> Vec<Vec<u8>> {
+    let capability = [1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    vec![tar_of(|b| {
+        append_dir(b, "bin/");
+        append_with_xattrs(b, "bin/capable", b"body", &[("security.capability", &capability)]);
+        append_with_xattrs(b, "bin/noted", b"body", &[("user.note", b"hello")]);
+        append_file(b, "bin/plain", b"body");
+    })]
 }
 
 fn xattr_names(path: &Utf8Path) -> Vec<String> {

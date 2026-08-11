@@ -237,7 +237,7 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
 ///
 /// Only the names: the values can be large, nothing restores them, and the
 /// names are all a reader needs to say what an image asked for and did not get.
-fn xattr_names(entry: &mut tar::Entry<'_, impl Read>) -> io::Result<Vec<u8>> {
+pub fn xattr_names(entry: &mut tar::Entry<'_, impl Read>) -> io::Result<Vec<u8>> {
     let Some(extensions) = entry.pax_extensions()? else {
         return Ok(Vec::new());
     };

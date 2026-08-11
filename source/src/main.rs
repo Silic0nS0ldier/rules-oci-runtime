@@ -82,7 +82,7 @@ fn run(args: RunArgs) -> Result<i32> {
     log!("Using {} for the container bundle", bundle.dir());
 
     let rootfs = bundle.rootfs();
-    let mut extractor = RootfsExtractor::new(&rootfs, args.index.as_deref())?;
+    let mut extractor = RootfsExtractor::new(&rootfs, args.index.as_deref(), args.strict_xattrs)?;
     extractor.plan(&manifest.layers)?;
     extractor.apply(&layout, &manifest.layers)?;
 
