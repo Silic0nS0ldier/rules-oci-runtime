@@ -45,18 +45,33 @@ impl RootfsExtractor {
                     .as_ref(),
             );
 
+            // `./` names the rootfs, which the tables spell the one way they
+            // can hold it.
+            let names_the_root = fsutil::names_the_root(path.as_os_str().as_bytes());
+            if names_the_root {
+                relative.clear();
+                relative.push(b'.');
+            } else if !fsutil::canonical_entry_path(path.as_os_str().as_bytes(), &mut relative) {
+                return Err(Error::UnsafeEntry {
+                    layer: layer.to_string(),
+                    path: path.display().to_string(),
+                });
+            }
+
             // A resolved image had every table read up front, so reporting
-            // here as well would say it twice.
+            // here as well would say it twice. Reported on the canonical path
+            // rather than the layer's spelling of it, which is the form the
+            // tables hold and so the one the other route reports.
             if !self.plan.is_resolved() {
                 let names = crate::entries::xattr_names(&mut entry)
                     .io_context(|| format!("reading entry attributes in layer {layer}"))?;
-                self.report_xattrs(layer, path.as_os_str().as_bytes(), &names)?;
+                self.report_xattrs(layer, &relative, &names)?;
             }
 
-            // `./` names the rootfs, so there is nothing to place: the mode it
-            // carries is deferred like any other directory's, and a layer
-            // naming the root as anything but a directory is refused.
-            if fsutil::names_the_root(path.as_os_str().as_bytes()) {
+            // Nothing to place at the rootfs: the mode it carries is deferred
+            // like any other directory's, and a layer naming the root as
+            // anything but a directory is refused.
+            if names_the_root {
                 if Kind::of(entry.header()) != Kind::Directory {
                     return Err(Error::UnsafeEntry {
                         layer: layer.to_string(),
@@ -68,12 +83,6 @@ impl RootfsExtractor {
                 continue;
             }
 
-            if !fsutil::canonical_entry_path(path.as_os_str().as_bytes(), &mut relative) {
-                return Err(Error::UnsafeEntry {
-                    layer: layer.to_string(),
-                    path: path.display().to_string(),
-                });
-            }
             fsutil::join_under(root, &relative, &mut dst);
 
             match whiteout::of(&relative) {

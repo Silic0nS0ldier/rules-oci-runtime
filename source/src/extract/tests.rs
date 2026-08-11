@@ -2005,6 +2005,9 @@ fn a_layer_rooted_at_dot_extracts_its_entries() {
 
 /// Writes a PAX extended header ahead of `path`, which is how a layer carries
 /// extended attributes: one `SCHILY.xattr.<name>` record per attribute.
+///
+/// The name is written into the header directly, so a path spelled `./x`
+/// reaches the extractor that way rather than having its `.` stripped.
 fn append_with_xattrs(
     builder: &mut tar::Builder<Vec<u8>>,
     path: &str,
@@ -2035,11 +2038,15 @@ fn append_with_xattrs(
     header.set_cksum();
     builder.append(&header, &records[..]).expect("pax header");
 
-    append_file(builder, path, body);
+    append_file_named(builder, path.as_bytes(), body);
 }
 
 /// A layer asking for extended attributes gets none, so by default the image
 /// is refused rather than extracted into a container that will not match it.
+///
+/// The path is asserted as well as the attributes: the tables hold a canonical
+/// path and the walk reads the layer's own spelling of it, so this is where
+/// the two would drift apart.
 #[test]
 fn a_layer_setting_extended_attributes_is_refused() {
     for route in Route::ALL {
@@ -2047,8 +2054,11 @@ fn a_layer_setting_extended_attributes_is_refused() {
         let err = extract_by(route, &root, &xattr_layers(), true)
             .expect_err("an image asking for attributes must be refused");
         match err {
-            Error::UnsupportedXattrs { attributes, .. } => {
-                assert_eq!(attributes, "security.capability")
+            Error::UnsupportedXattrs {
+                attributes, path, ..
+            } => {
+                assert_eq!(attributes, "security.capability");
+                assert_eq!(path, "bin/capable", "{route:?}")
             }
             other => panic!("{route:?}: expected unsupported attributes, got {other:?}"),
         }
@@ -2087,15 +2097,15 @@ fn xattr_layers() -> Vec<Vec<u8>> {
         1u8, 0, 0, 2, 0, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     vec![tar_of(|b| {
-        append_dir(b, "bin/");
+        append_dir(b, "./bin/");
         append_with_xattrs(
             b,
-            "bin/capable",
+            "./bin/capable",
             b"body",
             &[("security.capability", &capability)],
         );
-        append_with_xattrs(b, "bin/noted", b"body", &[("user.note", b"hello")]);
-        append_file(b, "bin/plain", b"body");
+        append_with_xattrs(b, "./bin/noted", b"body", &[("user.note", b"hello")]);
+        append_file(b, "./bin/plain", b"body");
     })]
 }
 
