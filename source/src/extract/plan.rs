@@ -437,6 +437,7 @@ mod tests {
             size: 1,
             path: path.as_bytes().to_vec(),
             link: Vec::new(),
+            xattrs: Vec::new(),
         }
     }
 

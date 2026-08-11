@@ -13,8 +13,14 @@ implementation someone else read, which is the only way to catch a clause we
 have misread the same way twice.
 
 umoci is downloaded as a pinned binary, so nothing here needs a Go toolchain.
-Both sides run rootless, so uid, gid and extended attributes are not compared:
-neither can set them.
+Both sides run rootless, so uid and gid are not compared: neither can set them.
+
+Extended attributes are not compared either, but for a different reason. Neither
+side can restore `security.capability` without privileges we do not have, so
+they agree there. umoci does restore `user.*` attributes and the launcher
+restores nothing, so they disagree there. No image measured carries a `user.*`
+attribute, and the launcher's side of that is pinned by a unit test rather than
+here.
 
 Each case lives in [cases.sh](cases.sh) as a `case_<name>` function and is
 exposed as a separate `sh_test` target. A case builds its layers with `tar`,
