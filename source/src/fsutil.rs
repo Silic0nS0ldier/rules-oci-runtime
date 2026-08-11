@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::ops::Bound;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -225,7 +226,7 @@ impl ParentCache {
     pub fn forget(&mut self, path: &Path) {
         let doomed: Vec<PathBuf> = self
             .verified
-            .range(path.to_path_buf()..)
+            .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
             .take_while(|p| p.starts_with(path))
             .cloned()
             .collect();
