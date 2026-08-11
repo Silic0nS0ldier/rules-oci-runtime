@@ -96,10 +96,6 @@ impl RootfsExtractor {
     /// Resolves the image before extracting it, so that entries a later layer
     /// replaces are never written. Without an entry table for every layer this
     /// plans nothing and each layer is placed in full, as before.
-    ///
-    /// The directories the image ends up with are created here rather than
-    /// discovered a layer at a time, so nothing later has to work out where an
-    /// entry can go.
     pub fn plan(&mut self, layers: &[Descriptor]) -> Result<()> {
         self.plan = plan::Plan::build(self.index_dir.as_deref(), layers);
         if !self.plan.is_resolved() {
@@ -113,7 +109,18 @@ impl RootfsExtractor {
                 self.report_xattrs(&descriptor.digest, &entry.path, &entry.xattrs)?;
             }
         }
+        Ok(())
+    }
 
+    /// Creates the directories the image ends up with, so that nothing placing
+    /// an entry has to work out where it can go.
+    ///
+    /// Only for the route that places entries straight from the plan: a walk
+    /// builds the tree as it goes, and a tree standing before the first layer
+    /// runs is a tree the layers can see. A symlink resolving to a directory
+    /// that will not exist until a later layer is kept rather than replaced,
+    /// which is a different image.
+    fn create_planned_directories(&mut self) -> Result<()> {
         let root = self.rootfs.clone();
         let mut path = PathBuf::new();
         for (relative, mode) in self.plan.directories() {
@@ -133,7 +140,7 @@ impl RootfsExtractor {
     /// layer at a time, which is what has to happen when the plan cannot say
     /// where an entry ends up without building the tree to find out.
     pub fn apply(&mut self, layout: &Layout, descriptors: &[Descriptor]) -> Result<()> {
-        if let Some(work) = self.plan.work() {
+        if self.plan.work().is_some() {
             // Every layer needs a checkpoint index, since a span is where a
             // worker starts inflating. One checkpoint is enough: it means the
             // layer is one span.
@@ -143,6 +150,8 @@ impl RootfsExtractor {
                 .map(|dir| descriptors.iter().map(|d| index_at(dir, d)).collect())
                 .unwrap_or_default();
             if let Some(indexes) = indexes {
+                self.create_planned_directories()?;
+                let work = self.plan.work().expect("the work this route needs");
                 return spans::extract(&self.rootfs, layout, descriptors, &self.plan, work, indexes);
             }
         }
