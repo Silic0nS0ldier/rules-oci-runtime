@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 const MTIME: u64 = 1_700_000_000;
 
 const GZIP_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+const ZSTD_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 
@@ -51,6 +52,31 @@ struct Args {
     /// Layers compressed at once. Each worker holds one whole layer.
     #[arg(long, value_name = "N")]
     workers: Option<usize>,
+
+    /// How the layers are compressed.
+    #[arg(long, value_enum, default_value_t = Packing::Gzip)]
+    compression: Packing,
+
+    /// Uncompressed bytes per zstd frame. A frame boundary is the only place
+    /// a zstd span can start, so this decides how far the layer parallelises:
+    /// a layer smaller than this is one frame, as `bsdtar` writes them.
+    #[arg(long, value_name = "BYTES", default_value_t = 64 << 20)]
+    frame_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Packing {
+    Gzip,
+    Zstd,
+}
+
+impl Packing {
+    fn media_type(self) -> &'static str {
+        match self {
+            Packing::Gzip => GZIP_LAYER,
+            Packing::Zstd => ZSTD_LAYER,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -242,7 +268,13 @@ fn build(args: &Args) -> io::Result<()> {
         // Each worker holds a whole layer, uncompressed and compressed.
         .min(4);
 
-    let built = compress(&layers, &args.output, workers)?;
+    let built = compress(
+        &layers,
+        &args.output,
+        workers,
+        args.compression,
+        args.frame_bytes,
+    )?;
 
     let diff_ids: Vec<String> = built.iter().map(|blob| blob.diff_id.clone()).collect();
     let config = serde_json::json!({
@@ -262,7 +294,7 @@ fn build(args: &Args) -> io::Result<()> {
             "size": config_size,
         },
         "layers": built.iter().map(|blob| serde_json::json!({
-            "mediaType": GZIP_LAYER,
+            "mediaType": args.compression.media_type(),
             "digest": blob.digest,
             "size": blob.size,
         })).collect::<Vec<_>>(),
@@ -645,6 +677,8 @@ fn compress(
     layers: &[Vec<Entry>],
     output: &Utf8Path,
     workers: usize,
+    packing: Packing,
+    frame_bytes: usize,
 ) -> io::Result<Vec<LayerBlob>> {
     let built: Mutex<Vec<Option<LayerBlob>>> =
         Mutex::new((0..layers.len()).map(|_| None).collect());
@@ -659,7 +693,7 @@ fn compress(
                     if index >= layers.len() {
                         return;
                     }
-                    match build_layer(&layers[index], output) {
+                    match build_layer(&layers[index], output, packing, frame_bytes) {
                         Ok(blob) => built.lock().expect("built")[index] = Some(blob),
                         Err(err) => {
                             *failure.lock().expect("failure") = Some(err);
@@ -682,7 +716,12 @@ fn compress(
         .collect())
 }
 
-fn build_layer(entries: &[Entry], output: &Utf8Path) -> io::Result<LayerBlob> {
+fn build_layer(
+    entries: &[Entry],
+    output: &Utf8Path,
+    packing: Packing,
+    frame_bytes: usize,
+) -> io::Result<LayerBlob> {
     // Straight to disk rather than into a buffer: the base layer of the full
     // profile is a few hundred megabytes on its own, and several workers hold
     // one each.
@@ -691,9 +730,14 @@ fn build_layer(entries: &[Entry], output: &Utf8Path) -> io::Result<LayerBlob> {
     let staging = blobs.join(format!("partial.{}", NEXT.fetch_add(1, Ordering::Relaxed)));
 
     let file = io::BufWriter::new(fs::File::create(&staging)?);
-    let encoder = GzBuilder::new()
-        .mtime(0)
-        .write(Hashing::new(file), Compression::new(6));
+    let encoder = match packing {
+        Packing::Gzip => Encoder::Gzip(
+            GzBuilder::new()
+                .mtime(0)
+                .write(Hashing::new(file), Compression::new(6)),
+        ),
+        Packing::Zstd => Encoder::Zstd(FrameWriter::new(Hashing::new(file), frame_bytes)),
+    };
     let mut builder = tar::Builder::new(Hashing::new(encoder));
     for entry in entries {
         append(&mut builder, entry)?;
@@ -712,6 +756,89 @@ fn build_layer(entries: &[Entry], output: &Utf8Path) -> io::Result<LayerBlob> {
         diff_id: format!("sha256:{diff_id}"),
         size,
     })
+}
+
+/// The compressor a layer's tar stream is written through.
+enum Encoder<W: io::Write> {
+    Gzip(flate2::write::GzEncoder<W>),
+    Zstd(FrameWriter<W>),
+}
+
+impl<W: io::Write> Encoder<W> {
+    fn finish(self) -> io::Result<W> {
+        match self {
+            Encoder::Gzip(encoder) => encoder.finish(),
+            Encoder::Zstd(writer) => writer.finish(),
+        }
+    }
+}
+
+impl<W: io::Write> io::Write for Encoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Encoder::Gzip(encoder) => encoder.write(buf),
+            Encoder::Zstd(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Encoder::Gzip(encoder) => encoder.flush(),
+            Encoder::Zstd(writer) => writer.flush(),
+        }
+    }
+}
+
+/// Writes zstd frames of a bounded uncompressed size, the way `pzstd` and the
+/// seekable format do. Each frame is what a span can start at, so this is the
+/// knob that decides whether an indexed zstd layer parallelises at all.
+struct FrameWriter<W: io::Write> {
+    inner: W,
+    pending: Vec<u8>,
+    limit: usize,
+}
+
+impl<W: io::Write> FrameWriter<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        FrameWriter {
+            inner,
+            pending: Vec::new(),
+            limit: limit.max(1),
+        }
+    }
+
+    fn emit(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        // `ruzstd` implements only the fastest level, so these frames compress
+        // worse than a real layer's. What is being measured is the decoder.
+        let frame = ruzstd::encoding::compress_to_vec(
+            &self.pending[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        self.pending.clear();
+        self.inner.write_all(&frame)
+    }
+
+    fn finish(mut self) -> io::Result<W> {
+        self.emit()?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: io::Write> io::Write for FrameWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        if self.pending.len() >= self.limit {
+            self.emit()?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Hashes and counts everything on its way through.
