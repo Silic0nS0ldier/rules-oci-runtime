@@ -196,37 +196,41 @@ impl RootfsExtractor {
         }
 
         let file = layout.open_blob(descriptor)?;
-        let digest = descriptor.digest.clone();
+        let digest = &descriptor.digest;
         let (sender, receiver) = sync_channel(PIPELINE_DEPTH);
         let (pool, ret) = buffer_pool();
         // Indexed spans are sized by the index rather than by CHUNK_BYTES, so
         // there is nothing for the streaming pool to hand them back to.
         let ret = index.is_none().then_some(ret);
-        let owned = descriptor.clone();
-        let inflate = thread::spawn(move || match index {
-            Some(index) => inflate_indexed(file, &index, &owned, Sink::new(sender)),
-            None => inflate_blob(file, &owned, Sink::new(sender), pool),
-        });
+        // Scoped, so the inflater reads the caller's descriptor and index
+        // where a detached thread would have needed copies of both.
+        thread::scope(|scope| {
+            let index = &index;
+            let inflate = scope.spawn(move || match index {
+                Some(index) => inflate_indexed(file, index, descriptor, Sink::new(sender)),
+                None => inflate_blob(file, descriptor, Sink::new(sender), pool),
+            });
 
-        let mut reader = ChunkReader::new(receiver, ret);
-        let mut unpacked = self.unpack(&mut reader, &digest);
-        if unpacked.is_ok() {
-            // The tar stream ends at its marker, but the digest covers the blob.
-            unpacked = io::copy(&mut reader, &mut io::sink())
-                .map(|_| ())
-                .io_context(|| format!("reading layer {digest}"));
-        }
-        // Releasing the receiver lets the inflater stop early when unpacking failed.
-        drop(reader);
+            let mut reader = ChunkReader::new(receiver, ret);
+            let mut unpacked = self.unpack(&mut reader, digest);
+            if unpacked.is_ok() {
+                // The tar stream ends at its marker, but the digest covers the blob.
+                unpacked = io::copy(&mut reader, &mut io::sink())
+                    .map(|_| ())
+                    .io_context(|| format!("reading layer {digest}"));
+            }
+            // Releasing the receiver lets the inflater stop early when unpacking failed.
+            drop(reader);
 
-        match inflate.join() {
-            // An unverified blob explains any unpacking failure, so it wins.
-            Ok(inflated) => inflated.and(unpacked),
-            Err(_) => Err(Error::io(
-                "decompressing a layer",
-                io::Error::other("the decompression thread panicked"),
-            )),
-        }
+            match inflate.join() {
+                // An unverified blob explains any unpacking failure, so it wins.
+                Ok(inflated) => inflated.and(unpacked),
+                Err(_) => Err(Error::io(
+                    "decompressing a layer",
+                    io::Error::other("the decompression thread panicked"),
+                )),
+            }
+        })
     }
 
     /// Applies the recorded directory permissions, deepest first.
