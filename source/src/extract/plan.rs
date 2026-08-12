@@ -413,8 +413,18 @@ fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
                         // the tree underneath it as well.
                         _ => {
                             ensure_parents(&mut tree, &entry.path, (l, e));
-                            remove_under(&mut tree, &entry.path, &mut bound, Removal::Whole);
-                            tree.insert(&entry.path, node);
+                            if entry.kind == Kind::HardLink && entry.link == entry.path {
+                                // The copy standing here is the one the link
+                                // names, so the path keeps its owner and what
+                                // is under it. Naming it again is still what a
+                                // whiteout later in this layer goes by.
+                                if let Some(at) = tree.get_mut(entry.path.as_slice()) {
+                                    at.named_by = Some(l);
+                                }
+                            } else {
+                                remove_under(&mut tree, &entry.path, &mut bound, Removal::Whole);
+                                tree.insert(&entry.path, node);
+                            }
                         }
                     }
                 }
@@ -497,10 +507,11 @@ fn links_somewhere(tree: &BTreeMap<&[u8], Node>, tables: &[Table], entry: &Entry
         // A hard link is made against what is on disk, which is what the tree
         // holds at this point. A directory cannot be linked, and nothing was
         // placed for a type the extractor does not support. Nor can a link
-        // name itself or anything under itself: the walk clears the path
-        // before linking, which takes the copy it was about to link to.
+        // name anything under itself: the walk clears the path before linking,
+        // which takes the copy it was about to link to. Naming the path itself
+        // is the one case the walk leaves alone.
         Kind::HardLink
-            if names_itself(&entry.path, &entry.link)
+            if under_itself(&entry.path, &entry.link)
                 || under(tree, tables, &entry.link) != Blocked::Nothing
                 || !tree.get(entry.link.as_slice()).is_some_and(|node| {
                     !matches!(node.kind, Kind::Directory | Kind::Unsupported)
@@ -533,7 +544,12 @@ fn ensure_parents<'a>(tree: &mut BTreeMap<&'a [u8], Node>, path: &'a [u8], owner
 
 /// True when `target` is `path` or something under it.
 fn names_itself(path: &[u8], target: &[u8]) -> bool {
-    target == path || (target.starts_with(path) && target.get(path.len()) == Some(&b'/'))
+    target == path || under_itself(path, target)
+}
+
+/// True when `target` is something under `path`.
+fn under_itself(path: &[u8], target: &[u8]) -> bool {
+    target.starts_with(path) && target.get(path.len()) == Some(&b'/')
 }
 
 /// The directories the final tree needs, parents before children.

@@ -180,16 +180,43 @@ impl RootfsExtractor {
                 continue;
             }
 
+            let unsafe_entry = || Error::UnsafeEntry {
+                layer: layer.to_string(),
+                path: path.display().to_string(),
+            };
+
+            // A hard link is made against what is on disk, so its target is
+            // resolved before the path is cleared below: a link naming its own
+            // path would otherwise lose the copy it names.
+            let source = if kind == Kind::HardLink {
+                let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
+                // A hard link names an earlier entry of the same archive,
+                // so it is rooted at the rootfs like any other entry path.
+                let mut canonical = Vec::new();
+                if !fsutil::canonical_entry_path(target.as_os_str().as_bytes(), &mut canonical) {
+                    return Err(unsafe_entry());
+                }
+                let mut source = PathBuf::new();
+                fsutil::join_under(root, &canonical, &mut source);
+                if !self.parents.contains_parent_of(&source)? {
+                    return Err(unsafe_entry());
+                }
+                Some(source)
+            } else {
+                None
+            };
+
+            // `tar` writes a path given to it twice as a hard link to itself.
+            // What stands there is the copy the entry names, so it stays.
+            if source.as_deref() == Some(dst.as_path()) && fs::symlink_metadata(&dst).is_ok() {
+                continue;
+            }
+
             // Replacing whatever is here is what `set_overwrite` bought from
             // `tar`, and the link calls below will not do it themselves.
             if fsutil::remove_any(&dst)? {
                 self.parents.forget(&dst);
             }
-
-            let unsafe_entry = || Error::UnsafeEntry {
-                layer: layer.to_string(),
-                path: path.display().to_string(),
-            };
 
             match kind {
                 Kind::Symlink => {
@@ -199,19 +226,7 @@ impl RootfsExtractor {
                         .io_context(|| extracting(layer, path.as_os_str().as_bytes()))?;
                 }
                 Kind::HardLink => {
-                    let target = link_name(&entry, layer)?.ok_or_else(unsafe_entry)?;
-                    // A hard link names an earlier entry of the same archive,
-                    // so it is rooted at the rootfs like any other entry path.
-                    let target = target.as_os_str().as_bytes();
-                    let mut canonical = Vec::new();
-                    if !fsutil::canonical_entry_path(target, &mut canonical) {
-                        return Err(unsafe_entry());
-                    }
-                    let mut source = PathBuf::new();
-                    fsutil::join_under(root, &canonical, &mut source);
-                    if !self.parents.contains_parent_of(&source)? {
-                        return Err(unsafe_entry());
-                    }
+                    let source = source.expect("a hard link resolves its target above");
                     fs::hard_link(&source, &dst)
                         .io_context(|| extracting(layer, path.as_os_str().as_bytes()))?;
                 }

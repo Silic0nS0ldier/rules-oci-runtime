@@ -1237,6 +1237,71 @@ fn every_route_agrees_on_a_hard_link_naming_another_hard_link() {
     );
 }
 
+/// `tar` given the same path twice writes the second occurrence as a hard link
+/// naming that very path, so an archive built by hand or by a careless script
+/// holds one. The copy already standing there is what the link names, and
+/// clearing the path first would take it: GNU tar keeps the file, and so does
+/// this. (umoci refuses such a layer outright, which is why no conformance
+/// fixture holds the two to each other here.)
+#[test]
+fn every_route_agrees_when_a_hard_link_names_its_own_path() {
+    assert_routes_agree(
+        "route-self-hard-link",
+        &Route::ALL,
+        &[tar_of(|b| {
+            append_dir(b, "etc/");
+            append_file(b, "etc/config", b"body");
+            append_hard_link(b, "etc/config", "etc/config");
+        })],
+    );
+}
+
+/// The layer's own copy is what survives, whatever the layer below left there.
+#[test]
+fn a_hard_link_naming_its_own_path_keeps_the_file_beside_it() {
+    for route in Route::ALL {
+        let root = scratch(&format!("self-hard-link-{route:?}"));
+        let rootfs = extract_by(
+            route,
+            &root,
+            &[
+                tar_of(|b| append_file(b, "kept", b"lower")),
+                tar_of(|b| {
+                    append_file(b, "kept", b"upper");
+                    append_hard_link(b, "kept", "kept");
+                }),
+            ],
+            true,
+        )
+        .unwrap_or_else(|err| panic!("{route:?}: {err}"));
+        assert_eq!(
+            fs::read_to_string(rootfs.join("kept")).expect("kept"),
+            "upper",
+            "{route:?}: the entry the link names"
+        );
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+/// Nothing has appeared at the path for the link to name, so there is nothing
+/// to keep and every route says so rather than leaving the path empty.
+#[test]
+fn a_hard_link_naming_its_own_path_with_nothing_there_is_refused() {
+    for route in Route::ALL {
+        let root = scratch(&format!("dangling-self-hard-link-{route:?}"));
+        let (result, _) = apply_by(
+            route,
+            &root,
+            &[tar_of(|b| append_hard_link(b, "gone", "gone"))],
+        );
+        assert!(
+            result.is_err(),
+            "{route:?} extracted a hard link naming a path nothing placed"
+        );
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
 /// The ways a layer set can reach the rootfs. Which one runs is decided by
 /// what sidecars sit beside the blobs, so a fixture can be put through all
 /// three and the results compared.
