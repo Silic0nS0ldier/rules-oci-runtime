@@ -10,6 +10,7 @@ container="${runfiles}/${CONTAINER}"
 configured_container="${runfiles}/${CONFIGURED_CONTAINER}"
 read_only_container="${runfiles}/${READ_ONLY_CONTAINER}"
 mounting_container="${runfiles}/${MOUNTING_CONTAINER}"
+zstd_container="${runfiles}/${ZSTD_CONTAINER}"
 
 failures=0
 
@@ -175,6 +176,27 @@ case_layer_indexes() {
     fail "container failed"
   stderr=$(cat "${TEST_TMPDIR}/index.err")
   assert_contains "$stderr" "checkpoints" "layers extract via their indexes"
+}
+
+# A zstd layer on a gzip base: compression is a property of the layer, and
+# `oci_image` writes whichever the archive it was handed uses.
+case_zstd_layer() {
+  local output stderr
+  output=$(RULES_OCI_RUNTIME_VERBOSE=1 "$zstd_container" \
+    /bin/sh -c 'cat /zstd-marker; cat /etc/alpine-release' \
+    </dev/null 2>"${TEST_TMPDIR}/zstd.err")
+  assert_contains "$output" "from-the-zstd-layer" "the file the zstd layer adds"
+  assert_contains "$output" "3.22" "the gzip base underneath it"
+
+  # Without this the case would pass on a gzip layer too, which is what
+  # `oci_image` writes if the archive is not the one we think it is.
+  stderr=$(cat "${TEST_TMPDIR}/zstd.err")
+  assert_contains "$stderr" "tar+zstd" "a zstd layer was extracted"
+
+  # Only gzip layers are indexed at build time, so one zstd layer leaves the
+  # image short of the checkpoints the parallel route needs.
+  assert_contains "$stderr" "Extracting layer" "the image is walked layer by layer"
+  assert_not_contains "$stderr" "units on" "no span route without an index per layer"
 }
 
 case_rootfs_contents() {

@@ -1,5 +1,7 @@
+load("@rules_oci//oci:defs.bzl", "oci_image")
 load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("@tar.bzl", "tar")
 
 runc_binary(
     name = "container",
@@ -30,6 +32,29 @@ runc_binary(
     mounts = ["$TEST_TMPDIR/rule-mount:/rule-data:ro"],
 )
 
+# `oci_image` reads the compression off the archive itself, so a `.tar.zst`
+# layer becomes an `application/vnd.oci.image.layer.v1.tar+zstd` blob.
+tar(
+    name = "marker_layer",
+    srcs = ["zstd_marker.txt"],
+    compress = "zstd",
+    mtree = [
+        "zstd-marker uid=0 gid=0 mode=0644 time=0 type=file content=$(location zstd_marker.txt)",
+    ],
+)
+
+# The base layers stay gzip, so this is an image of both compressions.
+oci_image(
+    name = "zstd_image",
+    base = "@alpine",
+    tars = [":marker_layer"],
+)
+
+runc_binary(
+    name = "zstd_container",
+    image = ":zstd_image",
+)
+
 CASES = [
     "cleanup",
     "command_override",
@@ -49,6 +74,7 @@ CASES = [
     "signal_forwarding",
     "stdin_is_piped",
     "verbose_logging",
+    "zstd_layer",
 ]
 
 [
@@ -61,12 +87,14 @@ CASES = [
             ":container",
             ":mounting_container",
             ":read_only_container",
+            ":zstd_container",
         ],
         env = {
             "CONFIGURED_CONTAINER": "$(rlocationpath :configured_container)",
             "CONTAINER": "$(rlocationpath :container)",
             "MOUNTING_CONTAINER": "$(rlocationpath :mounting_container)",
             "READ_ONLY_CONTAINER": "$(rlocationpath :read_only_container)",
+            "ZSTD_CONTAINER": "$(rlocationpath :zstd_container)",
         },
         # Containers need user namespaces, which the Bazel sandbox does not nest.
         tags = [
