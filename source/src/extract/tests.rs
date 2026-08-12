@@ -109,6 +109,7 @@ fn recycled_buffers_do_not_leak_the_previous_chunk() {
 }
 
 const GZIP_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+const ZSTD_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 const PLAIN_LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
 
 fn scratch(name: &str) -> Utf8PathBuf {
@@ -165,6 +166,13 @@ fn gzip(bytes: &[u8]) -> Vec<u8> {
     encoder.finish().expect("compress")
 }
 
+/// One zstd frame. The encoder is `ruzstd`'s own, so these tests hold the
+/// wiring rather than the format; blobs from another implementation are what
+/// the conformance and smoke modules run.
+fn zstd(bytes: &[u8]) -> Vec<u8> {
+    ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest)
+}
+
 /// Writes a blob and returns a descriptor that matches it.
 fn install_blob(root: &Utf8Path, media_type: &str, blob: &[u8]) -> Descriptor {
     let hex = hex_encode(&Sha256::digest(blob));
@@ -206,6 +214,7 @@ fn extract_indexed(
 fn layers_are_unpacked_while_they_are_inflated() {
     for (name, media_type, blob) in [
         ("gzip", GZIP_LAYER, gzip(&sample_tar())),
+        ("zstd", ZSTD_LAYER, zstd(&sample_tar())),
         ("plain", PLAIN_LAYER, sample_tar()),
     ] {
         let root = scratch(&format!("pipeline-{name}"));
@@ -584,6 +593,83 @@ fn a_corrupt_blob_is_reported_rather_than_hanging() {
 }
 
 #[test]
+fn a_zstd_blob_that_does_not_match_its_digest_is_rejected() {
+    let root = scratch("zstd-digest");
+    let mut descriptor = install_blob(&root, ZSTD_LAYER, &zstd(&sample_tar()));
+
+    let mut altered = sample_tar();
+    altered.extend_from_slice(&[0u8; 1024]);
+    let altered = zstd(&altered);
+    let path = Layout::open(&root)
+        .expect("layout")
+        .blob_path(&descriptor.digest)
+        .expect("blob path");
+    fs::write(&path, &altered).expect("blob");
+    descriptor.size = altered.len() as u64;
+
+    match extract(&root, &descriptor) {
+        Err(Error::DigestMismatch { .. }) => {}
+        other => panic!("expected a digest mismatch, got {other:?}"),
+    }
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+#[test]
+fn a_corrupt_zstd_blob_is_reported_rather_than_hanging() {
+    let root = scratch("zstd-corrupt");
+    let mut blob = zstd(&sample_tar());
+    let tail = blob.len() - 64;
+    blob[tail..].fill(0xff);
+    let descriptor = install_blob(&root, ZSTD_LAYER, &blob);
+    assert!(extract(&root, &descriptor).is_err());
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+#[test]
+fn a_truncated_zstd_blob_is_reported() {
+    let root = scratch("zstd-truncated");
+    let mut blob = zstd(&sample_tar());
+    blob.truncate(blob.len() / 2);
+    let descriptor = install_blob(&root, ZSTD_LAYER, &blob);
+    assert!(
+        extract(&root, &descriptor).is_err(),
+        "half a frame must not pass for a layer"
+    );
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+/// A zstd blob may be several frames back to back, as any tool that
+/// compresses in parallel writes. The whole blob is one tar stream.
+///
+/// Ignored: `ruzstd`'s `StreamingDecoder` returns `Ok(0)` as soon as one frame
+/// finishes and never starts the next, so such a layer fails here with
+/// "unexpected EOF during skip". `MultiGzDecoder` already spans gzip members;
+/// zstd needs the same adapter.
+#[test]
+#[ignore = "multi-frame zstd blobs are not decoded past the first frame"]
+fn a_zstd_blob_of_several_frames_is_read_to_the_end() {
+    let root = scratch("zstd-frames");
+    let tar = sample_tar();
+    let split = tar.len() / 2;
+    let mut blob = zstd(&tar[..split]);
+    blob.extend_from_slice(&zstd(&tar[split..]));
+
+    let descriptor = install_blob(&root, ZSTD_LAYER, &blob);
+    let rootfs = extract(&root, &descriptor).expect("extract");
+    assert_eq!(
+        fs::read(rootfs.join("dir/large")).expect("large").len(),
+        CHUNK_BYTES * 2 + 17,
+        "the entry spanning the frame boundary"
+    );
+    assert_eq!(
+        fs::read_link(rootfs.join("link")).expect("link"),
+        Path::new("dir/small"),
+        "the entry in the second frame"
+    );
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+#[test]
 fn an_unsupported_media_type_is_reported() {
     let root = scratch("media-type");
     let descriptor = install_blob(&root, "application/x-nonsense", &sample_tar());
@@ -799,6 +885,92 @@ fn tar_of(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
     build(&mut builder);
     builder.into_inner().expect("tar")
+}
+
+/// Installs `layers` as alternating gzip and zstd blobs, optionally with an
+/// entry table beside each: the shape `oci_image` produces when it adds a zstd
+/// layer to a gzip base.
+fn install_mixed_compression(
+    root: &Utf8Path,
+    layers: &[Vec<u8>],
+    tables: bool,
+) -> (Utf8PathBuf, Vec<Descriptor>) {
+    let index_dir = root.join("indexes");
+    fs::create_dir_all(&index_dir).expect("index dir");
+
+    let mut descriptors = Vec::new();
+    for (nth, tar) in layers.iter().enumerate() {
+        let descriptor = if nth % 2 == 0 {
+            install_blob(root, GZIP_LAYER, &gzip(tar))
+        } else {
+            install_blob(root, ZSTD_LAYER, &zstd(tar))
+        };
+        if tables {
+            let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+            let table = crate::entries::Table::build(&tar[..]).expect("entry table");
+            let mut bytes = Vec::new();
+            table.write_to(&mut bytes).expect("serialise");
+            fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
+        }
+        descriptors.push(descriptor);
+    }
+    (index_dir, descriptors)
+}
+
+/// The plan comes from the entry tables, so it must place the same tree
+/// whatever each layer was compressed with.
+#[test]
+fn a_zstd_layer_over_a_gzip_base_plans_the_tree_it_streams() {
+    let layers = vec![
+        tar_of(|builder| {
+            append_dir(builder, "etc/");
+            append_file(builder, "etc/config", b"lower\n");
+            append_file(builder, "etc/kept", b"kept\n");
+        }),
+        tar_of(|builder| {
+            append_file(builder, "etc/config", b"upper\n");
+            append_symlink(builder, "etc/link", "config");
+        }),
+    ];
+
+    let streamed = scratch("mixed-streamed");
+    let (_, descriptors) = install_mixed_compression(&streamed, &layers, false);
+    let rootfs = streamed.join("rootfs");
+    let layout = Layout::open(&streamed).expect("layout");
+    let mut extractor = RootfsExtractor::new(&rootfs, None, true).expect("extractor");
+    extractor.plan(&descriptors).expect("plan");
+    assert!(
+        !extractor.plan.is_resolved(),
+        "without tables there is nothing to resolve"
+    );
+    extractor.apply(&layout, &descriptors).expect("apply");
+    extractor.finish().expect("finish");
+    let expected = snapshot(&rootfs);
+
+    let planned = scratch("mixed-planned");
+    let (index_dir, descriptors) = install_mixed_compression(&planned, &layers, true);
+    let rootfs = planned.join("rootfs");
+    let layout = Layout::open(&planned).expect("layout");
+    let mut extractor = RootfsExtractor::new(&rootfs, Some(&index_dir), true).expect("extractor");
+    extractor.plan(&descriptors).expect("plan");
+    assert!(
+        extractor.plan.is_resolved(),
+        "the tables must resolve the plan"
+    );
+    // Only gzip layers are indexed at build time, so one zstd layer leaves the
+    // image short of the checkpoints the span route needs and it walks.
+    assert!(
+        descriptors
+            .iter()
+            .all(|descriptor| index_at(&index_dir, descriptor).is_none()),
+        "a zstd layer has no checkpoint index to fall back on"
+    );
+    extractor.apply(&layout, &descriptors).expect("apply");
+    extractor.finish().expect("finish");
+
+    assert_eq!(expected, snapshot(&rootfs));
+    let _ = fsutil::force_remove_dir_all(streamed.as_std_path());
+    let _ = fsutil::force_remove_dir_all(planned.as_std_path());
 }
 
 fn append_dir(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
