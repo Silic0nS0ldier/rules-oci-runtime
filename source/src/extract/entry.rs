@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{self, Read};
+use std::ops::Bound;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -291,7 +292,7 @@ impl RootfsExtractor {
     /// True when this layer has placed anything under `dir`.
     fn wrote_under(&self, dir: &Path) -> bool {
         self.written
-            .range(dir.to_path_buf()..)
+            .range::<Path, _>((Bound::Included(dir), Bound::Unbounded))
             .take_while(|path| path.starts_with(dir))
             .any(|path| path != dir)
     }
