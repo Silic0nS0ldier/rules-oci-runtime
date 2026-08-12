@@ -13,6 +13,8 @@ use std::thread;
 
 use sha2::{Digest, Sha256};
 
+use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
+
 use crate::error::{Error, Result};
 use crate::image::{Descriptor, verify, verify_digest};
 use crate::sys::Blob;
@@ -347,12 +349,68 @@ fn decompressor<'a, R: io::BufRead + 'a>(
     match compression_of(media_type) {
         Some(Compression::None) => Ok(Box::new(reader)),
         Some(Compression::Gzip) => Ok(Box::new(flate2::bufread::MultiGzDecoder::new(reader))),
-        Some(Compression::Zstd) => {
-            let decoder = ruzstd::decoding::StreamingDecoder::new(reader)
-                .map_err(|err| Error::io("initialising zstd decoder", io::Error::other(err)))?;
-            Ok(Box::new(decoder))
-        }
+        Some(Compression::Zstd) => Ok(Box::new(MultiFrameZstd::new(reader))),
         None => Err(Error::UnsupportedMediaType(media_type.to_string())),
+    }
+}
+
+/// Reads a blob's zstd frames as one stream.
+///
+/// A blob may hold several frames back to back: concatenating them is how the
+/// format appends, and a compressor that splits the work across threads emits
+/// one per thread. `ruzstd`'s decoder ends at the frame it was given, so
+/// without this a layer stops short wherever the first frame does, which the
+/// tar reader then reports as a truncated archive. `MultiGzDecoder` spans
+/// gzip members for the same reason.
+struct MultiFrameZstd<R: io::BufRead>(Frames<R>);
+
+enum Frames<R: io::BufRead> {
+    /// Between frames, holding the decoder so the next frame reuses its
+    /// window rather than allocating one of its own.
+    Between(R, FrameDecoder),
+    Decoding(StreamingDecoder<R, FrameDecoder>),
+    /// The blob ended, or a frame would not start.
+    Done,
+}
+
+impl<R: io::BufRead> MultiFrameZstd<R> {
+    fn new(reader: R) -> Self {
+        MultiFrameZstd(Frames::Between(reader, FrameDecoder::new()))
+    }
+}
+
+impl<R: io::BufRead> Read for MultiFrameZstd<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Starting a frame consumes its header, and an empty buffer would
+        // leave nowhere to put what follows it.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match std::mem::replace(&mut self.0, Frames::Done) {
+                Frames::Decoding(mut decoder) => match decoder.read(buf) {
+                    // This frame is spent; the blob may hold another.
+                    Ok(0) => {
+                        let (source, frames) = decoder.into_parts();
+                        self.0 = Frames::Between(source, frames);
+                    }
+                    read => {
+                        self.0 = Frames::Decoding(decoder);
+                        return read;
+                    }
+                },
+                Frames::Between(mut source, frames) => {
+                    if source.fill_buf()?.is_empty() {
+                        return Ok(0);
+                    }
+                    self.0 = Frames::Decoding(
+                        StreamingDecoder::new_with_decoder(source, frames)
+                            .map_err(io::Error::other)?,
+                    );
+                }
+                Frames::Done => return Ok(0),
+            }
+        }
     }
 }
 

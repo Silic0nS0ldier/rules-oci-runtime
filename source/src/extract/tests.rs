@@ -640,13 +640,7 @@ fn a_truncated_zstd_blob_is_reported() {
 
 /// A zstd blob may be several frames back to back, as any tool that
 /// compresses in parallel writes. The whole blob is one tar stream.
-///
-/// Ignored: `ruzstd`'s `StreamingDecoder` returns `Ok(0)` as soon as one frame
-/// finishes and never starts the next, so such a layer fails here with
-/// "unexpected EOF during skip". `MultiGzDecoder` already spans gzip members;
-/// zstd needs the same adapter.
 #[test]
-#[ignore = "multi-frame zstd blobs are not decoded past the first frame"]
 fn a_zstd_blob_of_several_frames_is_read_to_the_end() {
     let root = scratch("zstd-frames");
     let tar = sample_tar();
