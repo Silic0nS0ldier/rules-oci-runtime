@@ -60,7 +60,7 @@ Launcher performance is the recurring workstream, so measure it properly:
 
 ## Git
 
-- Commit freely; **never push**. The user pushes and opens PRs.
-- Land invasive work as separate or stacked PRs rather than one large branch.
+- Commit freely on new branches; **never push**. The user pushes and opens PRs.
+- Land invasive work as separate or stacked branches rather than one large branch.
 - Commit bodies carry the measured numbers behind a performance claim.
 - `Refs #N` is for issues only. PR numbers are added by GitHub at merge time.
