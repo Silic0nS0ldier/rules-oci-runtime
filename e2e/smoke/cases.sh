@@ -189,14 +189,20 @@ case_zstd_layer() {
   assert_contains "$output" "3.22" "the gzip base underneath it"
 
   # Without this the case would pass on a gzip layer too, which is what
-  # `oci_image` writes if the archive is not the one we think it is.
-  stderr=$(cat "${TEST_TMPDIR}/zstd.err")
-  assert_contains "$stderr" "tar+zstd" "a zstd layer was extracted"
+  # `oci_image` writes if the archive is not the one we think it is. The span
+  # route does not name each layer as it goes, so the image says so instead.
+  local layout
+  layout=$(sed -n 's/.*"layout":"\([^"]*\)".*/\1/p' "${zstd_container}.launch.json")
+  if ! grep -rq 'tar+zstd' "${runfiles}/${layout}/blobs"; then
+    fail "no zstd layer in ${runfiles}/${layout}"
+  fi
 
-  # Only gzip layers are indexed at build time, so one zstd layer leaves the
-  # image short of the checkpoints the parallel route needs.
-  assert_contains "$stderr" "Extracting layer" "the image is walked layer by layer"
-  assert_not_contains "$stderr" "units on" "no span route without an index per layer"
+  # Both formats are checkpointed now, so a zstd layer no longer takes the
+  # image off the parallel route.
+  stderr=$(cat "${TEST_TMPDIR}/zstd.err")
+  if [[ "$(nproc)" -ge 2 ]]; then
+    assert_contains "$stderr" "units on" "a zstd layer still takes the span route"
+  fi
 }
 
 case_rootfs_contents() {

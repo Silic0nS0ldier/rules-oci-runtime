@@ -1,7 +1,16 @@
-//! Checkpoint index for gzip layer blobs, in the spirit of zlib's `zran.c`
-//! and SOCI's zTOC. A checkpoint records enough inflate state (bit offset and
-//! 32 KiB window) to resume decompression at a deflate block boundary, which
-//! lets independent threads inflate disjoint spans of one gzip member.
+//! Checkpoint index for compressed layer blobs, in the spirit of zlib's
+//! `zran.c` and SOCI's zTOC. A checkpoint records where decompression can be
+//! resumed part way through a blob, which lets independent threads decompress
+//! disjoint spans of it.
+//!
+//! What that costs depends on the format. Deflate carries its state in a
+//! 32 KiB sliding window, so a gzip checkpoint stores one and can sit at any
+//! block boundary. A zstd frame instead declares its own window -- 8 MiB is
+//! the size the RFC asks decoders to support, and the format permits far more
+//! -- so storing one per span would rival the blob. Frames are independent of
+//! each other, though, so a zstd checkpoint sits at a frame boundary and
+//! stores nothing at all. A blob written as a single frame therefore indexes
+//! as a single span, which is the price of not rewriting the blob.
 //!
 //! Built at Bazel build time by `oci_runtime index`; the image blobs are never
 //! modified. Each span also carries a CRC-32 of its uncompressed bytes: blob
@@ -10,14 +19,43 @@
 
 use std::io::{self, Read, Write};
 
+use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
+
 use crate::error::{Error, Result};
 
-const MAGIC: &[u8; 4] = b"OZI1";
+const MAGIC: &[u8; 4] = b"OZI2";
 const WINDOW_SIZE: usize = 32 * 1024;
 /// Checkpoints are only useful while spans decompress in bounded memory.
 const MAX_CHECKPOINTS: u32 = 1 << 20;
 
-/// Resume point at a deflate block boundary (or a gzip member start).
+/// Which compressed format an index describes, and so what a checkpoint in it
+/// means. An index is only usable against the format it was built from, so
+/// this is recorded rather than inferred from the layer's media type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    Gzip,
+    Zstd,
+}
+
+impl Flavor {
+    fn code(self) -> u8 {
+        match self {
+            Flavor::Gzip => 0,
+            Flavor::Zstd => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Flavor::Gzip),
+            1 => Some(Flavor::Zstd),
+            _ => None,
+        }
+    }
+}
+
+/// Resume point: a deflate block boundary (or gzip member start) for
+/// [`Flavor::Gzip`], a frame start for [`Flavor::Zstd`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     /// Offset of the first compressed byte not yet consumed at the boundary.
@@ -27,7 +65,7 @@ pub struct Checkpoint {
     /// Uncompressed offset this checkpoint resumes at.
     pub out_offset: u64,
     /// Sliding window at the boundary; empty at a stream or member start,
-    /// where inflate instead parses the gzip header.
+    /// where inflate instead parses the gzip header, and always empty for zstd.
     pub window: Vec<u8>,
     /// CRC-32 of the uncompressed span from here to the next checkpoint.
     pub crc: u32,
@@ -37,14 +75,22 @@ pub struct Checkpoint {
 /// spans between consecutive checkpoints cover the whole uncompressed output.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Index {
+    pub flavor: Flavor,
     pub uncompressed_len: u64,
     pub checkpoints: Vec<Checkpoint>,
 }
 
 impl Index {
-    /// Decompresses `blob` once, dropping a checkpoint at the first block
+    /// Decompresses `blob` once, dropping a checkpoint at the first resumable
     /// boundary after every `span` uncompressed bytes.
-    pub fn build(blob: &[u8], span: u64) -> Result<Self> {
+    pub fn build(flavor: Flavor, blob: &[u8], span: u64) -> Result<Self> {
+        match flavor {
+            Flavor::Gzip => Self::build_gzip(blob, span),
+            Flavor::Zstd => Self::build_zstd(blob, span),
+        }
+    }
+
+    fn build_gzip(blob: &[u8], span: u64) -> Result<Self> {
         let context = "indexing gzip blob";
         let mut inflater = Inflater::new(HEADER_WINDOW_BITS).map_err(|e| Error::io(context, e))?;
         let mut buf = vec![0u8; 1 << 20];
@@ -117,13 +163,78 @@ impl Index {
         checkpoints.last_mut().expect("non-empty").crc = crc.sum();
 
         Ok(Index {
+            flavor: Flavor::Gzip,
             uncompressed_len: out_pos,
             checkpoints,
         })
     }
 
-    /// Inflates the span between checkpoint `i` and its successor (or the end
-    /// of the stream) and verifies it against the recorded CRC.
+    /// Walks `blob` frame by frame, starting a checkpoint at the first frame
+    /// boundary past every `span` uncompressed bytes.
+    ///
+    /// Coalescing frames matters as much as splitting them: a `zstd:chunked`
+    /// or seekable-format blob can hold thousands of small frames, and one
+    /// span each would be more queue than work.
+    fn build_zstd(blob: &[u8], span: u64) -> Result<Self> {
+        let context = "indexing zstd blob";
+        let mut checkpoints = vec![Checkpoint {
+            in_offset: 0,
+            bits: 0,
+            out_offset: 0,
+            window: Vec::new(),
+            crc: 0,
+        }];
+        let mut decoder = FrameDecoder::new();
+        let mut scratch = vec![0u8; 1 << 20];
+        let mut crc = flate2::Crc::new();
+        let mut pos = 0usize;
+        let mut out_pos = 0u64;
+        let mut last = 0u64;
+
+        while pos < blob.len() {
+            if let Some(len) = skippable_frame_len(&blob[pos..]) {
+                pos = pos
+                    .checked_add(len)
+                    .filter(|end| *end <= blob.len())
+                    .ok_or_else(|| {
+                        Error::io(context, io::Error::other("truncated skippable frame"))
+                    })?;
+                continue;
+            }
+            if out_pos >= last + span {
+                if checkpoints.len() as u32 == MAX_CHECKPOINTS {
+                    return Err(Error::io(context, io::Error::other("too many checkpoints")));
+                }
+                checkpoints.last_mut().expect("non-empty").crc = crc.sum();
+                crc.reset();
+                checkpoints.push(Checkpoint {
+                    in_offset: pos as u64,
+                    bits: 0,
+                    out_offset: out_pos,
+                    window: Vec::new(),
+                    crc: 0,
+                });
+                last = out_pos;
+            }
+            let mut produced = 0u64;
+            pos = decode_frame(&mut decoder, blob, pos, &mut scratch, |bytes| {
+                crc.update(bytes);
+                produced += bytes.len() as u64;
+            })
+            .map_err(|e| Error::io(context, e))?;
+            out_pos += produced;
+        }
+        checkpoints.last_mut().expect("non-empty").crc = crc.sum();
+
+        Ok(Index {
+            flavor: Flavor::Zstd,
+            uncompressed_len: out_pos,
+            checkpoints,
+        })
+    }
+
+    /// Decompresses the span between checkpoint `i` and its successor (or the
+    /// end of the stream) and verifies it against the recorded CRC.
     pub fn extract_span(&self, blob: &[u8], i: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.extract_span_into(blob, i, &mut out, 0)?;
@@ -160,60 +271,13 @@ impl Index {
             ));
         }
 
-        // An empty window is a stream or member start: parse the header there.
-        let at_header = point.window.is_empty() && point.bits == 0;
-        let mut inflater = Inflater::new(if at_header {
-            HEADER_WINDOW_BITS
-        } else {
-            RAW_WINDOW_BITS
-        })
-        .map_err(|e| Error::io(context, e))?;
-        if point.bits != 0 {
-            // The boundary sits inside the previous byte: feed its unconsumed
-            // high bits, then continue from the byte boundary.
-            let byte = blob[point.in_offset as usize - 1];
-            inflater
-                .prime(point.bits, byte >> (8 - point.bits))
-                .map_err(|e| Error::io(context, e))?;
-        }
-        if !point.window.is_empty() {
-            inflater
-                .set_dictionary(&point.window)
-                .map_err(|e| Error::io(context, e))?;
-        }
-
         if out.len() < at + len {
             out.resize(at + len, 0);
         }
         let span = &mut out[at..at + len];
-        let mut in_pos = point.in_offset as usize;
-        let mut filled = 0usize;
-        while filled < len {
-            let (consumed, produced, ret) = inflater
-                .inflate(&blob[in_pos..], &mut span[filled..], Flush::None)
-                .map_err(|e| Error::io(context, e))?;
-            in_pos += consumed;
-            filled += produced;
-            match ret {
-                Z_STREAM_END if filled < len => {
-                    // The span continues into the next gzip member.
-                    if in_pos == blob.len() {
-                        return Err(Error::io(
-                            context,
-                            io::Error::other("stream ended before the indexed span"),
-                        ));
-                    }
-                    inflater =
-                        Inflater::new(HEADER_WINDOW_BITS).map_err(|e| Error::io(context, e))?;
-                }
-                Z_OK if consumed == 0 && produced == 0 => {
-                    return Err(Error::io(
-                        context,
-                        io::Error::other("truncated or corrupt gzip stream"),
-                    ));
-                }
-                _ => {}
-            }
+        match self.flavor {
+            Flavor::Gzip => inflate_span(blob, point, span)?,
+            Flavor::Zstd => decode_span(blob, point, span)?,
         }
 
         let mut crc = flate2::Crc::new();
@@ -229,6 +293,7 @@ impl Index {
 
     pub fn write_to(&self, mut writer: impl Write) -> io::Result<()> {
         writer.write_all(MAGIC)?;
+        writer.write_all(&[self.flavor.code()])?;
         writer.write_all(&self.uncompressed_len.to_le_bytes())?;
         writer.write_all(&(self.checkpoints.len() as u32).to_le_bytes())?;
         for point in &self.checkpoints {
@@ -252,6 +317,10 @@ impl Index {
         if magic != *MAGIC {
             return Err(io::Error::other("not a checkpoint index"));
         }
+        let mut flavor = [0u8];
+        reader.read_exact(&mut flavor)?;
+        let flavor = Flavor::from_code(flavor[0])
+            .ok_or_else(|| io::Error::other("unknown compressed format"))?;
         let uncompressed_len = read_u64(&mut reader)?;
         let count = read_u32(&mut reader)?;
         if count == 0 || count > MAX_CHECKPOINTS {
@@ -273,6 +342,10 @@ impl Index {
             if window.len() > WINDOW_SIZE || bits[0] > 7 {
                 return Err(io::Error::other("malformed checkpoint"));
             }
+            // A zstd checkpoint is a frame start, which resumes from nothing.
+            if flavor == Flavor::Zstd && (!window.is_empty() || bits[0] != 0) {
+                return Err(io::Error::other("malformed checkpoint"));
+            }
             if previous.is_some_and(|(i, o)| in_offset < i || out_offset < o) {
                 return Err(io::Error::other("checkpoints out of order"));
             }
@@ -289,10 +362,159 @@ impl Index {
             return Err(io::Error::other("checkpoints out of order"));
         }
         Ok(Index {
+            flavor,
             uncompressed_len,
             checkpoints,
         })
     }
+}
+
+/// Inflates one gzip span into `span`, which is exactly its length.
+fn inflate_span(blob: &[u8], point: &Checkpoint, span: &mut [u8]) -> Result<()> {
+    let context = "resuming from checkpoint";
+    // An empty window is a stream or member start: parse the header there.
+    let at_header = point.window.is_empty() && point.bits == 0;
+    let mut inflater = Inflater::new(if at_header {
+        HEADER_WINDOW_BITS
+    } else {
+        RAW_WINDOW_BITS
+    })
+    .map_err(|e| Error::io(context, e))?;
+    if point.bits != 0 {
+        // The boundary sits inside the previous byte: feed its unconsumed
+        // high bits, then continue from the byte boundary.
+        let byte = blob[point.in_offset as usize - 1];
+        inflater
+            .prime(point.bits, byte >> (8 - point.bits))
+            .map_err(|e| Error::io(context, e))?;
+    }
+    if !point.window.is_empty() {
+        inflater
+            .set_dictionary(&point.window)
+            .map_err(|e| Error::io(context, e))?;
+    }
+
+    let len = span.len();
+    let mut in_pos = point.in_offset as usize;
+    let mut filled = 0usize;
+    while filled < len {
+        let (consumed, produced, ret) = inflater
+            .inflate(&blob[in_pos..], &mut span[filled..], Flush::None)
+            .map_err(|e| Error::io(context, e))?;
+        in_pos += consumed;
+        filled += produced;
+        match ret {
+            Z_STREAM_END if filled < len => {
+                // The span continues into the next gzip member.
+                if in_pos == blob.len() {
+                    return Err(Error::io(
+                        context,
+                        io::Error::other("stream ended before the indexed span"),
+                    ));
+                }
+                inflater = Inflater::new(HEADER_WINDOW_BITS).map_err(|e| Error::io(context, e))?;
+            }
+            Z_OK if consumed == 0 && produced == 0 => {
+                return Err(Error::io(
+                    context,
+                    io::Error::other("truncated or corrupt gzip stream"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Decodes zstd frames from the checkpoint until `span` is full.
+///
+/// A span ends where the next checkpoint begins, which is a frame boundary, so
+/// the frames decoded here produce exactly `span.len()` bytes. Producing more
+/// than that means the index does not describe this blob.
+fn decode_span(blob: &[u8], point: &Checkpoint, span: &mut [u8]) -> Result<()> {
+    let context = "resuming from checkpoint";
+    let len = span.len();
+    let mut decoder = FrameDecoder::new();
+    let mut scratch = vec![0u8; 1 << 20];
+    let mut pos = point.in_offset as usize;
+    let mut filled = 0usize;
+
+    while filled < len {
+        if pos >= blob.len() {
+            return Err(Error::io(
+                context,
+                io::Error::other("stream ended before the indexed span"),
+            ));
+        }
+        if let Some(skip) = skippable_frame_len(&blob[pos..]) {
+            pos = pos
+                .checked_add(skip)
+                .filter(|end| *end <= blob.len())
+                .ok_or_else(|| Error::io(context, io::Error::other("truncated skippable frame")))?;
+            continue;
+        }
+        let mut overflowed = false;
+        pos = decode_frame(&mut decoder, blob, pos, &mut scratch, |bytes| {
+            let take = bytes.len().min(len - filled);
+            span[filled..filled + take].copy_from_slice(&bytes[..take]);
+            filled += take;
+            overflowed |= take < bytes.len();
+        })
+        .map_err(|e| Error::io(context, e))?;
+        if overflowed {
+            return Err(Error::io(
+                context,
+                io::Error::other("the span decoded to more than the index recorded"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The bytes a zstd skippable frame occupies at the start of `bytes`, its
+/// 8 byte header included; `None` when a data frame starts there instead.
+///
+/// Skippable frames are how the seekable format carries its jump table and how
+/// `zstd:chunked` carries its manifest, so a real layer can begin or end with
+/// one, and every decoder is required to ignore them.
+pub fn skippable_frame_len(bytes: &[u8]) -> Option<usize> {
+    const SKIPPABLE: std::ops::RangeInclusive<u32> = 0x184D_2A50..=0x184D_2A5F;
+    let magic = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    if !SKIPPABLE.contains(&magic) {
+        return None;
+    }
+    let len = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+    Some(8 + len as usize)
+}
+
+/// Decodes the one zstd frame starting at `blob[at]`, handing each run of
+/// output to `emit`, and returns the offset just past it.
+fn decode_frame(
+    decoder: &mut FrameDecoder,
+    blob: &[u8],
+    at: usize,
+    scratch: &mut [u8],
+    mut emit: impl FnMut(&[u8]),
+) -> io::Result<usize> {
+    let mut source = &blob[at..];
+    decoder.init(&mut source).map_err(io::Error::other)?;
+    loop {
+        let finished = decoder.is_finished();
+        loop {
+            let read = decoder.read(scratch)?;
+            if read == 0 {
+                break;
+            }
+            emit(&scratch[..read]);
+        }
+        if finished {
+            break;
+        }
+        decoder
+            .decode_blocks(&mut source, BlockDecodingStrategy::UptoBytes(scratch.len()))
+            .map_err(io::Error::other)?;
+    }
+    Ok(blob.len() - source.len())
 }
 
 fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
@@ -458,6 +680,26 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    /// One zstd frame, as any single-threaded compressor writes.
+    fn zstd(data: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    /// `data` cut into frames of `each` bytes, which is what `pzstd`, the
+    /// seekable format and `zstd:chunked` all produce.
+    fn zstd_framed(data: &[u8], each: usize) -> Vec<u8> {
+        data.chunks(each).flat_map(zstd).collect()
+    }
+
+    /// A skippable frame carrying `payload`, as the seekable format's jump
+    /// table and `zstd:chunked`'s manifest are stored.
+    fn skippable(payload: &[u8]) -> Vec<u8> {
+        let mut frame = 0x184D_2A50u32.to_le_bytes().to_vec();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
     fn assert_spans_reproduce(index: &Index, blob: &[u8], data: &[u8]) {
         assert_eq!(index.uncompressed_len, data.len() as u64);
         let mut reassembled = Vec::new();
@@ -471,7 +713,7 @@ mod tests {
     fn every_span_resumes_to_the_reference_bytes() {
         let data = sample_data(2 << 20);
         let blob = gzip(&data);
-        let index = Index::build(&blob, 128 << 10).unwrap();
+        let index = Index::build(Flavor::Gzip, &blob, 128 << 10).unwrap();
         assert!(
             index.checkpoints.len() > 4,
             "expected several checkpoints, found {}",
@@ -488,7 +730,7 @@ mod tests {
     fn a_span_owns_only_what_it_reports_writing() {
         let data = sample_data(2 << 20);
         let blob = gzip(&data);
-        let index = Index::build(&blob, 128 << 10).unwrap();
+        let index = Index::build(Flavor::Gzip, &blob, 128 << 10).unwrap();
 
         let mut buffer = vec![0xab; 4 << 20];
         let stale = buffer.len();
@@ -515,7 +757,7 @@ mod tests {
         let mut data = first;
         data.extend_from_slice(&second);
 
-        let index = Index::build(&blob, 100 << 10).unwrap();
+        let index = Index::build(Flavor::Gzip, &blob, 100 << 10).unwrap();
         assert!(
             index
                 .checkpoints
@@ -530,7 +772,7 @@ mod tests {
     fn a_blob_smaller_than_a_span_still_round_trips() {
         let data = b"tiny".to_vec();
         let blob = gzip(&data);
-        let index = Index::build(&blob, 4 << 20).unwrap();
+        let index = Index::build(Flavor::Gzip, &blob, 4 << 20).unwrap();
         assert_eq!(index.checkpoints.len(), 1);
         assert_spans_reproduce(&index, &blob, &data);
     }
@@ -539,7 +781,7 @@ mod tests {
     fn the_index_survives_serialisation() {
         let data = sample_data(1 << 20);
         let blob = gzip(&data);
-        let index = Index::build(&blob, 128 << 10).unwrap();
+        let index = Index::build(Flavor::Gzip, &blob, 128 << 10).unwrap();
         let mut bytes = Vec::new();
         index.write_to(&mut bytes).unwrap();
         let read = Index::read_from(&bytes[..]).unwrap();
@@ -550,12 +792,12 @@ mod tests {
     #[test]
     fn a_truncated_blob_is_an_error_not_a_hang() {
         let blob = gzip(&sample_data(1 << 20));
-        assert!(Index::build(&blob[..blob.len() / 2], 128 << 10).is_err());
+        assert!(Index::build(Flavor::Gzip, &blob[..blob.len() / 2], 128 << 10).is_err());
     }
 
     #[test]
     fn garbage_input_is_rejected() {
-        assert!(Index::build(&sample_data(4096), 1 << 10).is_err());
+        assert!(Index::build(Flavor::Gzip, &sample_data(4096), 1 << 10).is_err());
         assert!(Index::read_from(&b"not an index"[..]).is_err());
     }
 
@@ -563,7 +805,7 @@ mod tests {
     fn a_tampered_window_is_caught_by_the_span_checksum() {
         let data = sample_data(1 << 20);
         let blob = gzip(&data);
-        let mut index = Index::build(&blob, 128 << 10).unwrap();
+        let mut index = Index::build(Flavor::Gzip, &blob, 128 << 10).unwrap();
         let point = index
             .checkpoints
             .iter_mut()
@@ -587,11 +829,119 @@ mod tests {
     fn out_of_order_checkpoints_are_rejected_on_read() {
         let data = sample_data(1 << 20);
         let blob = gzip(&data);
-        let mut index = Index::build(&blob, 128 << 10).unwrap();
+        let mut index = Index::build(Flavor::Gzip, &blob, 128 << 10).unwrap();
         assert!(index.checkpoints.len() >= 3);
         index.checkpoints.swap(1, 2);
         let mut bytes = Vec::new();
         index.write_to(&mut bytes).unwrap();
         assert!(Index::read_from(&bytes[..]).is_err());
+    }
+
+    #[test]
+    fn every_zstd_frame_boundary_can_start_a_span() {
+        let data = sample_data(2 << 20);
+        let blob = zstd_framed(&data, 64 << 10);
+        let index = Index::build(Flavor::Zstd, &blob, 128 << 10).unwrap();
+        assert!(
+            index.checkpoints.len() > 4,
+            "expected several checkpoints, found {}",
+            index.checkpoints.len()
+        );
+        assert!(
+            index
+                .checkpoints
+                .iter()
+                .all(|p| p.window.is_empty() && p.bits == 0),
+            "a frame start resumes from no state at all"
+        );
+        assert_spans_reproduce(&index, &blob, &data);
+    }
+
+    /// Frames far smaller than the span are gathered into one, or a
+    /// `zstd:chunked` layer would be more queue than work.
+    #[test]
+    fn small_zstd_frames_are_gathered_into_spans() {
+        let data = sample_data(1 << 20);
+        let blob = zstd_framed(&data, 4 << 10);
+        let index = Index::build(Flavor::Zstd, &blob, 256 << 10).unwrap();
+        assert!(
+            (4..=6).contains(&index.checkpoints.len()),
+            "expected roughly one checkpoint per span, found {}",
+            index.checkpoints.len()
+        );
+        assert_spans_reproduce(&index, &blob, &data);
+    }
+
+    /// What `bsdtar` and the `zstd` tool write. There is nowhere to resume, so
+    /// the layer is one span; it must still index and extract.
+    #[test]
+    fn a_single_frame_zstd_blob_indexes_as_one_span() {
+        let data = sample_data(1 << 20);
+        let blob = zstd(&data);
+        let index = Index::build(Flavor::Zstd, &blob, 128 << 10).unwrap();
+        assert_eq!(index.checkpoints.len(), 1);
+        assert_spans_reproduce(&index, &blob, &data);
+    }
+
+    #[test]
+    fn skippable_frames_are_stepped_over() {
+        let data = sample_data(1 << 20);
+        let mut blob = skippable(b"a leading identifier");
+        blob.extend_from_slice(&zstd_framed(&data, 64 << 10));
+        blob.extend_from_slice(&skippable(&[0u8; 512]));
+
+        let index = Index::build(Flavor::Zstd, &blob, 128 << 10).unwrap();
+        assert!(index.checkpoints.len() > 2);
+        assert_spans_reproduce(&index, &blob, &data);
+    }
+
+    #[test]
+    fn the_zstd_index_survives_serialisation() {
+        let data = sample_data(1 << 20);
+        let blob = zstd_framed(&data, 64 << 10);
+        let index = Index::build(Flavor::Zstd, &blob, 128 << 10).unwrap();
+        let mut bytes = Vec::new();
+        index.write_to(&mut bytes).unwrap();
+        let read = Index::read_from(&bytes[..]).unwrap();
+        assert_eq!(read.flavor, Flavor::Zstd);
+        assert_eq!(read, index);
+        assert_spans_reproduce(&read, &blob, &data);
+    }
+
+    /// The two formats resume from entirely different state, so an index has
+    /// to say which it describes rather than leaving it to the file name.
+    #[test]
+    fn an_index_records_which_format_it_describes() {
+        let data = sample_data(256 << 10);
+        let mut bytes = Vec::new();
+        Index::build(Flavor::Gzip, &gzip(&data), 64 << 10)
+            .unwrap()
+            .write_to(&mut bytes)
+            .unwrap();
+        assert_eq!(Index::read_from(&bytes[..]).unwrap().flavor, Flavor::Gzip);
+
+        // A gzip window in a zstd index would be read as a frame start.
+        bytes[4] = Flavor::Zstd.code();
+        assert!(Index::read_from(&bytes[..]).is_err());
+    }
+
+    #[test]
+    fn a_truncated_zstd_blob_is_an_error_not_a_hang() {
+        let blob = zstd(&sample_data(1 << 20));
+        assert!(Index::build(Flavor::Zstd, &blob[..blob.len() / 2], 128 << 10).is_err());
+    }
+
+    #[test]
+    fn a_zstd_span_that_decodes_too_far_is_refused() {
+        let data = sample_data(1 << 20);
+        let blob = zstd_framed(&data, 64 << 10);
+        let mut index = Index::build(Flavor::Zstd, &blob, 128 << 10).unwrap();
+        // Claim the first span ends earlier than the frames it covers do.
+        index.checkpoints[1].out_offset -= 1024;
+        let err = index.extract_span(&blob, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("more than the index"),
+            "got: {err}"
+        );
     }
 }

@@ -25,7 +25,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct IndexArgs {
-    /// Gzip layer blob to index.
+    /// Gzip or zstd layer blob to index.
     #[arg(
         long,
         value_name = "PATH",
@@ -34,7 +34,8 @@ pub struct IndexArgs {
     )]
     pub blob: Option<Utf8PathBuf>,
 
-    /// Image layout whose gzip layers are all indexed, across every platform.
+    /// Image layout whose compressed layers are all indexed, across every
+    /// platform.
     #[arg(long, value_name = "DIR")]
     pub layout: Option<Utf8PathBuf>,
 
@@ -58,7 +59,8 @@ pub struct RunArgs {
     #[arg(long, value_name = "PATH")]
     pub runtime: Utf8PathBuf,
 
-    /// Directory of layer decompression indexes, one `<hex>.zinfo` per gzip layer.
+    /// Directory of layer decompression indexes, one `<hex>.zinfo` per
+    /// compressed layer.
     #[arg(long, value_name = "DIR")]
     pub index: Option<Utf8PathBuf>,
 

@@ -32,7 +32,7 @@ use crate::zinfo;
 
 use pipeline::{ChunkReader, PIPELINE_DEPTH, Sink, buffer_pool, inflate_blob, inflate_indexed};
 
-pub use pipeline::{Compression, compression_of};
+pub use pipeline::{Compression, compression_of, decompressed};
 
 /// Applies layers in order, deferring directory permissions so that read-only
 /// directories in one layer do not block writes from the next.
@@ -259,13 +259,38 @@ impl RootfsExtractor {
 
 /// Reads the checkpoint index recorded for a layer, if there is a usable one.
 fn index_at(dir: &Utf8Path, descriptor: &Descriptor) -> Option<zinfo::Index> {
-    if compression_of(&descriptor.media_type) != Some(Compression::Gzip) {
-        return None;
-    }
+    let flavor = flavor_of(&descriptor.media_type)?;
     if thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
         return None;
     }
     let hex = parse_digest(&descriptor.digest).ok()?.hex;
     let path = crate::sidecar::checkpoints_at(dir, &hex);
-    crate::sidecar::read(&path, zinfo::Index::read_from)
+    let index = crate::sidecar::read(&path, zinfo::Index::read_from)?;
+    // A checkpoint only means anything to the format it was taken from, and
+    // the sidecar is named after the digest alone.
+    if index.flavor != flavor {
+        warning!(
+            "ignoring {path}: it does not index a {} layer",
+            flavor_name(flavor)
+        );
+        return None;
+    }
+    Some(index)
+}
+
+/// How a layer's blob is compressed, for the formats a checkpoint index can
+/// describe. Uncompressed layers have nothing to resume.
+pub fn flavor_of(media_type: &str) -> Option<zinfo::Flavor> {
+    match compression_of(media_type)? {
+        Compression::Gzip => Some(zinfo::Flavor::Gzip),
+        Compression::Zstd => Some(zinfo::Flavor::Zstd),
+        Compression::None => None,
+    }
+}
+
+fn flavor_name(flavor: zinfo::Flavor) -> &'static str {
+    match flavor {
+        zinfo::Flavor::Gzip => "gzip",
+        zinfo::Flavor::Zstd => "zstd",
+    }
 }

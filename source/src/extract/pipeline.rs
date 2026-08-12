@@ -347,10 +347,22 @@ fn decompressor<'a, R: io::BufRead + 'a>(
     reader: R,
 ) -> Result<Box<dyn Read + 'a>> {
     match compression_of(media_type) {
-        Some(Compression::None) => Ok(Box::new(reader)),
-        Some(Compression::Gzip) => Ok(Box::new(flate2::bufread::MultiGzDecoder::new(reader))),
-        Some(Compression::Zstd) => Ok(Box::new(MultiFrameZstd::new(reader))),
+        Some(compression) => Ok(decompressed(compression, reader)),
         None => Err(Error::UnsupportedMediaType(media_type.to_string())),
+    }
+}
+
+/// The same decompressor, for a caller that already knows the format. Building
+/// an entry table goes through this so the table describes the stream
+/// extraction will see, rather than a second opinion about the blob.
+pub fn decompressed<'a, R: io::BufRead + 'a>(
+    compression: Compression,
+    reader: R,
+) -> Box<dyn Read + 'a> {
+    match compression {
+        Compression::None => Box::new(reader),
+        Compression::Gzip => Box::new(flate2::bufread::MultiGzDecoder::new(reader)),
+        Compression::Zstd => Box::new(MultiFrameZstd::new(reader)),
     }
 }
 
@@ -362,25 +374,30 @@ fn decompressor<'a, R: io::BufRead + 'a>(
 /// without this a layer stops short wherever the first frame does, which the
 /// tar reader then reports as a truncated archive. `MultiGzDecoder` spans
 /// gzip members for the same reason.
+///
+/// Skippable frames are stepped over here rather than by the decoder, which
+/// reports one as an error after consuming the reader it was handed.
 struct MultiFrameZstd<R: io::BufRead>(Frames<R>);
 
 enum Frames<R: io::BufRead> {
     /// Between frames, holding the decoder so the next frame reuses its
     /// window rather than allocating one of its own.
-    Between(R, FrameDecoder),
-    Decoding(StreamingDecoder<R, FrameDecoder>),
+    Between(Peeked<R>, FrameDecoder),
+    Decoding(StreamingDecoder<Peeked<R>, FrameDecoder>),
     /// The blob ended, or a frame would not start.
     Done,
 }
 
 impl<R: io::BufRead> MultiFrameZstd<R> {
     fn new(reader: R) -> Self {
-        MultiFrameZstd(Frames::Between(reader, FrameDecoder::new()))
+        MultiFrameZstd(Frames::Between(Peeked::new(reader), FrameDecoder::new()))
     }
 }
 
 impl<R: io::BufRead> Read for MultiFrameZstd<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use io::BufRead;
+
         // Starting a frame consumes its header, and an empty buffer would
         // leave nowhere to put what follows it.
         if buf.is_empty() {
@@ -400,8 +417,15 @@ impl<R: io::BufRead> Read for MultiFrameZstd<R> {
                     }
                 },
                 Frames::Between(mut source, frames) => {
-                    if source.fill_buf()?.is_empty() {
+                    let header = source.peek(FRAME_HEADER_PEEK)?;
+                    if header.is_empty() {
                         return Ok(0);
+                    }
+                    if let Some(len) = zinfo::skippable_frame_len(header) {
+                        source.consume(FRAME_HEADER_PEEK);
+                        source.skip(len - FRAME_HEADER_PEEK)?;
+                        self.0 = Frames::Between(source, frames);
+                        continue;
                     }
                     self.0 = Frames::Decoding(
                         StreamingDecoder::new_with_decoder(source, frames)
@@ -414,7 +438,93 @@ impl<R: io::BufRead> Read for MultiFrameZstd<R> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Enough to hold a skippable frame's magic and length.
+const FRAME_HEADER_PEEK: usize = 8;
+
+/// A reader that can be looked at before it is handed on.
+///
+/// `BufRead::fill_buf` cannot answer this: it returns whatever the producer
+/// last handed over, which at a chunk boundary can be a single byte.
+struct Peeked<R> {
+    prefix: [u8; FRAME_HEADER_PEEK],
+    start: usize,
+    end: usize,
+    inner: R,
+}
+
+impl<R: io::BufRead> Peeked<R> {
+    fn new(inner: R) -> Self {
+        Peeked {
+            prefix: [0; FRAME_HEADER_PEEK],
+            start: 0,
+            end: 0,
+            inner,
+        }
+    }
+
+    /// The next `n` bytes without consuming them, or fewer at the end of the
+    /// blob.
+    fn peek(&mut self, n: usize) -> io::Result<&[u8]> {
+        self.prefix.copy_within(self.start..self.end, 0);
+        self.end -= self.start;
+        self.start = 0;
+        while self.end < n {
+            match self.inner.read(&mut self.prefix[self.end..n])? {
+                0 => break,
+                read => self.end += read,
+            }
+        }
+        Ok(&self.prefix[self.start..self.end])
+    }
+
+    /// Discards `n` bytes of a frame this decoder does not read.
+    fn skip(&mut self, mut n: usize) -> io::Result<()> {
+        use io::BufRead;
+
+        while n > 0 {
+            let available = self.fill_buf()?.len().min(n);
+            if available == 0 {
+                return Err(io::Error::other("truncated skippable frame"));
+            }
+            self.consume(available);
+            n -= available;
+        }
+        Ok(())
+    }
+}
+
+impl<R: io::BufRead> io::BufRead for Peeked<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.start < self.end {
+            return Ok(&self.prefix[self.start..self.end]);
+        }
+        self.start = 0;
+        self.end = 0;
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if self.start < self.end {
+            self.start = (self.start + amt).min(self.end);
+            return;
+        }
+        self.inner.consume(amt);
+    }
+}
+
+impl<R: io::BufRead> Read for Peeked<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use io::BufRead;
+
+        let available = self.fill_buf()?;
+        let take = available.len().min(buf.len());
+        buf[..take].copy_from_slice(&available[..take]);
+        self.consume(take);
+        Ok(take)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
     Gzip,
