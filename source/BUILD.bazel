@@ -6,7 +6,31 @@ exports_files(["rustfmt.toml"])
 
 rust_binary(
     name = "oci_runtime",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    aliases = aliases(),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+# Benchmarking tools are built by Bazel and then run outside it: a measurement
+# taken through the sandbox, with its own filesystem layout and resource
+# limits, is not the measurement anyone cares about.
+rust_binary(
+    name = "bench_image",
+    srcs = ["src/bin/bench_image.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "bench_run",
+    srcs = ["src/bin/bench_run.rs"],
     aliases = aliases(),
     edition = "2024",
     visibility = ["//visibility:public"],
@@ -19,10 +43,32 @@ rust_test(
     crate = ":oci_runtime",
 )
 
+# Counts, never times. A CI runner's clock is useless for this, but a syscall
+# the launcher stopped making is a syscall it stopped making on any host.
+rust_test(
+    name = "bench_counts_test",
+    timeout = "short",
+    srcs = ["tests/counts.rs"],
+    data = [
+        ":bench_image",
+        ":oci_runtime",
+    ],
+    edition = "2024",
+    env = {
+        "BENCH_IMAGE": "$(rootpath :bench_image)",
+        "OCI_RUNTIME": "$(rootpath :oci_runtime)",
+    },
+)
+
 rustfmt_test(
     name = "oci_runtime_fmt_test",
     timeout = "short",
-    targets = [":oci_runtime"],
+    targets = [
+        ":bench_counts_test",
+        ":bench_image",
+        ":bench_run",
+        ":oci_runtime",
+    ],
 )
 
 launcher_toolchain(

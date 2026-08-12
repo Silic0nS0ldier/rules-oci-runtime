@@ -11,6 +11,14 @@ edition = "2024"
 name = "oci_runtime"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench_image"
+path = "src/bin/bench_image.rs"
+
+[[bin]]
+name = "bench_run"
+path = "src/bin/bench_run.rs"
+
 [dependencies]
 camino = "1.2.5"
 clap = { version = "4.6.3", features = ["derive"] }

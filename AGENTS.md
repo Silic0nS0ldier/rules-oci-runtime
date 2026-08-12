@@ -46,17 +46,30 @@ from the behavioural change.
 
 ## Benchmarking
 
-Launcher performance is the recurring workstream, so measure it properly:
+Launcher performance is the recurring workstream, so use the committed tools
+rather than writing another one-off script. See
+[source/README.md](source/README.md#benchmarking); in short:
 
-- Use an optimised release build (`--config=release`).
-- Report CPU time (user + sys) and syscall counts. Wall clock is unreliable in
-  containers and VMs.
-- Interleave old and new binaries round robin; report min, median and max.
-- Benchmark on an image rich in symlinks and overwrites, not just a distro base.
-  A per entry cache regression that was invisible on alpine cost 5x on
-  `browserless/chromium`.
-- Confirm the fast run actually did the work (entry counts, exit codes) and diff
-  the extracted trees before believing a speedup.
+```
+cd source && bazel build //:bench_image //:bench_run
+.bazel/bin/bench_image --output /tmp/bench-full --profile full
+.bazel/bin/bench_run --layout /tmp/bench-full --rounds 7 --syscalls OLD NEW
+```
+
+- Build with `--config=release`; run outside Bazel.
+- Prefer counts to times. Syscall counts and entries placed do not care what
+  else the host was doing; wall clock in a container or VM does.
+- Anything under 2% is this host, not the change. Prove it by passing the same
+  binary to `bench_run` twice before believing a number near the floor.
+- Absolute numbers do not survive a reboot. Only within-run comparisons mean
+  anything.
+- Confirm the fast run did the work: `bench_run` counts the entries every run
+  placed and says so when they disagree.
+- A harness that skips the work a design introduces will flatter that design.
+  The parallel writer looked 5x better than it was for exactly this reason.
+- `//:bench_counts_test` guards the counts in CI. When it fails, something
+  changed what the launcher asks of the kernel -- find out what before
+  updating its numbers.
 
 ## Git
 
