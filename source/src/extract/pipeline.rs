@@ -270,8 +270,9 @@ pub(super) fn inflate_indexed(
     }
 }
 
-/// Presents the inflated chunks as a stream for `tar` to walk, returning each
-/// buffer to the producer's pool once it has been drained.
+/// Presents the chunks as a stream for whoever drains them -- the
+/// decompressor at one end of the pipeline, `tar` at the other -- returning
+/// each buffer to the producer's pool once it has been read out.
 pub(super) struct ChunkReader {
     chunks: Receiver<io::Result<Chunk>>,
     current: Chunk,
@@ -296,16 +297,9 @@ impl ChunkReader {
     }
 }
 
-impl Read for ChunkReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let available = self.current.len - self.taken;
-            if available > 0 {
-                let take = available.min(buf.len());
-                buf[..take].copy_from_slice(&self.current.buf[self.taken..self.taken + take]);
-                self.taken += take;
-                return Ok(take);
-            }
+impl io::BufRead for ChunkReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.taken == self.current.len {
             // A full pool means the producer has all the buffers it can use,
             // so the spare is dropped rather than blocking the pipeline on it.
             if let Some(ret) = &self.ret
@@ -320,16 +314,39 @@ impl Read for ChunkReader {
                 }
                 Ok(Err(err)) => return Err(err),
                 // The sender is gone, so the blob has been read in full.
-                Err(_) => return Ok(0),
+                Err(_) => return Ok(&[]),
             }
         }
+        Ok(&self.current.buf[self.taken..self.current.len])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.taken = (self.taken + amt).min(self.current.len);
     }
 }
 
-fn decompressor<'a, R: Read + 'a>(media_type: &str, reader: R) -> Result<Box<dyn Read + 'a>> {
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use io::BufRead;
+
+        let available = self.fill_buf()?;
+        let take = available.len().min(buf.len());
+        buf[..take].copy_from_slice(&available[..take]);
+        self.consume(take);
+        Ok(take)
+    }
+}
+
+/// A decompressor reading straight out of the pipeline buffers. Without this
+/// the adapters wrap the reader in a `BufReader` of their own, which copies
+/// every compressed byte of the blob into it on the way past.
+fn decompressor<'a, R: io::BufRead + 'a>(
+    media_type: &str,
+    reader: R,
+) -> Result<Box<dyn Read + 'a>> {
     match compression_of(media_type) {
         Some(Compression::None) => Ok(Box::new(reader)),
-        Some(Compression::Gzip) => Ok(Box::new(flate2::read::MultiGzDecoder::new(reader))),
+        Some(Compression::Gzip) => Ok(Box::new(flate2::bufread::MultiGzDecoder::new(reader))),
         Some(Compression::Zstd) => {
             let decoder = ruzstd::decoding::StreamingDecoder::new(reader)
                 .map_err(|err| Error::io("initialising zstd decoder", io::Error::other(err)))?;
