@@ -146,6 +146,7 @@ fn index(args: IndexArgs) -> Result<i32> {
             &args.output,
             &Utf8PathBuf::from(format!("{}.entries", args.output)),
             args.span,
+            None,
         )?;
     } else if let Some(layout) = &args.layout {
         index_layout(layout, &args.output, args.span)?;
@@ -153,11 +154,17 @@ fn index(args: IndexArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Records a blob's checkpoints and, where the tar stream can be walked, its
+/// entries.
+///
+/// `media_type` is what the manifest calls the layer. A blob indexed on its
+/// own has no manifest to ask, so its format is taken from the bytes.
 fn index_blob(
     blob: &Utf8Path,
     checkpoints: &Utf8Path,
     entries: &Utf8Path,
     span: u64,
+    media_type: Option<&str>,
 ) -> Result<()> {
     let file =
         std::fs::File::open(blob).map_err(|source| Error::io(format!("opening {blob}"), source))?;
@@ -171,21 +178,49 @@ fn index_blob(
         other => other,
     };
 
-    let index = zinfo::Index::build(bytes, span).map_err(named)?;
+    let compression = match media_type {
+        Some(media_type) => extract::compression_of(media_type)
+            .ok_or_else(|| Error::UnsupportedMediaType(media_type.to_string()))?,
+        None => sniff(bytes).ok_or_else(|| {
+            Error::io(
+                format!("{blob} is not gzip or zstd"),
+                std::io::Error::from(std::io::ErrorKind::InvalidData),
+            )
+        })?,
+    };
+    let flavor = match compression {
+        extract::Compression::Gzip => zinfo::Flavor::Gzip,
+        extract::Compression::Zstd => zinfo::Flavor::Zstd,
+        // Nothing to resume from, so the layer is walked at run time.
+        extract::Compression::None => return Ok(()),
+    };
+
+    let index = zinfo::Index::build(flavor, bytes, span).map_err(named)?;
     write_sidecar(checkpoints, |writer| index.write_to(writer))?;
 
-    // A second pass rather than a second job for the inflater: the entry walk
-    // wants the tar stream in order, and the checkpoint pass keeps none of it.
+    // A second pass rather than a second job for the decompressor: the entry
+    // walk wants the tar stream in order, and the checkpoint pass keeps none
+    // of it.
     //
     // A layer the walk cannot follow still extracts, because extraction reads
     // the stream itself; it just does not get planned. So the table is left
     // out rather than failing the build over it.
-    match entries::Table::build(flate2::read::MultiGzDecoder::new(bytes)) {
+    match entries::Table::build(extract::decompressed(compression, bytes)) {
         Ok(table) => write_sidecar(entries, |writer| table.write_to(writer)),
         Err(err) => {
             log::warn(format!("not recording the entries of {blob}: {err}"));
             Ok(())
         }
+    }
+}
+
+/// The compression a blob's first bytes announce.
+fn sniff(bytes: &[u8]) -> Option<extract::Compression> {
+    match bytes {
+        [0x1f, 0x8b, ..] => Some(extract::Compression::Gzip),
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(extract::Compression::Zstd),
+        _ if zinfo::skippable_frame_len(bytes).is_some() => Some(extract::Compression::Zstd),
+        _ => None,
     }
 }
 
@@ -199,7 +234,7 @@ fn write_sidecar(
         .map_err(|source| Error::io(format!("writing {path}"), source))
 }
 
-/// Indexes every gzip layer of every manifest in the layout, so a
+/// Indexes every compressed layer of every manifest in the layout, so a
 /// multi-architecture image gets indexes for whichever platform runs it.
 ///
 /// Blobs are independent, so they are indexed concurrently. This runs as a
@@ -214,7 +249,7 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
     let mut work = Vec::new();
     for manifest in layout.all_manifests()? {
         for layer in &manifest.layers {
-            if extract::compression_of(&layer.media_type) != Some(extract::Compression::Gzip) {
+            if extract::flavor_of(&layer.media_type).is_none() {
                 continue;
             }
             let hex = image::parse_digest(&layer.digest)?.hex;
@@ -226,6 +261,7 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
                 blob,
                 sidecar::checkpoints_at(output, &hex),
                 sidecar::entries_at(output, &hex),
+                layer.media_type.clone(),
             ));
         }
     }
@@ -246,10 +282,10 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
             scope.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((blob, checkpoints, entries)) = work.get(i) else {
+                    let Some((blob, checkpoints, entries, media_type)) = work.get(i) else {
                         break;
                     };
-                    let result = index_blob(blob, checkpoints, entries, span);
+                    let result = index_blob(blob, checkpoints, entries, span, Some(media_type));
                     *results[i].lock().expect("index result") = Some(result);
                 }
             });
@@ -354,16 +390,27 @@ mod tests {
             encoder.finish().expect("finish")
         }
 
+        fn zstd(bytes: &[u8]) -> Vec<u8> {
+            ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest)
+        }
+
         #[test]
-        fn a_layout_gets_one_index_per_gzip_layer() {
+        fn a_layout_gets_one_index_per_compressed_layer() {
             let root = scratch("layout");
             let gzip_layer = gzip(b"pretend this is a tar");
             let gzip_hex = image::hex_encode(&Sha256::digest(&gzip_layer));
+            let zstd_layer = zstd(b"pretend this is another tar");
+            let zstd_hex = image::hex_encode(&Sha256::digest(&zstd_layer));
 
             let gzip_descriptor = install_blob(
                 &root,
                 "application/vnd.oci.image.layer.v1.tar+gzip",
                 &gzip_layer,
+            );
+            let zstd_descriptor = install_blob(
+                &root,
+                "application/vnd.oci.image.layer.v1.tar+zstd",
+                &zstd_layer,
             );
             let plain_descriptor = install_blob(
                 &root,
@@ -375,7 +422,7 @@ mod tests {
             // The gzip layer appears twice, as in a multi-platform image
             // sharing a base layer: it must be indexed once.
             let manifest = format!(
-                r#"{{"config": {config_descriptor}, "layers": [{gzip_descriptor}, {plain_descriptor}, {gzip_descriptor}]}}"#,
+                r#"{{"config": {config_descriptor}, "layers": [{gzip_descriptor}, {plain_descriptor}, {gzip_descriptor}, {zstd_descriptor}]}}"#,
             );
             let manifest_descriptor = install_blob(
                 &root,
@@ -391,7 +438,7 @@ mod tests {
             let output = root.join("indexes");
             index_layout(&root, &output, 4 << 20).expect("index the layout");
 
-            let entries: Vec<String> = std::fs::read_dir(&output)
+            let mut entries: Vec<String> = std::fs::read_dir(&output)
                 .expect("read output")
                 .map(|entry| {
                     entry
@@ -401,10 +448,20 @@ mod tests {
                         .expect("utf-8")
                 })
                 .collect();
-            assert_eq!(entries, [format!("{gzip_hex}.zinfo")]);
+            entries.sort();
+            let mut expected = [format!("{gzip_hex}.zinfo"), format!("{zstd_hex}.zinfo")];
+            expected.sort();
+            assert_eq!(entries, expected);
 
-            let file = std::fs::File::open(output.join(&entries[0])).expect("open index");
-            zinfo::Index::read_from(std::io::BufReader::new(file)).expect("a well-formed index");
+            for (name, flavor) in [
+                (format!("{gzip_hex}.zinfo"), zinfo::Flavor::Gzip),
+                (format!("{zstd_hex}.zinfo"), zinfo::Flavor::Zstd),
+            ] {
+                let file = std::fs::File::open(output.join(name)).expect("open index");
+                let index = zinfo::Index::read_from(std::io::BufReader::new(file))
+                    .expect("a well-formed index");
+                assert_eq!(index.flavor, flavor);
+            }
 
             std::fs::remove_dir_all(&root).expect("cleanup");
         }

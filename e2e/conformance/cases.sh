@@ -134,19 +134,14 @@ check_fixture() {
 
   # With sidecars beside the blobs the launcher resolves the image up front and
   # extracts it span by span, which is a different code path to the walk above.
-  # Only gzip blobs can be checkpointed, so a fixture with a zstd layer walks
-  # here too; the count below says which layers the build could index.
+  # Both compressed formats are checkpointed, so every layer is indexed.
   local index="${work}/${name}/index"
   mkdir -p "$index"
   "$launcher" index --layout "$layout" --output "$index" >/dev/null 2>&1
-  local indexable=0 spec
-  for spec in "$@"; do
-    [[ "$spec" == zstd:* ]] || indexable=$((indexable + 1))
-  done
   local sidecars
   sidecars=$(find "$index" -name '*.zinfo' | wc -l)
-  if ((sidecars != indexable)); then
-    fail "${name}: ${sidecars} checkpoint indexes for ${indexable} gzip layer(s)"
+  if ((sidecars != $#)); then
+    fail "${name}: ${sidecars} checkpoint indexes for $# layer(s)"
   fi
   local indexed
   indexed=$(extract "$layout" "${work}/${name}/indexed" "$index")

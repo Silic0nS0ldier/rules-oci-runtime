@@ -173,6 +173,12 @@ fn zstd(bytes: &[u8]) -> Vec<u8> {
     ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest)
 }
 
+/// The same bytes cut into frames, as `pzstd` and the seekable format write
+/// them. Only a blob like this has anywhere for a span to start.
+fn zstd_framed(bytes: &[u8], each: usize) -> Vec<u8> {
+    bytes.chunks(each).flat_map(zstd).collect()
+}
+
 /// Writes a blob and returns a descriptor that matches it.
 fn install_blob(root: &Utf8Path, media_type: &str, blob: &[u8]) -> Descriptor {
     let hex = hex_encode(&Sha256::digest(blob));
@@ -722,7 +728,8 @@ fn gzip_default(bytes: &[u8]) -> Vec<u8> {
 /// Builds a checkpoint index for the blob and installs it where the
 /// extractor looks, returning the index directory.
 fn install_index(root: &Utf8Path, descriptor: &Descriptor, blob: &[u8]) -> Utf8PathBuf {
-    let index = zinfo::Index::build(blob, 64 * 1024).expect("index");
+    let flavor = flavor_of(&descriptor.media_type).expect("an indexable layer");
+    let index = zinfo::Index::build(flavor, blob, 64 * 1024).expect("index");
     assert!(
         index.checkpoints.len() > 2,
         "the sample must produce several checkpoints, got {}",
@@ -739,23 +746,124 @@ fn install_index(root: &Utf8Path, descriptor: &Descriptor, blob: &[u8]) -> Utf8P
 
 #[test]
 fn an_indexed_layer_extracts_the_same_bytes() {
-    let root = scratch("indexed");
-    let tar = multi_span_tar();
-    let blob = gzip_default(&tar);
-    let descriptor = install_blob(&root, GZIP_LAYER, &blob);
-    let dir = install_index(&root, &descriptor, &blob);
+    for (name, media_type, blob) in [
+        ("gzip", GZIP_LAYER, gzip_default(&multi_span_tar())),
+        (
+            "zstd",
+            ZSTD_LAYER,
+            zstd_framed(&multi_span_tar(), 64 * 1024),
+        ),
+    ] {
+        let root = scratch(&format!("indexed-{name}"));
+        let descriptor = install_blob(&root, media_type, &blob);
+        let dir = install_index(&root, &descriptor, &blob);
 
-    let rootfs = extract_indexed(&root, &descriptor, Some(&dir)).expect("extract");
-    assert_eq!(
-        fs::read(rootfs.join("random")).expect("random"),
-        random_bytes(1 << 20),
-        "indexed extraction must reproduce the exact bytes"
+        let rootfs = extract_indexed(&root, &descriptor, Some(&dir)).expect("extract");
+        assert_eq!(
+            fs::read(rootfs.join("random")).expect("random"),
+            random_bytes(1 << 20),
+            "{name}: indexed extraction must reproduce the exact bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("small")).expect("small"),
+            "hello"
+        );
+        let _ = fsutil::force_remove_dir_all(root.as_std_path());
+    }
+}
+
+/// A gzip checkpoint carries a window and can sit mid-block; a zstd one
+/// carries nothing and must sit at a frame start. Reading either as the other
+/// would resume from the wrong state, and the sidecar is named after the
+/// layer's digest alone, so nothing but the index itself can tell them apart.
+#[test]
+fn an_index_of_the_wrong_format_is_ignored() {
+    let root = scratch("indexed-flavour");
+    let tar = multi_span_tar();
+    let blob = zstd_framed(&tar, 64 * 1024);
+    let descriptor = install_blob(&root, ZSTD_LAYER, &blob);
+
+    let dir = root.join("indexes");
+    fs::create_dir_all(&dir).expect("index dir");
+    let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+    let gzip_index =
+        zinfo::Index::build(zinfo::Flavor::Gzip, &gzip_default(&tar), 64 * 1024).expect("index");
+    let mut bytes = Vec::new();
+    gzip_index.write_to(&mut bytes).expect("serialise");
+    fs::write(dir.join(format!("{hex}.zinfo")), bytes).expect("install index");
+
+    assert!(
+        index_at(&dir, &descriptor).is_none(),
+        "a gzip index must not be used for a zstd layer"
     );
+    // Ignoring it is not failing: the layer still streams.
+    let rootfs = extract_indexed(&root, &descriptor, Some(&dir)).expect("extract");
     assert_eq!(
         fs::read_to_string(rootfs.join("small")).expect("small"),
         "hello"
     );
     let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+/// A layer written as one frame has nowhere to resume, so it indexes as a
+/// single span. That is still worth recording: one layer without an index
+/// takes the whole image off the span route.
+#[test]
+fn a_single_frame_zstd_layer_still_gets_an_index() {
+    let root = scratch("indexed-one-frame");
+    let blob = zstd(&multi_span_tar());
+    let descriptor = install_blob(&root, ZSTD_LAYER, &blob);
+    let dir = root.join("indexes");
+    fs::create_dir_all(&dir).expect("index dir");
+    let index = zinfo::Index::build(zinfo::Flavor::Zstd, &blob, 64 * 1024).expect("index");
+    assert_eq!(index.checkpoints.len(), 1);
+    let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+    let mut bytes = Vec::new();
+    index.write_to(&mut bytes).expect("serialise");
+    fs::write(dir.join(format!("{hex}.zinfo")), bytes).expect("install index");
+
+    assert!(index_at(&dir, &descriptor).is_some());
+    let rootfs = extract_indexed(&root, &descriptor, Some(&dir)).expect("extract");
+    assert_eq!(
+        fs::read(rootfs.join("random")).expect("random"),
+        random_bytes(1 << 20)
+    );
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+/// The seekable format ends with its jump table in a skippable frame, and
+/// `zstd:chunked` opens with its manifest in one. Every decoder has to step
+/// over them, whichever route reads the layer.
+#[test]
+fn skippable_frames_do_not_stop_a_layer() {
+    let root = scratch("zstd-skippable");
+    let tar = multi_span_tar();
+    let mut blob = skippable_frame(b"a manifest of some kind");
+    blob.extend_from_slice(&zstd_framed(&tar, 64 * 1024));
+    blob.extend_from_slice(&skippable_frame(&[0u8; 256]));
+    let descriptor = install_blob(&root, ZSTD_LAYER, &blob);
+
+    let streamed = extract_indexed(&root, &descriptor, None).expect("stream");
+    assert_eq!(
+        fs::read(streamed.join("random")).expect("random"),
+        random_bytes(1 << 20)
+    );
+    fsutil::force_remove_dir_all(streamed.as_std_path()).expect("clear rootfs");
+
+    let dir = install_index(&root, &descriptor, &blob);
+    let spanned = extract_indexed(&root, &descriptor, Some(&dir)).expect("extract");
+    assert_eq!(
+        fs::read(spanned.join("random")).expect("random"),
+        random_bytes(1 << 20)
+    );
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
+fn skippable_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = 0x184D_2A50u32.to_le_bytes().to_vec();
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
 }
 
 #[test]
@@ -781,11 +889,12 @@ fn a_tampered_index_fails_the_extraction() {
     let descriptor = install_blob(&root, GZIP_LAYER, &blob);
     let dir = install_index(&root, &descriptor, &blob);
 
-    // Flip the first checkpoint's span CRC (after magic, length and count).
+    // Flip the first checkpoint's span CRC, which follows the header (magic,
+    // flavour, length, count) and the checkpoint's two offsets.
     let hex = parse_digest(&descriptor.digest).expect("digest").hex;
     let path = dir.join(format!("{hex}.zinfo"));
     let mut bytes = fs::read(&path).expect("index");
-    bytes[32] ^= 0xff;
+    bytes[4 + 1 + 8 + 4 + 8 + 8] ^= 0xff;
     fs::write(&path, bytes).expect("index");
 
     let err = extract_indexed(&root, &descriptor, Some(&dir))
@@ -806,7 +915,7 @@ fn an_index_for_another_blob_is_an_error_not_a_panic() {
     // An index built from a different, shorter blob: checkpoints point
     // into compressed bytes that do not exist.
     let other = gzip_default(&random_bytes(512 * 1024));
-    let index = zinfo::Index::build(&other, 64 * 1024).expect("index");
+    let index = zinfo::Index::build(zinfo::Flavor::Gzip, &other, 64 * 1024).expect("index");
     let dir = root.join("indexes");
     fs::create_dir_all(&dir).expect("index dir");
     let hex = parse_digest(&descriptor.digest).expect("digest").hex;
@@ -881,30 +990,37 @@ fn tar_of(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
     builder.into_inner().expect("tar")
 }
 
-/// Installs `layers` as alternating gzip and zstd blobs, optionally with an
-/// entry table beside each: the shape `oci_image` produces when it adds a zstd
+/// Installs `layers` as alternating gzip and zstd blobs, optionally with the
+/// sidecars beside each: the shape `oci_image` produces when it adds a zstd
 /// layer to a gzip base.
 fn install_mixed_compression(
     root: &Utf8Path,
     layers: &[Vec<u8>],
-    tables: bool,
+    sidecars: bool,
 ) -> (Utf8PathBuf, Vec<Descriptor>) {
     let index_dir = root.join("indexes");
     fs::create_dir_all(&index_dir).expect("index dir");
 
     let mut descriptors = Vec::new();
     for (nth, tar) in layers.iter().enumerate() {
-        let descriptor = if nth % 2 == 0 {
-            install_blob(root, GZIP_LAYER, &gzip(tar))
+        let (media_type, blob) = if nth % 2 == 0 {
+            (GZIP_LAYER, gzip(tar))
         } else {
-            install_blob(root, ZSTD_LAYER, &zstd(tar))
+            (ZSTD_LAYER, zstd(tar))
         };
-        if tables {
+        let descriptor = install_blob(root, media_type, &blob);
+        if sidecars {
             let hex = parse_digest(&descriptor.digest).expect("digest").hex;
             let table = crate::entries::Table::build(&tar[..]).expect("entry table");
             let mut bytes = Vec::new();
             table.write_to(&mut bytes).expect("serialise");
             fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
+
+            let flavor = flavor_of(media_type).expect("an indexable layer");
+            let index = zinfo::Index::build(flavor, &blob, 64 * 1024).expect("index");
+            let mut bytes = Vec::new();
+            index.write_to(&mut bytes).expect("serialise");
+            fs::write(index_dir.join(format!("{hex}.zinfo")), bytes).expect("install index");
         }
         descriptors.push(descriptor);
     }
@@ -951,13 +1067,13 @@ fn a_zstd_layer_over_a_gzip_base_plans_the_tree_it_streams() {
         extractor.plan.is_resolved(),
         "the tables must resolve the plan"
     );
-    // Only gzip layers are indexed at build time, so one zstd layer leaves the
-    // image short of the checkpoints the span route needs and it walks.
+    // Both formats index, so a zstd layer no longer takes the whole image off
+    // the span route.
     assert!(
         descriptors
             .iter()
-            .all(|descriptor| index_at(&index_dir, descriptor).is_none()),
-        "a zstd layer has no checkpoint index to fall back on"
+            .all(|descriptor| index_at(&index_dir, descriptor).is_some()),
+        "every layer of a mixed image must have a checkpoint index"
     );
     extractor.apply(&layout, &descriptors).expect("apply");
     extractor.finish().expect("finish");
@@ -1303,8 +1419,8 @@ fn a_hard_link_naming_its_own_path_with_nothing_there_is_refused() {
 }
 
 /// The ways a layer set can reach the rootfs. Which one runs is decided by
-/// what sidecars sit beside the blobs, so a fixture can be put through all
-/// three and the results compared.
+/// what sidecars sit beside the blobs, so a fixture can be put through all of
+/// them and the results compared.
 #[derive(Clone, Copy, Debug)]
 enum Route {
     /// No sidecars: every layer is walked and applied in turn.
@@ -1315,10 +1431,34 @@ enum Route {
     /// Entry tables and checkpoint indexes: the plan becomes a queue of spans
     /// extracted in parallel.
     Spans,
+    /// The same, over zstd layers, whose spans resume from a frame boundary
+    /// rather than an inflate window.
+    ZstdSpans,
 }
 
 impl Route {
-    const ALL: [Route; 3] = [Route::Streaming, Route::Planned, Route::Spans];
+    const ALL: [Route; 4] = [
+        Route::Streaming,
+        Route::Planned,
+        Route::Spans,
+        Route::ZstdSpans,
+    ];
+
+    /// Frames are the only place a zstd span can start, so the fixtures are
+    /// cut into small ones; the gzip routes checkpoint inside a single member.
+    fn compress(self, tar: &[u8]) -> (&'static str, Vec<u8>) {
+        match self {
+            Route::ZstdSpans => (ZSTD_LAYER, zstd_framed(tar, 2048)),
+            _ => (GZIP_LAYER, gzip_default(tar)),
+        }
+    }
+
+    fn span_bytes(self) -> u64 {
+        match self {
+            Route::ZstdSpans => 4096,
+            _ => 64 * 1024,
+        }
+    }
 }
 
 /// Installs `layers` as blobs, with exactly the sidecars `route` reads.
@@ -1332,18 +1472,19 @@ fn install_for(
 
     let mut descriptors = Vec::new();
     for tar in layers {
-        let blob = gzip_default(tar);
-        let descriptor = install_blob(root, GZIP_LAYER, &blob);
+        let (media_type, blob) = route.compress(tar);
+        let descriptor = install_blob(root, media_type, &blob);
         let hex = parse_digest(&descriptor.digest).expect("digest").hex;
 
-        if matches!(route, Route::Planned | Route::Spans) {
+        if matches!(route, Route::Planned | Route::Spans | Route::ZstdSpans) {
             let table = crate::entries::Table::build(&tar[..]).expect("entry table");
             let mut bytes = Vec::new();
             table.write_to(&mut bytes).expect("serialise");
             fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
         }
-        if matches!(route, Route::Spans) {
-            let index = zinfo::Index::build(&blob, 64 * 1024).expect("index");
+        if matches!(route, Route::Spans | Route::ZstdSpans) {
+            let flavor = flavor_of(media_type).expect("an indexable layer");
+            let index = zinfo::Index::build(flavor, &blob, route.span_bytes()).expect("index");
             let mut bytes = Vec::new();
             index.write_to(&mut bytes).expect("serialise");
             fs::write(index_dir.join(format!("{hex}.zinfo")), bytes).expect("install index");
@@ -1369,7 +1510,7 @@ fn extract_by(
     let rootfs = root.join("rootfs");
     let dir = match route {
         Route::Streaming => None,
-        Route::Planned | Route::Spans => Some(index_dir.as_path()),
+        Route::Planned | Route::Spans | Route::ZstdSpans => Some(index_dir.as_path()),
     };
     let mut extractor = RootfsExtractor::new(&rootfs, dir, strict_xattrs)?;
     extractor.plan(&descriptors)?;
@@ -1390,7 +1531,7 @@ fn extract_by(
                 "the planned route must have no checkpoint index to fall back on"
             );
         }
-        Route::Spans => {
+        Route::Spans | Route::ZstdSpans => {
             assert!(
                 extractor.plan.work().is_some(),
                 "the plan must produce work"
@@ -1416,7 +1557,7 @@ fn apply_by(route: Route, root: &Utf8Path, layers: &[Vec<u8>]) -> (Result<Utf8Pa
     let rootfs = root.join("rootfs");
     let dir = match route {
         Route::Streaming => None,
-        Route::Planned | Route::Spans => Some(index_dir.as_path()),
+        Route::Planned | Route::Spans | Route::ZstdSpans => Some(index_dir.as_path()),
     };
 
     let mut placed = false;
