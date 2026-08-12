@@ -27,6 +27,12 @@ exposed as a separate `sh_test` target. A case builds its layers with `tar`,
 assembles them into an image with `umoci raw add-layer`, then compares the
 entries, their contents, and which names share an inode.
 
+Layers are named `[<compression>:]<path>`, defaulting to gzip. Only gzip blobs
+carry the checkpoints the parallel route needs, so a fixture with a zstd layer
+is extracted by the walk both times; each case asserts that it got exactly the
+sidecars its layers allow, which is also what catches a fixture that asked for
+zstd and was written as gzip.
+
 Every fixture ships an `etc/` directory. The launcher writes `etc/hostname`,
 `etc/hosts` and `etc/resolv.conf` into the bundle itself, and those three are
 excluded from the comparison; without an `etc/` in the layer the launcher would

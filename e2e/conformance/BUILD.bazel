@@ -12,7 +12,9 @@ CASES = [
     "dot_rooted_layers",
     "whiteouts",
     "links_and_modes",
+    "mixed_compression",
     "same_layer_whiteout",
+    "zstd_layers",
 ]
 
 [

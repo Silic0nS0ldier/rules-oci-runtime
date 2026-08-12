@@ -77,13 +77,22 @@ pack() {
   (cd "$from" && tar --format=gnu --no-recursion -cf "$out" "$@")
 }
 
+# Layers are named `[<compression>:]<path>`. umoci compresses with gzip unless
+# told otherwise, which is what every fixture without a prefix gets.
 build_image() {
   local layout=$1
   shift
   "$umoci" init --layout "$layout" >/dev/null || return 1
   "$umoci" new --image "${layout}:test" >/dev/null || return 1
-  for layer in "$@"; do
-    "$umoci" raw add-layer --image "${layout}:test" "$layer" >/dev/null 2>&1 || return 1
+  local spec compress layer
+  for spec in "$@"; do
+    compress=${spec%%:*}
+    layer=${spec#*:}
+    if [[ "$layer" == "$spec" ]]; then
+      compress=gzip
+    fi
+    "$umoci" raw add-layer --compress="$compress" --image "${layout}:test" "$layer" \
+      >/dev/null 2>&1 || return 1
   done
 }
 
@@ -125,9 +134,20 @@ check_fixture() {
 
   # With sidecars beside the blobs the launcher resolves the image up front and
   # extracts it span by span, which is a different code path to the walk above.
+  # Only gzip blobs can be checkpointed, so a fixture with a zstd layer walks
+  # here too; the count below says which layers the build could index.
   local index="${work}/${name}/index"
   mkdir -p "$index"
   "$launcher" index --layout "$layout" --output "$index" >/dev/null 2>&1
+  local indexable=0 spec
+  for spec in "$@"; do
+    [[ "$spec" == zstd:* ]] || indexable=$((indexable + 1))
+  done
+  local sidecars
+  sidecars=$(find "$index" -name '*.zinfo' | wc -l)
+  if ((sidecars != indexable)); then
+    fail "${name}: ${sidecars} checkpoint indexes for ${indexable} gzip layer(s)"
+  fi
   local indexed
   indexed=$(extract "$layout" "${work}/${name}/indexed" "$index")
   [[ -n "$indexed" ]] || {
@@ -150,20 +170,42 @@ case_dot_rooted_layers() {
 }
 
 # A named whiteout, an opaque whiteout, and a path replaced by a later layer.
-case_whiteouts() {
-  local one="${work}/wh/one" two="${work}/wh/two"
+# Packed under `${work}/$1`, so the compression cases below can have their own
+# copy of the same two layers.
+whiteout_layers() {
+  local at=$1
+  local one="${work}/${at}/one" two="${work}/${at}/two"
   mkdir -p "$one/etc" "$one/d/sub" "$two/etc" "$two/d"
   printf 'lower\n' >"$one/etc/config"
   printf 'gone\n' >"$one/etc/removed"
   printf 'one\n' >"$one/d/one"
   printf 'two\n' >"$one/d/sub/two"
-  pack "$one" "${work}/wh/l1.tar" ./ ./d ./d/one ./d/sub ./d/sub/two ./etc ./etc/config ./etc/removed
+  pack "$one" "${work}/${at}/l1.tar" ./ ./d ./d/one ./d/sub ./d/sub/two ./etc ./etc/config ./etc/removed
 
   printf 'upper\n' >"$two/etc/config"
   : >"$two/etc/.wh.removed"
   : >"$two/d/.wh..wh..opq"
-  pack "$two" "${work}/wh/l2.tar" ./ ./d ./d/.wh..wh..opq ./etc ./etc/config ./etc/.wh.removed
+  pack "$two" "${work}/${at}/l2.tar" ./ ./d ./d/.wh..wh..opq ./etc ./etc/config ./etc/.wh.removed
+}
+
+case_whiteouts() {
+  whiteout_layers wh
   check_fixture wh "${work}/wh/l1.tar" "${work}/wh/l2.tar"
+}
+
+# zstd is the other compression the image spec defines, and both sides read it:
+# the launcher through `ruzstd`, umoci through `klauspost/compress`.
+case_zstd_layers() {
+  whiteout_layers zstd
+  check_fixture zstd "zstd:${work}/zstd/l1.tar" "zstd:${work}/zstd/l2.tar"
+}
+
+# Compression is a property of the layer, not of the image, so the two can be
+# mixed -- which is what `oci_image` produces when it adds a zstd layer to a
+# base whose layers are gzip.
+case_mixed_compression() {
+  whiteout_layers mixed
+  check_fixture mixed "${work}/mixed/l1.tar" "zstd:${work}/mixed/l2.tar"
 }
 
 # "Files that are present in the same layer as a whiteout file can only be
