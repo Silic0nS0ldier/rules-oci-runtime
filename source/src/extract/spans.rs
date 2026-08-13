@@ -240,6 +240,7 @@ fn run(units: &[Unit], layers: &[Layer], work: &Work, plan: &Plan, root: &Path) 
             scope.spawn(move || {
                 let mut buffer = Vec::new();
                 let mut path = PathBuf::new();
+                let mut decoders = zinfo::Decoders::default();
                 while !stop.load(Ordering::Relaxed) {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(unit) = units.get(i) else { break };
@@ -257,6 +258,7 @@ fn run(units: &[Unit], layers: &[Layer], work: &Work, plan: &Plan, root: &Path) 
                             root,
                             &mut buffer,
                             &mut path,
+                            &mut decoders,
                         ),
                     };
                     if let Err(err) = result {
@@ -288,6 +290,7 @@ fn run_span(
     root: &Path,
     buffer: &mut Vec<u8>,
     path: &mut PathBuf,
+    decoders: &mut zinfo::Decoders,
 ) -> Result<()> {
     let base = layer.index.checkpoints[checkpoint].out_offset;
     let last = &table.entries[*entries.last().expect("a unit has entries") as usize];
@@ -310,7 +313,7 @@ fn run_span(
         }
         filled += layer
             .index
-            .extract_span_into(&layer.blob, at, buffer, filled)?;
+            .extract_span_into(&layer.blob, at, buffer, filled, decoders)?;
         at += 1;
     }
 
