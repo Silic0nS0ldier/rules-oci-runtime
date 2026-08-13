@@ -241,7 +241,7 @@ impl Index {
     /// end of the stream) and verifies it against the recorded CRC.
     pub fn extract_span(&self, blob: &[u8], i: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        self.extract_span_into(blob, i, &mut out, 0)?;
+        self.extract_span_into(blob, i, &mut out, 0, &mut Decoders::default())?;
         Ok(out)
     }
 
@@ -257,6 +257,7 @@ impl Index {
         i: usize,
         out: &mut Vec<u8>,
         at: usize,
+        decoders: &mut Decoders,
     ) -> Result<usize> {
         let context = "resuming from checkpoint";
         let point = &self.checkpoints[i];
@@ -281,8 +282,8 @@ impl Index {
         let span = &mut out[at..at + len];
         let mut crc = flate2::Crc::new();
         match self.flavor {
-            Flavor::Gzip => inflate_span(blob, point, span, &mut crc)?,
-            Flavor::Zstd => decode_span(blob, point, span, &mut crc)?,
+            Flavor::Gzip => inflate_span(blob, point, span, &mut crc, decoders)?,
+            Flavor::Zstd => decode_span(blob, point, span, &mut crc, decoders)?,
         }
 
         if crc.sum() != point.crc {
@@ -372,6 +373,36 @@ impl Index {
     }
 }
 
+/// Scratch that a span decode needs and the next one can have back.
+///
+/// Both decoders own buffers measured in tens of kilobytes to a megabyte, and
+/// a worker decodes span after span. Building them per span left the allocator
+/// asking the kernel for the same memory hundreds of times, and every unmap
+/// interrupts the other workers to shoot down their TLBs.
+#[derive(Default)]
+pub struct Decoders {
+    gzip: Option<Inflater>,
+    zstd: Option<(FrameDecoder, Vec<u8>)>,
+}
+
+impl Decoders {
+    /// An inflater rewound to `window_bits`, built on first use.
+    fn inflater(&mut self, window_bits: i32) -> io::Result<&mut Inflater> {
+        match &mut self.gzip {
+            Some(inflater) => inflater.reset_to(window_bits)?,
+            slot => *slot = Some(Inflater::new(window_bits)?),
+        }
+        Ok(self.gzip.as_mut().expect("just filled"))
+    }
+
+    fn zstd(&mut self) -> (&mut FrameDecoder, &mut Vec<u8>) {
+        let (decoder, scratch) = self
+            .zstd
+            .get_or_insert_with(|| (FrameDecoder::new(), vec![0u8; 1 << 20]));
+        (decoder, scratch)
+    }
+}
+
 /// Inflates one gzip span into `span`, which is exactly its length,
 /// checksumming each piece as it lands.
 fn inflate_span(
@@ -379,16 +410,18 @@ fn inflate_span(
     point: &Checkpoint,
     span: &mut [u8],
     crc: &mut flate2::Crc,
+    decoders: &mut Decoders,
 ) -> Result<()> {
     let context = "resuming from checkpoint";
     // An empty window is a stream or member start: parse the header there.
     let at_header = point.window.is_empty() && point.bits == 0;
-    let mut inflater = Inflater::new(if at_header {
-        HEADER_WINDOW_BITS
-    } else {
-        RAW_WINDOW_BITS
-    })
-    .map_err(|e| Error::io(context, e))?;
+    let inflater = decoders
+        .inflater(if at_header {
+            HEADER_WINDOW_BITS
+        } else {
+            RAW_WINDOW_BITS
+        })
+        .map_err(|e| Error::io(context, e))?;
     if point.bits != 0 {
         // The boundary sits inside the previous byte: feed its unconsumed
         // high bits, then continue from the byte boundary.
@@ -426,7 +459,9 @@ fn inflate_span(
                         io::Error::other("stream ended before the indexed span"),
                     ));
                 }
-                inflater = Inflater::new(HEADER_WINDOW_BITS).map_err(|e| Error::io(context, e))?;
+                inflater
+                    .reset_to(HEADER_WINDOW_BITS)
+                    .map_err(|e| Error::io(context, e))?;
             }
             Z_OK if consumed == 0 && produced == 0 => {
                 return Err(Error::io(
@@ -450,11 +485,11 @@ fn decode_span(
     point: &Checkpoint,
     span: &mut [u8],
     crc: &mut flate2::Crc,
+    decoders: &mut Decoders,
 ) -> Result<()> {
     let context = "resuming from checkpoint";
     let len = span.len();
-    let mut decoder = FrameDecoder::new();
-    let mut scratch = vec![0u8; 1 << 20];
+    let (decoder, scratch) = decoders.zstd();
     let mut pos = point.in_offset as usize;
     let mut filled = 0usize;
 
@@ -473,7 +508,7 @@ fn decode_span(
             continue;
         }
         let mut overflowed = false;
-        pos = decode_frame(&mut decoder, blob, pos, &mut scratch, |bytes| {
+        pos = decode_frame(decoder, blob, pos, scratch, |bytes| {
             let take = bytes.len().min(len - filled);
             span[filled..filled + take].copy_from_slice(&bytes[..take]);
             crc.update(&bytes[..take]);
@@ -667,6 +702,19 @@ impl Inflater {
         }
         Ok(())
     }
+
+    /// Rewinds to before the header and changes what header to expect, so one
+    /// inflater serves spans that resume at a member start and spans that
+    /// resume mid stream.
+    fn reset_to(&mut self, window_bits: i32) -> io::Result<()> {
+        // SAFETY: the stream is initialised; inflateReset2 accepts the same
+        // window bits inflateInit2_ does.
+        let ret = unsafe { libz_rs_sys::inflateReset2(&mut self.0, window_bits) };
+        if ret != Z_OK {
+            return Err(io::Error::other("inflateReset2 failed"));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Inflater {
@@ -755,7 +803,7 @@ mod tests {
         let mut buffer = vec![0xab; 4 << 20];
         let stale = buffer.len();
         let written = index
-            .extract_span_into(&blob, 1, &mut buffer, 0)
+            .extract_span_into(&blob, 1, &mut buffer, 0, &mut Decoders::default())
             .expect("span");
 
         let start = index.checkpoints[1].out_offset as usize;
