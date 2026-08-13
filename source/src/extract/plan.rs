@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use camino::Utf8Path;
+use ref_cast::RefCast;
 
 use crate::entries::{Entry, Kind, Table};
 use crate::fsutil;
@@ -34,6 +35,59 @@ const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 /// The rootfs itself, which a layer names as `.` or `/` and which the tree
 /// holds the one way.
 const ROOT_ENTRY: &[u8] = b".";
+
+/// A path as the tree orders it: the bytes, compared eight at a time.
+///
+/// The order is exactly `[u8]`'s, and the tree depends on that -- everything
+/// under a directory is one contiguous range only because paths sort as
+/// bytes. What differs is the cost. Image paths share long prefixes, so every
+/// lookup walks one before it finds a difference, and `[u8]`'s own comparison
+/// is the C library's `memcmp`, which musl writes a byte at a time. It was the
+/// largest single cost in the plan, and the plan runs on one thread while the
+/// workers wait for it.
+///
+/// It has to be a newtype over `[u8]` rather than a struct holding one: the
+/// map is keyed on borrowed paths, and only an unsized key can be looked up
+/// by a path that does not live as long as the tree.
+#[derive(PartialEq, Eq, Debug, RefCast)]
+#[repr(transparent)]
+struct Key([u8]);
+
+impl Key {
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let common = self.0.len().min(other.0.len());
+        let (mut ours, mut theirs) = (
+            self.0[..common].chunks_exact(8),
+            other.0[..common].chunks_exact(8),
+        );
+        for (ours, theirs) in ours.by_ref().zip(theirs.by_ref()) {
+            // Big endian, so that comparing the words compares the bytes.
+            let ours = u64::from_be_bytes(ours.try_into().expect("eight bytes"));
+            let theirs = u64::from_be_bytes(theirs.try_into().expect("eight bytes"));
+            if ours != theirs {
+                return ours.cmp(&theirs);
+            }
+        }
+        for (ours, theirs) in ours.remainder().iter().zip(theirs.remainder()) {
+            if ours != theirs {
+                return ours.cmp(theirs);
+            }
+        }
+        self.0.len().cmp(&other.0.len())
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// The entries each layer can skip, keyed by layer digest, and the directory
 /// tree they all need.
@@ -134,7 +188,7 @@ impl Plan {
                 // does: a layer that names one path twice is skipped by path,
                 // so shadowing the loser would take the winner with it.
                 let survives = tree
-                    .get(entry.path.as_slice())
+                    .get(Key::ref_cast(entry.path.as_slice()))
                     .is_some_and(|node| node.owner.0 == l);
                 if !survives {
                     bytes += entry.size;
@@ -251,7 +305,7 @@ fn canonicalise(tables: &mut [Table]) -> bool {
 ///   points and the walk checks that against the rootfs as it goes;
 /// - a hard link whose target is replaced after it, where the copy the walk
 ///   linked is not the copy that survives.
-fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
+fn placeable(tree: &BTreeMap<&Key, Node>, tables: &[Table]) -> Option<Work> {
     let mut work = Work {
         files: vec![Vec::new(); tables.len()],
         ..Work::default()
@@ -262,7 +316,7 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
             // Nothing here is created under something that is not a directory,
             // so whatever is there has to be resolved against the tree as it
             // is built. That is the walk's job for the whole image.
-            _ if behind_a_link(tree, path) => return None,
+            _ if behind_a_link(tree, path.as_bytes()) => return None,
             Kind::Directory | Kind::Unsupported => continue,
             Kind::Sparse => return None,
             Kind::File => work.files[layer].push(entry as u32),
@@ -271,7 +325,7 @@ fn placeable(tree: &BTreeMap<&[u8], Node>, tables: &[Table]) -> Option<Work> {
             Kind::Symlink => work.symlinks.push((layer as u32, entry as u32)),
             Kind::HardLink => {
                 let target = tables[layer].entries[entry].link.as_slice();
-                let at = tree.get(target)?;
+                let at = tree.get(Key::ref_cast(target))?;
                 if behind_a_link(tree, target) {
                     return None;
                 }
@@ -323,8 +377,8 @@ struct Node {
 ///
 /// Sorted by path, so everything under a directory is one contiguous range and
 /// a removal costs what it removes rather than a pass over the whole image.
-fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
-    let mut tree: BTreeMap<&[u8], Node> = BTreeMap::new();
+fn replay(tables: &[Table]) -> (BTreeMap<&Key, Node>, Blocked) {
+    let mut tree: BTreeMap<&Key, Node> = BTreeMap::new();
     let mut bound = Vec::new();
     let mut blocked = Blocked::Nothing;
     for (l, table) in tables.iter().enumerate() {
@@ -349,10 +403,10 @@ fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
                     // walk sees the path in what it has written and leaves the
                     // marker alone entirely.
                     let ours = tree
-                        .get(target.as_slice())
+                        .get(Key::ref_cast(target.as_slice()))
                         .is_some_and(|node| node.named_by == Some(l));
                     if !ours {
-                        tree.remove(target.as_slice());
+                        tree.remove(Key::ref_cast(target.as_slice()));
                         // What is underneath goes with it, this layer's own
                         // work included, because the walk removes the named
                         // path whole.
@@ -381,7 +435,7 @@ fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
                             // `prepare_directory` keeps a symlink that already
                             // resolves to a directory and replaces one that
                             // does not, so which it is decides the path.
-                            let standing = tree.get(entry.path.as_slice());
+                            let standing = tree.get(Key::ref_cast(entry.path.as_slice()));
                             let keep = match standing.filter(|at| at.kind == Kind::Symlink) {
                                 None => false,
                                 Some(at) => match resolves_to_a_directory(
@@ -401,8 +455,10 @@ fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
                                 },
                             };
                             if !keep {
-                                tree.insert(&entry.path, node);
-                            } else if let Some(at) = tree.get_mut(entry.path.as_slice()) {
+                                tree.insert(Key::ref_cast(&entry.path), node);
+                            } else if let Some(at) =
+                                tree.get_mut(Key::ref_cast(entry.path.as_slice()))
+                            {
                                 // The link stays, but the path has been named
                                 // again, which is what a whiteout later in
                                 // this layer goes by.
@@ -418,12 +474,13 @@ fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
                                 // names, so the path keeps its owner and what
                                 // is under it. Naming it again is still what a
                                 // whiteout later in this layer goes by.
-                                if let Some(at) = tree.get_mut(entry.path.as_slice()) {
+                                if let Some(at) = tree.get_mut(Key::ref_cast(entry.path.as_slice()))
+                                {
                                     at.named_by = Some(l);
                                 }
                             } else {
                                 remove_under(&mut tree, &entry.path, &mut bound, Removal::Whole);
-                                tree.insert(&entry.path, node);
+                                tree.insert(Key::ref_cast(&entry.path), node);
                             }
                         }
                     }
@@ -438,7 +495,7 @@ fn replay(tables: &[Table]) -> (BTreeMap<&[u8], Node>, Blocked) {
 /// when the plan cannot say: a target it will not resolve, or one that lands
 /// on another symlink.
 fn resolves_to_a_directory(
-    tree: &BTreeMap<&[u8], Node>,
+    tree: &BTreeMap<&Key, Node>,
     tables: &[Table],
     path: &[u8],
     at: &Node,
@@ -458,7 +515,10 @@ fn resolves_to_a_directory(
     if !fsutil::canonical_entry_path(&joined, &mut resolved) {
         return None;
     }
-    match tree.get(resolved.as_slice()).map(|node| node.kind) {
+    match tree
+        .get(Key::ref_cast(resolved.as_slice()))
+        .map(|node| node.kind)
+    {
         Some(Kind::Symlink) => None,
         Some(kind) => Some(kind == Kind::Directory),
         // Nothing names it, but it is still a directory when something is
@@ -469,15 +529,15 @@ fn resolves_to_a_directory(
 
 /// True when the tree holds anything under `dir`, which makes it a directory
 /// even though no entry names it.
-fn holds_anything(tree: &BTreeMap<&[u8], Node>, dir: &[u8]) -> bool {
+fn holds_anything(tree: &BTreeMap<&Key, Node>, dir: &[u8]) -> bool {
     let mut bound = dir.to_vec();
     bound.push(b'/');
-    tree.range::<[u8], _>((
-        std::ops::Bound::Included(bound.as_slice()),
+    tree.range::<Key, _>((
+        std::ops::Bound::Included(Key::ref_cast(bound.as_slice())),
         std::ops::Bound::Unbounded,
     ))
     .next()
-    .is_some_and(|(path, _)| path.starts_with(&bound))
+    .is_some_and(|(path, _)| path.as_bytes().starts_with(&bound))
 }
 
 /// What stands between the walk and `path`, if anything.
@@ -485,7 +545,7 @@ fn holds_anything(tree: &BTreeMap<&[u8], Node>, dir: &[u8]) -> bool {
 /// A symlink that resolves to a directory is one the walk writes through; one
 /// that resolves to nothing is one it stops on, which is the difference
 /// between an image it extracts and an image it refuses.
-fn under(tree: &BTreeMap<&[u8], Node>, tables: &[Table], path: &[u8]) -> Blocked {
+fn under(tree: &BTreeMap<&Key, Node>, tables: &[Table], path: &[u8]) -> Blocked {
     let Some((ancestor, node)) = blocked_by(tree, path) else {
         return Blocked::Nothing;
     };
@@ -499,7 +559,7 @@ fn under(tree: &BTreeMap<&[u8], Node>, tables: &[Table], path: &[u8]) -> Blocked
 }
 
 /// Whether a link entry names something the walk can link to.
-fn links_somewhere(tree: &BTreeMap<&[u8], Node>, tables: &[Table], entry: &Entry) -> Blocked {
+fn links_somewhere(tree: &BTreeMap<&Key, Node>, tables: &[Table], entry: &Entry) -> Blocked {
     match entry.kind {
         // A link naming nothing is refused rather than left pointing at
         // whatever the empty name resolves to.
@@ -513,9 +573,11 @@ fn links_somewhere(tree: &BTreeMap<&[u8], Node>, tables: &[Table], entry: &Entry
         Kind::HardLink
             if under_itself(&entry.path, &entry.link)
                 || under(tree, tables, &entry.link) != Blocked::Nothing
-                || !tree.get(entry.link.as_slice()).is_some_and(|node| {
-                    !matches!(node.kind, Kind::Directory | Kind::Unsupported)
-                }) =>
+                || !tree
+                    .get(Key::ref_cast(entry.link.as_slice()))
+                    .is_some_and(|node| {
+                        !matches!(node.kind, Kind::Directory | Kind::Unsupported)
+                    }) =>
         {
             Blocked::TheWalkStopsHere
         }
@@ -529,11 +591,11 @@ fn links_somewhere(tree: &BTreeMap<&[u8], Node>, tables: &[Table], entry: &Entry
 /// mode, but they stay behind once whatever they were made for is gone --
 /// which is why the tree has to hold them rather than work them out from what
 /// survives.
-fn ensure_parents<'a>(tree: &mut BTreeMap<&'a [u8], Node>, path: &'a [u8], owner: (usize, usize)) {
+fn ensure_parents<'a>(tree: &mut BTreeMap<&'a Key, Node>, path: &'a [u8], owner: (usize, usize)) {
     for ancestor in ancestors(path) {
         // Something already there is either the directory this needs or a
         // symlink the walk writes through, and neither is ours to replace.
-        tree.entry(ancestor).or_insert(Node {
+        tree.entry(Key::ref_cast(ancestor)).or_insert(Node {
             kind: Kind::Directory,
             owner,
             mode: DEFAULT_DIRECTORY_MODE,
@@ -557,29 +619,29 @@ fn under_itself(path: &[u8], target: &[u8]) -> bool {
 /// A path that ends up a symlink is left out however many entries sit under
 /// it: what it points at is where they actually go, and creating a directory
 /// there would displace the link.
-fn directories(tree: &BTreeMap<&[u8], Node>) -> Vec<(Vec<u8>, u32)> {
-    let mut wanted: BTreeMap<&[u8], u32> = BTreeMap::new();
+fn directories(tree: &BTreeMap<&Key, Node>) -> Vec<(Vec<u8>, u32)> {
+    let mut wanted: BTreeMap<&Key, u32> = BTreeMap::new();
     for (path, node) in tree {
-        if node.kind == Kind::Directory && !behind_a_link(tree, path) {
-            wanted.insert(path, node.mode);
+        if node.kind == Kind::Directory && !behind_a_link(tree, path.as_bytes()) {
+            wanted.insert(*path, node.mode);
         }
         // Ancestors nothing names still have to exist. `create_dir` would have
         // made them with the default mode, so they get it here too.
-        for ancestor in ancestors(path) {
-            if tree.contains_key(ancestor)
-                || wanted.contains_key(ancestor)
+        for ancestor in ancestors(path.as_bytes()) {
+            if tree.contains_key(Key::ref_cast(ancestor))
+                || wanted.contains_key(Key::ref_cast(ancestor))
                 || behind_a_link(tree, ancestor)
             {
                 continue;
             }
-            wanted.insert(ancestor, DEFAULT_DIRECTORY_MODE);
+            wanted.insert(Key::ref_cast(ancestor), DEFAULT_DIRECTORY_MODE);
         }
     }
     // A `BTreeMap` orders by path, so a parent always precedes what is under
     // it and the tree can be created in one pass.
     wanted
         .into_iter()
-        .map(|(path, mode)| (path.to_vec(), mode))
+        .map(|(path, mode)| (path.as_bytes().to_vec(), mode))
         .collect()
 }
 
@@ -597,17 +659,17 @@ fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// Whatever that is resolves somewhere else, and it is not created here, so
 /// there would be nothing to create this under. The extractor resolves the
 /// entries that live there against the tree as it builds it, as it always has.
-fn behind_a_link(tree: &BTreeMap<&[u8], Node>, path: &[u8]) -> bool {
+fn behind_a_link(tree: &BTreeMap<&Key, Node>, path: &[u8]) -> bool {
     blocked_by(tree, path).is_some()
 }
 
 /// The first thing on the way to `path` that is not a directory.
 fn blocked_by<'a, 'p>(
-    tree: &'a BTreeMap<&'p [u8], Node>,
+    tree: &'a BTreeMap<&'p Key, Node>,
     path: &'p [u8],
 ) -> Option<(&'p [u8], &'a Node)> {
     ancestors(path).find_map(|ancestor| {
-        let node = tree.get(ancestor)?;
+        let node = tree.get(Key::ref_cast(ancestor))?;
         (node.kind != Kind::Directory).then_some((ancestor, node))
     })
 }
@@ -669,7 +731,7 @@ enum Removal {
 /// seeks from is built in a buffer the caller keeps rather than a fresh pair
 /// of allocations per path.
 fn remove_under(
-    tree: &mut BTreeMap<&[u8], Node>,
+    tree: &mut BTreeMap<&Key, Node>,
     dir: &[u8],
     bound: &mut Vec<u8>,
     removal: Removal,
@@ -683,13 +745,13 @@ fn remove_under(
     // Everything under `dir` sorts from the bound onwards and is contiguous,
     // so the first path that is not under it ends the range.
     let under: Vec<(&[u8], Option<usize>)> = tree
-        .range::<[u8], _>((
-            std::ops::Bound::Included(bound.as_slice()),
+        .range::<Key, _>((
+            std::ops::Bound::Included(Key::ref_cast(bound.as_slice())),
             std::ops::Bound::Unbounded,
         ))
-        .take_while(|(path, _)| path.starts_with(bound.as_slice()))
-        .filter(|(path, _)| **path != ROOT_ENTRY)
-        .map(|(path, node)| (*path, node.named_by))
+        .take_while(|(path, _)| path.as_bytes().starts_with(bound.as_slice()))
+        .filter(|(path, _)| path.as_bytes() != ROOT_ENTRY)
+        .map(|(path, node)| (path.as_bytes(), node.named_by))
         .collect();
 
     let mut doomed: Vec<&[u8]> = Vec::new();
@@ -712,7 +774,7 @@ fn remove_under(
         }
     }
     for path in doomed {
-        tree.remove(path);
+        tree.remove(Key::ref_cast(path));
     }
 }
 
@@ -720,6 +782,45 @@ fn remove_under(
 mod tests {
     use super::*;
     use crate::entries::Entry;
+
+    /// Everything the tree does with ranges rests on `Key` ordering paths
+    /// exactly as the bytes order, so that is worth asking directly rather
+    /// than inferring it from the fixtures that would eventually break.
+    #[test]
+    fn keys_order_exactly_as_their_bytes_do() {
+        let paths: Vec<&[u8]> = vec![
+            b"",
+            b".",
+            b"a",
+            b"ab",
+            b"abcdefg",
+            b"abcdefgh",
+            b"abcdefghi",
+            b"abcdefgh/i",
+            b"abcdefgh/j",
+            b"abcdefghijklmno",
+            b"abcdefghijklmnop",
+            b"abcdefghijklmnop/q",
+            b"usr/share/doc",
+            b"usr/share/doc/",
+            b"usr/share/doc/a",
+            b"usr/share/docs",
+            b"usr/share/dod",
+            b"usr\x00share",
+            b"usr\xffshare",
+        ];
+        for ours in &paths {
+            for theirs in &paths {
+                assert_eq!(
+                    Key::ref_cast(ours).cmp(Key::ref_cast(theirs)),
+                    ours.cmp(theirs),
+                    "{:?} against {:?}",
+                    String::from_utf8_lossy(ours),
+                    String::from_utf8_lossy(theirs),
+                );
+            }
+        }
+    }
 
     fn descriptor(n: u8) -> Descriptor {
         Descriptor {
