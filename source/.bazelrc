@@ -15,6 +15,19 @@ build:release --@rules_rust//rust/settings:lto=fat
 build:release --@rules_rust//rust/settings:codegen_units=1
 build:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
 
+# Profile-guided optimisation. `//pgo:profile` reaches every crate the launcher
+# links, by a transition that stops at the launcher, so nothing else in the
+# workspace is built against a profile that does not describe it.
+#
+# `rustc` resolves the path itself, from a working directory that is neither
+# the workspace nor stable, so it has to be absolute -- and an rc file cannot
+# spell one. The caller supplies it, and README.md says how it is made:
+#
+#   bazel build --config=release \
+#       --//pgo:profile=$PWD/pgo/oci_runtime.profdata //:oci_runtime
+#
+# Without it the launcher still builds; it is simply the slower one.
+
 # Even with a musl target platform the glibc toolchains remain applicable, as
 # rules_rust does not constrain toolchains by libc. Prioritise musl explicitly.
 build:release --extra_toolchains=@rust_toolchains//:rust_linux_x86_64__x86_64-unknown-linux-musl__stable
