@@ -25,6 +25,10 @@ use crate::error::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"OZI2";
 const WINDOW_SIZE: usize = 32 * 1024;
+/// How much of a span is decompressed before it is checksummed. Small enough
+/// that the bytes are still in cache when the checksum reads them, large
+/// enough that the extra decompressor calls do not show.
+const CHECK_BYTES: usize = 1048576;
 /// Checkpoints are only useful while spans decompress in bounded memory.
 const MAX_CHECKPOINTS: u32 = 1 << 20;
 
@@ -275,13 +279,12 @@ impl Index {
             out.resize(at + len, 0);
         }
         let span = &mut out[at..at + len];
+        let mut crc = flate2::Crc::new();
         match self.flavor {
-            Flavor::Gzip => inflate_span(blob, point, span)?,
-            Flavor::Zstd => decode_span(blob, point, span)?,
+            Flavor::Gzip => inflate_span(blob, point, span, &mut crc)?,
+            Flavor::Zstd => decode_span(blob, point, span, &mut crc)?,
         }
 
-        let mut crc = flate2::Crc::new();
-        crc.update(span);
         if crc.sum() != point.crc {
             return Err(Error::io(
                 context,
@@ -369,8 +372,14 @@ impl Index {
     }
 }
 
-/// Inflates one gzip span into `span`, which is exactly its length.
-fn inflate_span(blob: &[u8], point: &Checkpoint, span: &mut [u8]) -> Result<()> {
+/// Inflates one gzip span into `span`, which is exactly its length,
+/// checksumming each piece as it lands.
+fn inflate_span(
+    blob: &[u8],
+    point: &Checkpoint,
+    span: &mut [u8],
+    crc: &mut flate2::Crc,
+) -> Result<()> {
     let context = "resuming from checkpoint";
     // An empty window is a stream or member start: parse the header there.
     let at_header = point.window.is_empty() && point.bits == 0;
@@ -398,10 +407,15 @@ fn inflate_span(blob: &[u8], point: &Checkpoint, span: &mut [u8]) -> Result<()> 
     let mut in_pos = point.in_offset as usize;
     let mut filled = 0usize;
     while filled < len {
+        // Inflating a whole span before checksumming it means the checksum
+        // reads from memory what inflate has long since evicted. A span is
+        // megabytes; a piece stays in cache.
+        let piece = (filled + CHECK_BYTES).min(len);
         let (consumed, produced, ret) = inflater
-            .inflate(&blob[in_pos..], &mut span[filled..], Flush::None)
+            .inflate(&blob[in_pos..], &mut span[filled..piece], Flush::None)
             .map_err(|e| Error::io(context, e))?;
         in_pos += consumed;
+        crc.update(&span[filled..filled + produced]);
         filled += produced;
         match ret {
             Z_STREAM_END if filled < len => {
@@ -431,7 +445,12 @@ fn inflate_span(blob: &[u8], point: &Checkpoint, span: &mut [u8]) -> Result<()> 
 /// A span ends where the next checkpoint begins, which is a frame boundary, so
 /// the frames decoded here produce exactly `span.len()` bytes. Producing more
 /// than that means the index does not describe this blob.
-fn decode_span(blob: &[u8], point: &Checkpoint, span: &mut [u8]) -> Result<()> {
+fn decode_span(
+    blob: &[u8],
+    point: &Checkpoint,
+    span: &mut [u8],
+    crc: &mut flate2::Crc,
+) -> Result<()> {
     let context = "resuming from checkpoint";
     let len = span.len();
     let mut decoder = FrameDecoder::new();
@@ -457,6 +476,7 @@ fn decode_span(blob: &[u8], point: &Checkpoint, span: &mut [u8]) -> Result<()> {
         pos = decode_frame(&mut decoder, blob, pos, &mut scratch, |bytes| {
             let take = bytes.len().min(len - filled);
             span[filled..filled + take].copy_from_slice(&bytes[..take]);
+            crc.update(&bytes[..take]);
             filled += take;
             overflowed |= take < bytes.len();
         })
