@@ -196,9 +196,12 @@ pub(super) fn inflate_indexed(
     let blob: &[u8] = &blob;
 
     let spans = index.checkpoints.len();
+    // The same cap the span route works under, for the same reason: the two
+    // routes ask the memory system for the same thing.
     let workers = thread::available_parallelism()
         .map_or(1, |n| n.get())
-        .min(spans);
+        .min(spans)
+        .min(super::spans::MAX_WORKERS);
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
 
@@ -216,12 +219,13 @@ pub(super) fn inflate_indexed(
             let span_sender = span_sender.clone();
             let (next, stop) = (&next, &stop);
             scope.spawn(move || {
+                let mut decoders = zinfo::Decoders::default();
                 while !stop.load(Ordering::Relaxed) {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= spans {
                         break;
                     }
-                    let result = index.extract_span(blob, i);
+                    let result = index.extract_span(blob, i, &mut decoders);
                     let failed = result.is_err();
                     if span_sender.send((i, result)).is_err() || failed {
                         break;

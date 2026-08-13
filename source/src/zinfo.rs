@@ -239,9 +239,9 @@ impl Index {
 
     /// Decompresses the span between checkpoint `i` and its successor (or the
     /// end of the stream) and verifies it against the recorded CRC.
-    pub fn extract_span(&self, blob: &[u8], i: usize) -> Result<Vec<u8>> {
+    pub fn extract_span(&self, blob: &[u8], i: usize, decoders: &mut Decoders) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        self.extract_span_into(blob, i, &mut out, 0, &mut Decoders::default())?;
+        self.extract_span_into(blob, i, &mut out, 0, decoders)?;
         Ok(out)
     }
 
@@ -772,7 +772,11 @@ mod tests {
         assert_eq!(index.uncompressed_len, data.len() as u64);
         let mut reassembled = Vec::new();
         for i in 0..index.checkpoints.len() {
-            reassembled.extend_from_slice(&index.extract_span(blob, i).unwrap());
+            reassembled.extend_from_slice(
+                &index
+                    .extract_span(blob, i, &mut Decoders::default())
+                    .unwrap(),
+            );
         }
         assert_eq!(reassembled, data);
     }
@@ -889,7 +893,9 @@ mod tests {
             .position(|p| !p.window.is_empty())
             .unwrap();
         // The bytes inflate fine; only the checksum can tell they are wrong.
-        let err = index.extract_span(&blob, i).unwrap_err();
+        let err = index
+            .extract_span(&blob, i, &mut Decoders::default())
+            .unwrap_err();
         assert!(err.to_string().contains("checksum"), "got: {err}");
     }
 
@@ -1006,7 +1012,9 @@ mod tests {
         let mut index = Index::build(Flavor::Zstd, &blob, 128 << 10).unwrap();
         // Claim the first span ends earlier than the frames it covers do.
         index.checkpoints[1].out_offset -= 1024;
-        let err = index.extract_span(&blob, 0).unwrap_err();
+        let err = index
+            .extract_span(&blob, 0, &mut Decoders::default())
+            .unwrap_err();
         assert!(
             err.to_string().contains("more than the index"),
             "got: {err}"
