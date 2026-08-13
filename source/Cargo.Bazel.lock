@@ -1,5 +1,5 @@
 {
-  "checksum": "f5cd6895250af2ab6e0526072f964375bf32cdf033d0beb962a2defbac0b43fe",
+  "checksum": "0835aa0a526016b237fd1ed8b704e9e3bfadac9af22b13617afad656e7b73c21",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -1723,6 +1723,10 @@
               "target": "libz_rs_sys"
             },
             {
+              "id": "ref-cast 1.0.26",
+              "target": "ref_cast"
+            },
+            {
               "id": "ruzstd 0.9.0",
               "target": "ruzstd"
             },
@@ -1957,6 +1961,139 @@
         "data_glob": [
           "**"
         ]
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "ref-cast 1.0.26": {
+      "name": "ref-cast",
+      "version": "1.0.26",
+      "package_url": "https://github.com/dtolnay/ref-cast",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/ref-cast/1.0.26/download",
+          "sha256": "216e8f773d7923bcba9ceb86a86c93cabb3903a11872fc3f138c49630e50b96d"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "ref_cast",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "ref_cast",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "extra_deps": {
+          "common": [
+            ":build_script_build"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "ref-cast-impl 1.0.26",
+              "target": "ref_cast_impl"
+            }
+          ],
+          "selects": {}
+        },
+        "version": "1.0.26"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ]
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "ref-cast-impl 1.0.26": {
+      "name": "ref-cast-impl",
+      "version": "1.0.26",
+      "package_url": "https://github.com/dtolnay/ref-cast",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/ref-cast-impl/1.0.26/download",
+          "sha256": "2c9283685feec7d69af75fb0e858d5e7378f33fe4fc699383b2916ab9273e03c"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "ref_cast_impl",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "ref_cast_impl",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "proc-macro2 1.0.107",
+              "target": "proc_macro2"
+            },
+            {
+              "id": "quote 1.0.47",
+              "target": "quote"
+            },
+            {
+              "id": "syn 3.0.3",
+              "target": "syn"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.0.26"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -3327,6 +3464,7 @@
     "flate2 1.1.9",
     "libc 0.2.189",
     "libz-rs-sys 0.6.7",
+    "ref-cast 1.0.26",
     "ruzstd 0.9.0",
     "serde 1.0.229",
     "serde_json 1.0.151",

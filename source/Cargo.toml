@@ -29,6 +29,9 @@ libc = "0.2.184"
 # The C-shaped face of the zlib-rs crate flate2 already uses; needed for the
 # inflatePrime/inflateSetDictionary checkpoint machinery flate2 does not expose.
 libz-rs-sys = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
+# Reinterpreting `&[u8]` as a newtype over it, which the plan's tree needs and
+# which safe Rust cannot express. The alternative is hand-written unsafe.
+ref-cast = "1.0.26"
 ruzstd = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
