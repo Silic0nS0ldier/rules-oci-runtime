@@ -64,3 +64,53 @@ today:
 nothing: entries placed, what the plan skipped, and the syscalls each route
 makes. Its numbers come from `bench_image --profile small`; when the generator
 changes, run the test and update them from what it reports.
+
+## Profile-guided optimisation
+
+Release launchers are built against `pgo/oci_runtime.profdata`, which is
+committed. Most of the launcher's time is inside `zlib-rs`, and the profile
+tells LLVM which way its branches actually go: it takes about 15% of the
+instructions out of `inflate`.
+
+`rustc` resolves the path itself, from a working directory that is neither the
+workspace nor stable, so it has to be absolute and the caller supplies it:
+
+```
+bazel build --config=release \
+    --//pgo:profile=$PWD/pgo/oci_runtime.profdata //:oci_runtime
+```
+
+Leave it out and the launcher still builds, just slower. The flag travels by a
+transition attached to `//:oci_runtime`, so it reaches every crate the launcher
+links and nothing else: the benchmark tools are not built against a profile
+that does not describe them.
+
+Regenerate the profile when the extraction path changes shape. A stale profile
+is not wrong -- it just stops paying for the functions it no longer describes,
+and `-pgo-warn-missing-function`, which the transition always passes, says
+which those are.
+
+```
+# 1. Instrument. Delete the old data first: `.profraw` files are updated in
+#    place, so one left over from another binary poisons the merge.
+rm -rf /tmp/pgo-data
+bazel build --config=release \
+    --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols \
+    --@rules_rust//rust/settings:extra_rustc_flag=-Cprofile-generate=/tmp/pgo-data \
+    //:oci_runtime
+
+# 2. Train, on both routes: with sidecars and without.
+bazel build //:bench_image
+.bazel/bin/bench_image --output /tmp/bench-full --profile full
+.bazel/bin/oci_runtime index --layout /tmp/bench-full --output /tmp/idx-full
+for index in "--index /tmp/idx-full" ""; do
+    .bazel/bin/oci_runtime run --layout /tmp/bench-full $index \
+        --runtime /nonexistent/runc --keep-bundle
+done
+
+# 3. Merge. `llvm-profdata` has to be the one matching rustc's LLVM.
+"$(find "$(bazel info output_base)/external" -name llvm-profdata | head -1)" \
+    merge -o pgo/oci_runtime.profdata /tmp/pgo-data/*.profraw
+```
+
+The instrumented binary is much slower than either; never benchmark it.

@@ -1,0 +1,10 @@
+load("//pgo:profile.bzl", "pgo_profile")
+
+# Absolute path to the profile the launcher is built against, empty by default
+# so an ordinary build neither reads it nor rebuilds when it changes. README.md
+# has how a release build passes it and how the committed one is regenerated.
+pgo_profile(
+    name = "profile",
+    build_setting_default = "",
+    visibility = ["//visibility:public"],
+)

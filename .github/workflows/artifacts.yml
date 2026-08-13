@@ -21,7 +21,9 @@ jobs:
           bazelisk-cache: true
           disk-cache: "artifacts-${{ matrix.arch }}"
           repository-cache: true
-      - run: bazel build --config=release_linux_${{ matrix.arch }} //:oci_runtime
+      - run: >
+          bazel build --config=release_linux_${{ matrix.arch }}
+          --//pgo:profile=$PWD/pgo/oci_runtime.profdata //:oci_runtime
         working-directory: source
       - run: install -m 0755 source/.bazel/bin/oci_runtime oci_runtime.${{ matrix.arch }}
       # Unarchived, so the asset can be downloaded as-is. The file name becomes
