@@ -218,7 +218,7 @@ fn plan_units(layers: &[Layer], work: &Work, plan: &Plan) -> Vec<Unit> {
 /// memory bound, and the cores end up queueing for the same bandwidth. On a
 /// sixteen core machine eight was the peak, and sixteen was worse than four
 /// on both wall clock and processor time.
-const MAX_WORKERS: usize = 8;
+pub(super) const MAX_WORKERS: usize = 8;
 
 fn workers(units: usize) -> usize {
     thread::available_parallelism()
