@@ -65,6 +65,8 @@ pub enum Error {
         program: String,
         source: io::Error,
     },
+    /// `--rootfs=fuse` was asked for and the image could not be served.
+    CannotServe(String),
 }
 
 impl Error {
@@ -154,6 +156,10 @@ impl fmt::Display for Error {
             Error::RuntimeSpawn { program, source } => {
                 write!(f, "failed to start container runtime {program:?}: {source}")
             }
+            Error::CannotServe(reason) => write!(
+                f,
+                "cannot serve the image: {reason}; pass --rootfs=auto to extract it instead"
+            ),
         }
     }
 }

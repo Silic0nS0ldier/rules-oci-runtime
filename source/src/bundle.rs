@@ -64,6 +64,12 @@ impl Bundle {
         self.root.join("state")
     }
 
+    /// Where a served rootfs keeps the bytes of the files something opened.
+    /// Inside the bundle, so it is taken away with everything else.
+    pub fn backing_dir(&self) -> Utf8PathBuf {
+        self.root.join("backing")
+    }
+
     pub fn write_config(&self, spec: &Spec) -> Result<()> {
         let path = self.root.join("config.json");
         let json = serde_json::to_vec_pretty(spec)

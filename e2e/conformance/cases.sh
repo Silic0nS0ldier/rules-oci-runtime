@@ -100,11 +100,37 @@ build_image() {
 # stands in for the runtime: the bundle is the point, not running it.
 extract() {
   local layout=$1 into=$2 index=${3:-}
-  local args=(run --layout "$layout" --runtime /bin/true --keep-bundle)
+  local args=(run --layout "$layout" --runtime /bin/true --keep-bundle --rootfs=extract)
   [[ -n "$index" ]] && args+=(--index "$index")
   mkdir -p "$into"
   TMPDIR="$into" "$launcher" "${args[@]}" /bin/sh >/dev/null 2>&1
   find "$into" -maxdepth 2 -name rootfs
+}
+
+# Serves the image instead, and echoes a copy of what the container would have
+# seen. The mount only exists while the runtime runs, so the stand-in runtime
+# is what copies it out; `cp -a` keeps modes, symlinks and hard link groups.
+serve() {
+  local layout=$1 into=$2 index=$3
+  local out="${into}/served"
+  mkdir -p "$into" "$out"
+  local runtime="${into}/copy-out"
+  cat >"$runtime" <<'EOF'
+#!/usr/bin/env bash
+bundle=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bundle) bundle="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$bundle" ]] && cp -a "${bundle}/rootfs/." "$COPY_OUT/"
+EOF
+  chmod +x "$runtime"
+  COPY_OUT="$out" TMPDIR="$into" "$launcher" run --layout "$layout" \
+    --runtime "$runtime" --index "$index" --rootfs=fuse --verbose \
+    /bin/sh >"${into}/log" 2>&1
+  [[ -n "$(ls -A "$out")" ]] && echo "$out"
 }
 
 # Runs one fixture through umoci and through both of the launcher's routes.
@@ -150,6 +176,24 @@ check_fixture() {
     return
   }
   compare "${name}, indexed" "$indexed" "$reference"
+
+  # The same sidecars let the image be served rather than written out at all,
+  # which is a third way to arrive at the tree and has to arrive at the same
+  # one. A host that cannot mount says so and is not held to it.
+  local served
+  served=$(serve "$layout" "${work}/${name}/served" "$index")
+  if grep -q "cannot serve the image" "${work}/${name}/served/log" 2>/dev/null; then
+    return
+  fi
+  [[ -n "$served" ]] || {
+    fail "${name}: the launcher served no rootfs"
+    return
+  }
+  grep -q "Serving" "${work}/${name}/served/log" || {
+    fail "${name}: the tree was compared but the image was never served"
+    return
+  }
+  compare "${name}, served" "$served" "$reference"
 }
 
 # `tar -C dir .` writes the archive root into the layer, and the spec's worked

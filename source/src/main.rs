@@ -6,6 +6,7 @@ mod extract;
 mod fsutil;
 mod image;
 mod launcher;
+mod lazy;
 mod log;
 mod runtime;
 mod sidecar;
@@ -85,7 +86,20 @@ fn run(args: RunArgs) -> Result<i32> {
     let rootfs = bundle.rootfs();
     let mut extractor = RootfsExtractor::new(&rootfs, args.index.as_deref(), args.strict_xattrs)?;
     extractor.plan(&manifest.layers)?;
-    extractor.apply(&layout, &manifest.layers)?;
+
+    // Declared after the bundle so that it unmounts before the bundle it sits
+    // in is taken away.
+    let _mount = lazy::serve(
+        args.rootfs,
+        &rootfs,
+        &bundle.backing_dir(),
+        &layout,
+        &manifest.layers,
+        &extractor,
+    )?;
+    if _mount.is_none() {
+        extractor.apply(&layout, &manifest.layers)?;
+    }
 
     let hostname = args
         .hostname

@@ -25,6 +25,7 @@ clap = { version = "4.6.3", features = ["derive"] }
 # zlib-rs decompresses real image layers about 1.5x faster than the default
 # miniz_oxide backend and, being pure Rust, keeps the musl builds C free.
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+fuser = { version = "0.18", default-features = false }
 libc = "0.2.184"
 # The C-shaped face of the zlib-rs crate flate2 already uses; needed for the
 # inflatePrime/inflateSetDictionary checkpoint machinery flate2 does not expose.

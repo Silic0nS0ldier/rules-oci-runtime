@@ -172,7 +172,7 @@ case_layer_indexes() {
     return
   fi
   local stderr
-  RULES_OCI_RUNTIME_VERBOSE=1 "$container" /bin/true </dev/null 2>"${TEST_TMPDIR}/index.err" ||
+  RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=extract /bin/true </dev/null 2>"${TEST_TMPDIR}/index.err" ||
     fail "container failed"
   stderr=$(cat "${TEST_TMPDIR}/index.err")
   assert_contains "$stderr" "checkpoints" "layers extract via their indexes"
@@ -182,7 +182,7 @@ case_layer_indexes() {
 # `oci_image` writes whichever the archive it was handed uses.
 case_zstd_layer() {
   local output stderr
-  output=$(RULES_OCI_RUNTIME_VERBOSE=1 "$zstd_container" \
+  output=$(RULES_OCI_RUNTIME_VERBOSE=1 "$zstd_container" --rootfs=extract \
     /bin/sh -c 'cat /zstd-marker; cat /etc/alpine-release' \
     </dev/null 2>"${TEST_TMPDIR}/zstd.err")
   assert_contains "$output" "from-the-zstd-layer" "the file the zstd layer adds"
@@ -225,12 +225,40 @@ case_verbose_logging() {
   assert_equals "only-container-output" "$stdout" "quiet stdout"
   assert_equals "" "$stderr" "quiet stderr"
 
-  stdout=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" /bin/echo only-container-output \
+  stdout=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=extract /bin/echo only-container-output \
     </dev/null 2>"${TEST_TMPDIR}/verbose.err")
   stderr=$(cat "${TEST_TMPDIR}/verbose.err")
   assert_equals "only-container-output" "$stdout" "verbose stdout"
   assert_contains "$stderr" "Extracting" "verbose setup logging"
   assert_not_contains "$stdout" "Extracting" "setup logging kept off stdout"
+}
+
+# The image is served rather than extracted wherever the host allows it, so the
+# same container has to come out the same either way.
+case_served_rootfs() {
+  local extracted served stderr
+  extracted=$("$container" --rootfs=extract \
+    /bin/sh -c 'cat /etc/alpine-release; readlink /bin/sh; ls /etc | wc -l' </dev/null)
+
+  served=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse \
+    /bin/sh -c 'cat /etc/alpine-release; readlink /bin/sh; ls /etc | wc -l' \
+    </dev/null 2>"${TEST_TMPDIR}/served.err")
+  stderr=$(cat "${TEST_TMPDIR}/served.err")
+  # A host without /dev/fuse cannot serve at all, and says so rather than
+  # quietly extracting when the route is asked for by name.
+  if [[ "$stderr" == *"cannot serve the image"* ]]; then
+    return
+  fi
+
+  assert_contains "$stderr" "Serving" "the image is served"
+  assert_equals "$extracted" "$served" "a served rootfs reads as an extracted one"
+
+  # Writes go to the container's own copy, not back into the image.
+  served=$("$container" --rootfs=fuse /bin/sh -c \
+    'echo written > /etc/alpine-release; cat /etc/alpine-release' </dev/null)
+  assert_equals "written" "$served" "a served rootfs is writable"
+  served=$("$container" --rootfs=fuse /bin/cat /etc/alpine-release </dev/null)
+  assert_equals "${extracted%%$'\n'*}" "$served" "the next run sees the image again"
 }
 
 case_signal_forwarding() {

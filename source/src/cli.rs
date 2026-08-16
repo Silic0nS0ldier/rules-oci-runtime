@@ -59,6 +59,12 @@ pub struct RunArgs {
     #[arg(long, value_name = "PATH")]
     pub runtime: Utf8PathBuf,
 
+    /// Whether to serve the root filesystem from the layers, fetching files as
+    /// the container opens them, or extract it up front. `auto` serves it
+    /// wherever the host and the image allow.
+    #[arg(long, value_enum, default_value_t = RootfsMode::Auto)]
+    pub rootfs: RootfsMode,
+
     /// Directory of layer decompression indexes, one `<hex>.zinfo` per
     /// compressed layer.
     #[arg(long, value_name = "DIR")]
@@ -127,6 +133,18 @@ pub enum Toggle {
     Auto,
     True,
     False,
+}
+
+/// Where the container's root filesystem comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RootfsMode {
+    /// Serve the image where the host and the image both allow it, and extract
+    /// it where they do not.
+    Auto,
+    /// Serve the image, failing the run if it cannot be served.
+    Fuse,
+    /// Extract the image before the container starts.
+    Extract,
 }
 
 impl Toggle {
