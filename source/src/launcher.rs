@@ -17,6 +17,14 @@ struct Config {
     runtime: String,
     #[serde(default)]
     index: Option<String>,
+    /// Profiles of what this container read before, one per platform.
+    #[serde(default)]
+    profiles: Vec<String>,
+    /// Where a recording goes, relative to the workspace rather than the
+    /// runfiles: a profile is a source file, and the runfiles copy of one is
+    /// read only and thrown away.
+    #[serde(default)]
+    record_to: Option<String>,
     #[serde(default)]
     args: Vec<String>,
 }
@@ -78,6 +86,14 @@ impl Config {
             argv.push("--index".to_string());
             argv.push(runfiles.join(index).into_string());
         }
+        for profile in &self.profiles {
+            argv.push("--profile".to_string());
+            argv.push(runfiles.join(profile).into_string());
+        }
+        if let Some(record_to) = &self.record_to {
+            argv.push("--profile-base".to_string());
+            argv.push(record_to.clone());
+        }
         argv.extend(self.args.iter().cloned());
         argv.extend(user.iter().cloned());
         argv
@@ -129,6 +145,27 @@ mod tests {
         assert_eq!(
             &argv[argv.len() - 2..],
             ["--index", "/tmp/rf/ws/pkg/container.zinfo"]
+        );
+    }
+
+    #[test]
+    fn profiles_are_resolved_and_the_recording_base_is_not() {
+        let config: Config = serde_json::from_str(
+            r#"{"layout": "l", "runtime": "r",
+                "profiles": ["ws/pkg/c.linux-amd64.profile"],
+                "record_to": "pkg/profiles/c"}"#,
+        )
+        .expect("config");
+        let argv = config.command_line("launcher", Utf8Path::new("/tmp/rf"), &[]);
+        assert_eq!(
+            &argv[argv.len() - 4..],
+            [
+                "--profile",
+                "/tmp/rf/ws/pkg/c.linux-amd64.profile",
+                // Recorded into the source tree, which is not the runfiles.
+                "--profile-base",
+                "pkg/profiles/c",
+            ]
         );
     }
 

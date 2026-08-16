@@ -21,6 +21,29 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Build parallel-decompression checkpoint indexes for gzip blobs.
     Index(IndexArgs),
+    /// Check that a recorded profile still describes an image.
+    Profile(ProfileArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileArgs {
+    /// The profile to check.
+    #[arg(long, value_name = "PATH")]
+    pub profile: Utf8PathBuf,
+
+    /// Image layout the profile is used with.
+    #[arg(long, value_name = "DIR")]
+    pub layout: Utf8PathBuf,
+
+    /// Directory of the layer sidecars, which is what says what the image
+    /// holds without reading it.
+    #[arg(long, value_name = "DIR")]
+    pub index: Utf8PathBuf,
+
+    /// File to write when the profile passes, for a build that needs an
+    /// output to depend on.
+    #[arg(long, value_name = "PATH")]
+    pub stamp: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -69,6 +92,34 @@ pub struct RunArgs {
     /// compressed layer.
     #[arg(long, value_name = "DIR")]
     pub index: Option<Utf8PathBuf>,
+
+    /// Profile of what a container read, fetched ahead of this one. Repeatable:
+    /// the profile recorded for the image platform in use is the one read.
+    #[arg(long = "profile", value_name = "PATH")]
+    pub profiles: Vec<Utf8PathBuf>,
+
+    /// Record what the container reads, merging into whatever profile is
+    /// there already. Given no `=PATH` it records where the rule said to,
+    /// under `$BUILD_WORKSPACE_DIRECTORY`; the platform is appended to the
+    /// name either way.
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub record_profile: Option<Utf8PathBuf>,
+
+    /// How many of a profile's files to fetch before the container starts. The
+    /// rest are fetched while it runs.
+    #[arg(long, value_name = "COUNT", default_value_t = 1)]
+    pub prefetch_barrier: usize,
+
+    /// Where `--record-profile` writes when given no path, relative to
+    /// `$BUILD_WORKSPACE_DIRECTORY`. Supplied by the rule.
+    #[arg(long, value_name = "PATH")]
+    pub profile_base: Option<Utf8PathBuf>,
 
     /// Additional environment variables, overriding the image.
     #[arg(long = "env", short = 'e', value_name = "NAME=VALUE")]

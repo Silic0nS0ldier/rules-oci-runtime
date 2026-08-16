@@ -67,6 +67,12 @@ pub enum Error {
     },
     /// `--rootfs=fuse` was asked for and the image could not be served.
     CannotServe(String),
+    /// A profile file is not one, or does not describe the image it was
+    /// handed to.
+    Profile {
+        path: String,
+        message: String,
+    },
 }
 
 impl Error {
@@ -160,6 +166,7 @@ impl fmt::Display for Error {
                 f,
                 "cannot serve the image: {reason}; pass --rootfs=auto to extract it instead"
             ),
+            Error::Profile { path, message } => write!(f, "profile {path} {message}"),
         }
     }
 }

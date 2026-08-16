@@ -8,6 +8,7 @@ mod image;
 mod launcher;
 mod lazy;
 mod log;
+mod profile;
 mod runtime;
 mod sidecar;
 mod spec;
@@ -18,11 +19,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 
 use crate::bundle::Bundle;
-use crate::cli::{Cli, Command, IndexArgs, RunArgs};
+use crate::cli::{Cli, Command, IndexArgs, ProfileArgs, RootfsMode, RunArgs};
 use crate::error::{Error, Result};
 use crate::extract::RootfsExtractor;
 use crate::image::{Layout, Platform};
 use crate::log::log;
+use crate::profile::Profile;
 use crate::runtime::{ContainerRuntime, RunRequest, Runc};
 use crate::spec::{BindMount, Spec, SpecOptions};
 
@@ -45,6 +47,7 @@ fn main() -> std::process::ExitCode {
         match cli.command {
             Command::Run(args) => run(*args),
             Command::Index(args) => index(args),
+            Command::Profile(args) => check_profile(&args),
         }
     });
     match code {
@@ -87,17 +90,39 @@ fn run(args: RunArgs) -> Result<i32> {
     let mut extractor = RootfsExtractor::new(&rootfs, args.index.as_deref(), args.strict_xattrs)?;
     extractor.plan(&manifest.layers)?;
 
+    let recording = recording_destination(&args, &platform)?;
+    let profile = profile_for(&args.profiles, &platform)?;
+    // A recording that quietly extracted the image records nothing, and says
+    // nothing about why.
+    let mode = match (args.rootfs, &recording) {
+        (RootfsMode::Auto, Some(_)) => RootfsMode::Fuse,
+        (RootfsMode::Extract, Some(_)) => {
+            return Err(Error::Profile {
+                path: "--record-profile".to_string(),
+                message: "has nothing to record from an extracted rootfs, whose files are all \
+                    written before the container starts"
+                    .to_string(),
+            });
+        }
+        (mode, _) => mode,
+    };
+
     // Declared after the bundle so that it unmounts before the bundle it sits
     // in is taken away.
-    let _mount = lazy::serve(
-        args.rootfs,
+    let mut mount = lazy::serve(
+        mode,
         &rootfs,
         &bundle.backing_dir(),
         &layout,
         &manifest.layers,
         &extractor,
+        lazy::Fetching {
+            profile: profile.as_ref(),
+            record: recording.is_some(),
+            barrier: args.prefetch_barrier,
+        },
     )?;
-    if _mount.is_none() {
+    if mount.is_none() {
         extractor.apply(&layout, &manifest.layers)?;
     } else if args.keep_bundle {
         // The rootfs only ever existed as a mount, so what is kept is what the
@@ -156,8 +181,199 @@ fn run(args: RunArgs) -> Result<i32> {
     log!("Handing bundle {} to {}", bundle.dir(), runc.name());
     let result = runc.run(&request);
     runc.delete(&request);
+    // Nothing is waiting on the image any more, however the container ended.
+    if let Some(mount) = mount.as_mut() {
+        mount.settle();
+    }
+    if let (Some(destination), Some(mount)) = (&recording, mount.as_ref()) {
+        record(destination, &platform, &manifest.config.digest, mount)?;
+    }
     log!("Container has exited, cleaning up...");
     result
+}
+
+/// Where this run's reads are written down, or `None` when it is not recording.
+///
+/// The platform is appended here rather than left to the caller: what a
+/// container reads is what the manifest it ran holds, and two platforms
+/// recorded over one name would each undo the other.
+fn recording_destination(args: &RunArgs, platform: &Platform) -> Result<Option<Utf8PathBuf>> {
+    let Some(given) = &args.record_profile else {
+        return Ok(None);
+    };
+    let base = if !given.as_str().is_empty() {
+        given.clone()
+    } else {
+        // `bazel run` exports this; a launcher run from `bazel-bin` does not
+        // have a source tree to write to at all.
+        let workspace = std::env::var("BUILD_WORKSPACE_DIRECTORY").unwrap_or_default();
+        let base = args.profile_base.as_ref().filter(|_| !workspace.is_empty());
+        let Some(base) = base else {
+            return Err(Error::Profile {
+                path: "--record-profile".to_string(),
+                message: "needs a path, since there is no rule and workspace to take one from"
+                    .to_string(),
+            });
+        };
+        Utf8PathBuf::from(workspace).join(base)
+    };
+    Ok(Some(profile::qualified(&base, platform)))
+}
+
+/// The profile recorded for this platform, out of those the caller named.
+fn profile_for(paths: &[Utf8PathBuf], platform: &Platform) -> Result<Option<Profile>> {
+    let wanted = platform.to_string();
+    for path in paths {
+        // A rule can name a profile that has not been recorded yet, which is
+        // how the first recording run gets to happen.
+        let Some(profile) = Profile::read(path)? else {
+            log!("There is no profile at {path} yet");
+            continue;
+        };
+        if profile.platform() != wanted {
+            log!(
+                "Ignoring {path}: recorded for {}, running {wanted}",
+                profile.platform()
+            );
+            continue;
+        }
+        log!(
+            "Read {path}: {} files over {} runs",
+            profile.ordered().len(),
+            profile.runs()
+        );
+        return Ok(Some(profile));
+    }
+    Ok(None)
+}
+
+/// Adds this run's reads to the profile at `destination`.
+///
+/// Merged rather than replacing what is there: one run is one path through a
+/// container, and a profile that only remembers the last one forgets whatever
+/// the run before it found.
+fn record(
+    destination: &Utf8Path,
+    platform: &Platform,
+    image: &str,
+    mount: &lazy::Mount,
+) -> Result<()> {
+    let read = mount.recorded().unwrap_or_default();
+    let mut profile = match Profile::read(destination)? {
+        Some(profile) if profile.platform() != platform.to_string() => {
+            return Err(Error::Profile {
+                path: destination.to_string(),
+                message: format!("was recorded for {}, not {platform}", profile.platform()),
+            });
+        }
+        Some(profile) => profile,
+        None => Profile::empty(platform),
+    };
+    let read: Vec<Vec<u8>> = read
+        .iter()
+        .map(|path| profile::from_entry_path(path))
+        .collect();
+    profile.merge_run(image, &read);
+    profile.write(destination)?;
+    // Recording is asked for outright, so say what came of it whether or not
+    // the run was a verbose one.
+    eprintln!(
+        "recorded {} files this run read into {destination}, {} in all over {} runs",
+        read.len(),
+        profile.ordered().len(),
+        profile.runs()
+    );
+    Ok(())
+}
+
+/// Checks that a profile still describes the image it will be used with.
+///
+/// Fetching ahead from a path an image no longer holds costs a lookup and
+/// nothing else, so this is not about the run failing. It is about a profile
+/// quietly ceasing to describe anything: one recorded against another image,
+/// or left behind by a rename, still looks like a profile and no longer buys
+/// what it claims.
+fn check_profile(args: &ProfileArgs) -> Result<i32> {
+    let fail = |message: String| Error::Profile {
+        path: args.profile.to_string(),
+        message,
+    };
+    let profile =
+        Profile::read(&args.profile)?.ok_or_else(|| fail("does not exist".to_string()))?;
+    if let Some(named) = profile::platform_of(&args.profile)
+        && named != profile.platform()
+    {
+        return Err(fail(format!(
+            "is named for {named} and was recorded for {}",
+            profile.platform()
+        )));
+    }
+
+    let platform = parse_platform(Some(profile.platform()))?;
+    let layout = Layout::open(&args.layout)?;
+    let manifest = layout.resolve_manifest(&platform)?;
+    if !profile.image().is_empty() && profile.image() != manifest.config.digest {
+        log::warn(format!(
+            "{} was recorded against image {}, which is now {}",
+            args.profile,
+            profile.image(),
+            manifest.config.digest
+        ));
+    }
+    if profile.is_empty() {
+        log::warn(format!("{} names no files", args.profile));
+    }
+
+    // Nothing is extracted, but resolving the image is what says which of its
+    // entries survive its own layers, and that is the tree a profile has to
+    // agree with.
+    let scratch = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .map_err(|path| {
+            Error::io(
+                format!("temporary directory {} is not valid UTF-8", path.display()),
+                std::io::Error::from(std::io::ErrorKind::InvalidData),
+            )
+        })?
+        .join(format!("rules-oci-runtime-check-{}", sys::random_hex(8)?));
+    let mut extractor = RootfsExtractor::new(&scratch, Some(&args.index), false)?;
+    let checked = extractor
+        .plan(&manifest.layers)
+        .and_then(|()| Ok(lazy::absent(&extractor, &manifest.layers, profile.paths())));
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let Some(absent) = checked? else {
+        return Err(fail(format!(
+            "cannot be checked against {}: its layers have no entry tables or no checkpoint indexes",
+            args.layout
+        )));
+    };
+    if !absent.is_empty() {
+        let named: Vec<String> = absent
+            .iter()
+            .take(10)
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect();
+        return Err(fail(format!(
+            "names {} this image does not hold: {}{}",
+            if absent.len() == 1 {
+                "a file".to_string()
+            } else {
+                format!("{} files", absent.len())
+            },
+            named.join(", "),
+            if absent.len() > named.len() {
+                ", ..."
+            } else {
+                ""
+            }
+        )));
+    }
+
+    if let Some(stamp) = &args.stamp {
+        std::fs::write(stamp, "")
+            .map_err(|source| Error::io(format!("writing {stamp}"), source))?;
+    }
+    Ok(0)
 }
 
 fn index(args: IndexArgs) -> Result<i32> {

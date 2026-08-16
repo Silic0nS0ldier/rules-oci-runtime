@@ -12,13 +12,12 @@
 //! # Fetching ahead
 //!
 //! What a container reads is nearly the same on every run of it, so a recorded
-//! list of paths would say what to fetch before it asks. There is nothing to
-//! build for that beyond the recording and the list: [`fs::Rootfs`] resolves a
-//! path to an inode through the same tree `lookup` uses, and fetching one is
-//! safe from any thread and already reaches the whole span the file is in. A
-//! profile is therefore a walk of paths handed to the same fetch a read takes,
-//! on a pool, between the mount going up here and the bundle reaching runc.
+//! list of paths says what to fetch before it asks. [`ahead`] fetches that
+//! list, and a recording run writes it down where the kernel asks rather than
+//! where a body is fetched, so a run doing both does not record its own
+//! guesses as reads.
 
+mod ahead;
 mod fs;
 mod source;
 mod tree;
@@ -27,6 +26,7 @@ use std::fs::OpenOptions;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 
 use camino::Utf8Path;
@@ -37,7 +37,11 @@ use crate::error::{Error, IoContext, Result};
 use crate::extract::RootfsExtractor;
 use crate::image::{Descriptor, Layout};
 use crate::log::{log, warning};
+use crate::profile::Profile;
 use crate::sys;
+
+use self::ahead::Ahead;
+use self::fs::Recorder;
 
 /// The character device every FUSE mount goes through. Its absence is the
 /// clearest sign a host cannot serve one.
@@ -51,6 +55,16 @@ const FUSE_CONF: &str = "/etc/fuse.conf";
 /// threads only queue for the same locks.
 const MAX_WORKERS: usize = 8;
 
+/// What a run does about the files the container has not asked for yet.
+pub struct Fetching<'a> {
+    /// The profile to fetch ahead from, where a run was given one.
+    pub profile: Option<&'a Profile>,
+    /// Whether to write down what the container opens.
+    pub record: bool,
+    /// How many of the profile's files to fetch before the container starts.
+    pub barrier: usize,
+}
+
 /// A live mount. Dropping it unmounts, which has to happen before the bundle
 /// holding the mount point is taken away.
 pub struct Mount {
@@ -59,6 +73,25 @@ pub struct Mount {
     /// Whether a helper is waiting to take the mount down when this process
     /// goes, which changes who has to take it down when it goes willingly.
     automatic: bool,
+    ahead: Option<Ahead>,
+    recorder: Option<Arc<Recorder>>,
+    served: fs::Rootfs,
+}
+
+impl Mount {
+    /// Stops fetching ahead, which is called for when the container it was
+    /// for has gone.
+    pub fn settle(&mut self) {
+        if let Some(ahead) = &mut self.ahead {
+            ahead.stop();
+        }
+    }
+
+    /// What the container opened, first opened first, as the entry tables name
+    /// it. `None` unless this run was recording.
+    pub fn recorded(&self) -> Option<Vec<Vec<u8>>> {
+        self.recorder.as_ref().map(|recorder| recorder.recorded())
+    }
 }
 
 impl Drop for Mount {
@@ -66,6 +99,12 @@ impl Drop for Mount {
         let Some(session) = self.session.take() else {
             return;
         };
+        // Nothing may be reading the mount as it goes.
+        self.settle();
+        log!(
+            "The container waited for {} files to be fetched",
+            self.served.waited()
+        );
         log!("Unmounting {}", self.at.display());
         // The helper behind an auto-unmounting mount waits for this process to
         // exit, and the session will not finish until the mount goes, so
@@ -115,6 +154,32 @@ fn unmount(at: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The paths, of those given, that this image does not hold as a regular file.
+///
+/// `None` when the image cannot be resolved at all, which is a different thing
+/// from a profile naming files an image does not have: one is a profile that
+/// has gone stale, the other an image nothing could have served in the first
+/// place.
+pub fn absent<'a>(
+    extractor: &RootfsExtractor,
+    descriptors: &[Descriptor],
+    paths: impl Iterator<Item = &'a [u8]>,
+) -> Option<Vec<Vec<u8>>> {
+    let (plan, work, indexes) = extractor.resolved(descriptors)?;
+    drop(indexes);
+    let (tree, _, names) = tree::Tree::build(plan.directories(), plan.tables(), work)?;
+    let absent = paths
+        .filter(|path| {
+            !names
+                .ino(&crate::profile::to_entry_path(path))
+                .and_then(|ino| tree.get(ino))
+                .is_some_and(|node| matches!(node.kind, tree::Kind::File(_)))
+        })
+        .map(<[u8]>::to_vec)
+        .collect();
+    Some(absent)
+}
+
 /// Mounts the image at `rootfs`, or returns `None` when it has to be extracted
 /// instead.
 ///
@@ -127,6 +192,7 @@ pub fn serve(
     layout: &Layout,
     descriptors: &[Descriptor],
     extractor: &RootfsExtractor,
+    fetching: Fetching<'_>,
 ) -> Result<Option<Mount>> {
     if mode == RootfsMode::Extract {
         return Ok(None);
@@ -145,7 +211,8 @@ pub fn serve(
     let Some((plan, work, indexes)) = extractor.resolved(descriptors) else {
         return refuse("the layers have no entry tables or no checkpoint indexes".to_string());
     };
-    let Some((tree, bodies)) = tree::Tree::build(plan.directories(), plan.tables(), work) else {
+    let Some((tree, bodies, names)) = tree::Tree::build(plan.directories(), plan.tables(), work)
+    else {
         return refuse("the resolved image does not describe a whole tree".to_string());
     };
     if let Err(err) = OpenOptions::new().read(true).write(true).open(DEVICE) {
@@ -159,6 +226,9 @@ pub fn serve(
     source.verify(descriptors)?;
 
     std::fs::create_dir_all(backing).io_context(|| format!("creating {backing}"))?;
+    let recorder = fetching
+        .record
+        .then(|| Arc::new(Recorder::new(names.by_ino(tree.len()))));
     let served = fs::Rootfs::new(
         tree,
         bodies,
@@ -167,6 +237,7 @@ pub fn serve(
         backing.as_std_path().to_owned(),
         sys::euid(),
         sys::egid(),
+        recorder.clone(),
     );
 
     // Auto-unmount first, so that a launcher that is killed outright does not
@@ -200,10 +271,22 @@ pub fn serve(
     } else {
         log!("Killing this process will leave the mount behind");
     }
+    let ahead = fetching.profile.map(|profile| {
+        Ahead::start(
+            &served,
+            &names,
+            profile,
+            fetching.barrier,
+            workers().div_ceil(2),
+        )
+    });
     Ok(Some(Mount {
         session: Some(session),
         at: rootfs.as_std_path().to_owned(),
         automatic,
+        ahead,
+        recorder,
+        served,
     }))
 }
 

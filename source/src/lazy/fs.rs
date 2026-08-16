@@ -13,14 +13,14 @@
 //! move, and two names for one file are two names for one backing file.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
@@ -68,6 +68,7 @@ impl Rootfs {
         backing: PathBuf,
         uid: u32,
         gid: u32,
+        recorder: Option<Arc<Recorder>>,
     ) -> Rootfs {
         Rootfs {
             served: Arc::new(Served {
@@ -83,6 +84,9 @@ impl Rootfs {
                 next_handle: AtomicU64::new(1),
                 backings: Mutex::new(HashMap::new()),
                 passthrough: AtomicBool::new(false),
+                recorder,
+                demand: Demand::default(),
+                waited: AtomicU64::new(0),
             }),
         }
     }
@@ -128,6 +132,99 @@ pub struct Served {
     /// Whether the kernel agreed to take files over at all. Cleared when it
     /// turns out to want a privilege this process does not have.
     passthrough: AtomicBool,
+    /// Where a recording run writes down what the container opened.
+    recorder: Option<Arc<Recorder>>,
+    /// What the container is waiting on right now, which anything fetching
+    /// ahead of it has to give way to.
+    demand: Demand,
+    /// How many files the container opened and then had to wait for. What
+    /// fetching ahead is for is this number, and unlike a clock it says the
+    /// same thing on a busy host as on an idle one.
+    waited: AtomicU64,
+}
+
+/// The image files something opened, in the order it reached them.
+///
+/// Recorded where the kernel asks rather than where a body is fetched: a run
+/// that is fetching ahead from a profile fetches files nothing ever opens, and
+/// a recording taken at the fetch would write those down as reads and grow a
+/// profile that can never shrink.
+pub struct Recorder {
+    /// The image's name for each inode. An inode with none here was made by
+    /// the container, and what the container made is not the image's to fetch.
+    names: Vec<Vec<u8>>,
+    opened: Mutex<(HashSet<u64>, Vec<u64>)>,
+}
+
+impl Recorder {
+    pub fn new(names: Vec<Vec<u8>>) -> Recorder {
+        Recorder {
+            names,
+            opened: Mutex::new((HashSet::new(), Vec::new())),
+        }
+    }
+
+    fn saw(&self, ino: u64) {
+        let named = ino
+            .checked_sub(1)
+            .and_then(|at| self.names.get(at as usize))
+            .is_some_and(|name| !name.is_empty());
+        if !named {
+            return;
+        }
+        let mut opened = self.opened.lock().unwrap_or_else(|err| err.into_inner());
+        if opened.0.insert(ino) {
+            opened.1.push(ino);
+        }
+    }
+
+    /// What was opened, first opened first, as the entry tables name it.
+    pub fn recorded(&self) -> Vec<Vec<u8>> {
+        let opened = self.opened.lock().unwrap_or_else(|err| err.into_inner());
+        opened
+            .1
+            .iter()
+            .map(|&ino| self.names[ino as usize - 1].clone())
+            .collect()
+    }
+}
+
+/// How many fetches the container itself is waiting on.
+///
+/// A profile is a guess, and the run where it guessed wrong is the one that
+/// matters: a read that arrives while the whole pool is fetching something
+/// else would queue behind work nothing asked for. Counting the reads lets
+/// the pool stand aside until they are answered.
+#[derive(Default)]
+pub struct Demand {
+    waiting: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl Demand {
+    /// Blocks while the container is waiting on a fetch of its own.
+    fn wait_out(&self) {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|err| err.into_inner());
+        while *waiting > 0 {
+            waiting = self
+                .idle
+                .wait(waiting)
+                .unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    fn entered(&self) {
+        *self.waiting.lock().unwrap_or_else(|err| err.into_inner()) += 1;
+    }
+
+    fn left(&self) {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|err| err.into_inner());
+        *waiting -= 1;
+        if *waiting == 0 {
+            drop(waiting);
+            self.idle.notify_all();
+        }
+    }
 }
 
 /// An open file, and the reason the kernel may not be asking about it.
@@ -167,6 +264,9 @@ impl Served {
     /// Fetches a file's bytes if this is the first time anything asked for
     /// them, and with them the rest of the span they are in.
     ///
+    /// Answers whether anything had to be fetched, which is what says a
+    /// caller waited rather than found the file already there.
+    ///
     /// The span is what inflating reaches whatever was asked for, so placing
     /// only the file that was asked for would inflate the same span again for
     /// the next one. Reading a rootfs right through costs what extracting it
@@ -175,9 +275,9 @@ impl Served {
     /// The tree lock is not held while a span is inflated. That is the one
     /// slow thing here, and holding it would stop every other request for as
     /// long as it took.
-    fn fetch(&self, ino: u64) -> Result<(), Errno> {
+    fn fetch(&self, ino: u64) -> Result<bool, Errno> {
         let Some((body, _)) = self.owed(ino)? else {
-            return Ok(());
+            return Ok(false);
         };
         let claim = self.source.span_of(body) * self.layers + body.layer as usize;
         // The lock guards nothing of its own, so a worker that panicked while
@@ -187,7 +287,7 @@ impl Served {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Whoever held the claim was inflating this very span.
         let Some((body, _)) = self.owed(ino)? else {
-            return Ok(());
+            return Ok(false);
         };
 
         SCRATCH
@@ -195,7 +295,31 @@ impl Served {
             .map_err(|err| {
                 crate::log::warn(format!("could not fetch an image file: {err}"));
                 Errno::EIO
-            })
+            })?;
+        Ok(true)
+    }
+
+    /// Fetches for the container itself. What the container is waiting on is
+    /// counted while it waits, so anything fetching ahead of it stands aside.
+    fn fetch_now(&self, ino: u64) -> Result<(), Errno> {
+        self.demand.entered();
+        let fetched = self.fetch(ino);
+        self.demand.left();
+        if matches!(fetched, Ok(true)) {
+            self.waited.fetch_add(1, Ordering::Relaxed);
+        }
+        fetched.map(|_| ())
+    }
+
+    /// Fetches a file the container has not asked for yet.
+    pub fn fetch_ahead(&self, ino: u64) {
+        self.demand.wait_out();
+        let _ = self.fetch(ino);
+    }
+
+    /// How many files the container opened and had to wait to be fetched.
+    pub fn waited(&self) -> u64 {
+        self.waited.load(Ordering::Relaxed)
     }
 
     fn fetch_span(&self, body: Body, scratch: &mut Scratch) -> crate::error::Result<()> {
@@ -247,7 +371,7 @@ impl Served {
     }
 
     fn open_backing(&self, ino: u64) -> Result<Arc<File>, Errno> {
-        self.fetch(ino)?;
+        self.fetch_now(ino)?;
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -480,7 +604,7 @@ impl Filesystem for Rootfs {
         // Ownership is not the image's to give: extraction leaves everything
         // owned by whoever ran it, and so does this.
         if let Some(size) = size {
-            answer!(reply, self.fetch(ino.0));
+            answer!(reply, self.fetch_now(ino.0));
             let file = answer!(
                 reply,
                 fs::OpenOptions::new()
@@ -523,6 +647,9 @@ impl Filesystem for Rootfs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if let Some(recorder) = &self.recorder {
+            recorder.saw(ino.0);
+        }
         let file = answer!(reply, self.open_backing(ino.0));
         match self.backing(ino.0, &file, |fd| reply.open_backing(fd)) {
             Some(backing) => {
