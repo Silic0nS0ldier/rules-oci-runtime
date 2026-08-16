@@ -70,6 +70,9 @@ cd source && bazel build //:bench_image //:bench_run
 - `//:bench_counts_test` guards the counts in CI. When it fails, something
   changed what the launcher asks of the kernel -- find out what before
   updating its numbers.
+- The served route has no harness. Measure it with a stand-in runtime that
+  reads part of the tree and compare `The container waited for N files`, which
+  is a count and so survives a busy host.
 
 ## Git
 

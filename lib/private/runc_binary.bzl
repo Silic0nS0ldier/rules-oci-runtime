@@ -1,5 +1,6 @@
 """Implementation of `runc_binary`."""
 
+load(":profile.bzl", "OciRuntimeProfileInfo")
 load(
     ":toolchains.bzl",
     "CONTAINER_RUNTIME_TOOLCHAIN_TYPE",
@@ -93,7 +94,7 @@ def _runc_binary_impl(ctx):
     if ctx.attr.index:
         index_dir = ctx.actions.declare_directory(ctx.label.name + ".zinfo")
         ctx.actions.run(
-            executable = ctx.attr._indexer[DefaultInfo].files_to_run,
+            executable = ctx.attr._tool[DefaultInfo].files_to_run,
             arguments = ["index", "--layout", layout.path, "--output", index_dir.path],
             inputs = [layout],
             outputs = [index_dir],
@@ -102,6 +103,12 @@ def _runc_binary_impl(ctx):
         )
         content["index"] = _rlocation_path(ctx, index_dir)
         indexes.append(index_dir)
+
+    profiles, checks = _profiles(ctx, layout, indexes)
+    if profiles:
+        content["profiles"] = [_rlocation_path(ctx, profile) for profile in profiles]
+    if ctx.attr.profile:
+        content["record_to"] = ctx.attr.profile[OciRuntimeProfileInfo].record_to
 
     config = ctx.actions.declare_file(ctx.label.name + ".launch.json")
     ctx.actions.write(
@@ -114,7 +121,7 @@ def _runc_binary_impl(ctx):
         config,
         launcher_toolchain.binary,
         runtime_toolchain.binary,
-    ] + indexes).merge_all([
+    ] + indexes + profiles).merge_all([
         launcher_toolchain.runfiles,
         runtime_toolchain.runfiles,
         ctx.attr.image[DefaultInfo].default_runfiles,
@@ -126,7 +133,47 @@ def _runc_binary_impl(ctx):
             files = depset([launcher, config] + indexes),
             runfiles = runfiles,
         ),
+        OutputGroupInfo(_validation = depset(checks)),
     ]
+
+def _profiles(ctx, layout, indexes):
+    # type: (ctx, File, list) -> tuple
+    """The profiles to fetch ahead from, and the checks that they still apply.
+
+    A profile that has stopped describing the image costs a lookup and nothing
+    else at run time, so nothing fails there. Here is where saying so is any
+    use: a profile left behind by a rename, or recorded against another image,
+    still looks like a profile and no longer buys what it claims.
+    """
+    if not ctx.attr.profile:
+        return [], []
+    profiles = ctx.attr.profile[OciRuntimeProfileInfo].files
+    if profiles and not indexes:
+        fail("{}: a profile needs `index = True`, since an image without the layer sidecars is extracted rather than served".format(ctx.label))
+
+    checks = []
+    for profile in profiles:
+        checked = ctx.actions.declare_file("{}.{}.checked".format(ctx.label.name, profile.basename))
+        ctx.actions.run(
+            executable = ctx.attr._tool[DefaultInfo].files_to_run,
+            arguments = [
+                "profile",
+                "--profile",
+                profile.path,
+                "--layout",
+                layout.path,
+                "--index",
+                indexes[0].path,
+                "--stamp",
+                checked.path,
+            ],
+            inputs = [layout, profile] + indexes,
+            outputs = [checked],
+            mnemonic = "OciProfileCheck",
+            progress_message = "Checking " + profile.short_path + " against %{label}",
+        )
+        checks.append(checked)
+    return profiles, checks
 
 runc_binary = rule(
     implementation = _runc_binary_impl,
@@ -189,7 +236,21 @@ off if build time matters more than startup time.
             allow_files = True,
             doc = "Extra files to make available in the runfiles tree, for use with `mounts`.",
         ),
-        "_indexer": attr.label(
+        "profile": attr.label(
+            providers = [OciRuntimeProfileInfo],
+            doc = """An `oci_runtime_profile` naming what this container reads, fetched ahead of it.
+
+A served image costs a wait every time the container opens a file nothing has
+opened yet. A profile is the list of those files from a previous run, so they
+can be fetched before it asks and on more than one thread at a time. Requires
+`index = True`, since an image without the sidecars is extracted rather than
+served.
+
+Profiles are recorded by running the container, not by building it: see
+`oci_runtime_profile`.
+""",
+        ),
+        "_tool": attr.label(
             default = ":current_launcher",
             executable = True,
             cfg = "exec",
