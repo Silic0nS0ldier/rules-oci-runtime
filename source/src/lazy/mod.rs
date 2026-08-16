@@ -24,11 +24,13 @@ mod source;
 mod tree;
 
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
 
 use camino::Utf8Path;
-use fuser::{BackgroundSession, MountOption, Session};
+use fuser::{BackgroundSession, MountOption, Session, SessionACL};
 
 use crate::cli::RootfsMode;
 use crate::error::{Error, IoContext, Result};
@@ -41,6 +43,10 @@ use crate::sys;
 /// clearest sign a host cannot serve one.
 const DEVICE: &str = "/dev/fuse";
 
+/// Where a host says whether an unprivileged caller may open a mount to
+/// others, which is what auto-unmounting is only offered alongside.
+const FUSE_CONF: &str = "/etc/fuse.conf";
+
 /// Serving is request bound rather than throughput bound, and past a point the
 /// threads only queue for the same locks.
 const MAX_WORKERS: usize = 8;
@@ -50,6 +56,9 @@ const MAX_WORKERS: usize = 8;
 pub struct Mount {
     session: Option<BackgroundSession>,
     at: PathBuf,
+    /// Whether a helper is waiting to take the mount down when this process
+    /// goes, which changes who has to take it down when it goes willingly.
+    automatic: bool,
 }
 
 impl Drop for Mount {
@@ -58,9 +67,51 @@ impl Drop for Mount {
             return;
         };
         log!("Unmounting {}", self.at.display());
+        // The helper behind an auto-unmounting mount waits for this process to
+        // exit, and the session will not finish until the mount goes, so
+        // leaving it to either of them is a deadlock. Taking the mount down
+        // here ends both.
+        if self.automatic
+            && let Err(err) = unmount(&self.at)
+        {
+            warning!("could not unmount {}: {err}", self.at.display());
+        }
         if let Err(err) = session.umount_and_join() {
             warning!("could not unmount {}: {err}", self.at.display());
         }
+    }
+}
+
+/// Detaches the mount at `at`, through the setuid helper where the caller may
+/// not do it itself.
+///
+/// Detached rather than plain: the mount is on its way out either way, and
+/// what it costs to wait for the last reference to it is a launcher that never
+/// returns.
+fn unmount(at: &Path) -> std::io::Result<()> {
+    let target = std::ffi::CString::new(at.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: the path is a live NUL terminated string.
+    if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } == 0 {
+        return Ok(());
+    }
+    let refused = std::io::Error::last_os_error();
+    if refused.raw_os_error() != Some(libc::EPERM) {
+        return Err(refused);
+    }
+    // Linux refuses every unprivileged caller, however it came by the mount.
+    let helper = fusermount().ok_or(refused)?;
+    let status = Command::new(helper)
+        .args(["-u", "-q", "-z", "--"])
+        .arg(at)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("fusermount {status}")))
     }
 }
 
@@ -118,16 +169,22 @@ pub fn serve(
         sys::egid(),
     );
 
-    let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        MountOption::FSName("rules_oci_runtime".to_string()),
-        MountOption::DefaultPermissions,
-    ];
-    config.n_threads = Some(workers());
-
-    let session = match Session::new(served, rootfs.as_std_path(), &config) {
-        Ok(session) => session,
-        Err(err) => return refuse(format!("{rootfs} could not be mounted ({err})")),
+    // Auto-unmount first, so that a launcher that is killed outright does not
+    // leave a mount standing where its bundle used to be.
+    let mut session = None;
+    let mut refusal = None;
+    for (automatic, config) in configurations() {
+        match Session::new(served.clone(), rootfs.as_std_path(), &config) {
+            Ok(open) => {
+                session = Some((open, automatic));
+                break;
+            }
+            Err(err) => refusal = Some(err),
+        }
+    }
+    let Some((session, automatic)) = session else {
+        let err = refusal.expect("a mount was attempted");
+        return refuse(format!("{rootfs} could not be mounted ({err})"));
     };
     let session = match session.spawn() {
         Ok(session) => session,
@@ -138,10 +195,80 @@ pub fn serve(
         descriptors.len(),
         workers()
     );
+    if automatic {
+        log!("The mount goes away with this process");
+    } else {
+        log!("Killing this process will leave the mount behind");
+    }
     Ok(Some(Mount {
         session: Some(session),
         at: rootfs.as_std_path().to_owned(),
+        automatic,
     }))
+}
+
+/// The mounts to try, best first, and whether each takes itself down.
+///
+/// Auto-unmounting hands the mount to a `fusermount3` that outlives this
+/// process and takes the mount down when the process goes, however it goes.
+/// It is only offered alongside an access control wider than the owner, which
+/// in the kernel means `allow_other` and nothing narrower.
+///
+/// Nothing is given away by that here: the mount point sits inside a bundle
+/// directory this process alone can enter, so no other user can reach it
+/// whatever the filesystem says.
+fn configurations() -> Vec<(bool, fuser::Config)> {
+    let plain = || {
+        let mut config = fuser::Config::default();
+        config.mount_options = vec![
+            MountOption::FSName("rules_oci_runtime".to_string()),
+            MountOption::DefaultPermissions,
+        ];
+        config.n_threads = Some(workers());
+        config
+    };
+    let mut attempts = Vec::new();
+    if auto_unmountable() {
+        let mut config = plain();
+        config.mount_options.push(MountOption::AutoUnmount);
+        config.acl = SessionACL::All;
+        attempts.push((true, config));
+    }
+    attempts.push((false, plain()));
+    attempts
+}
+
+/// Whether asking for an auto-unmounting mount is worth the attempt: it goes
+/// through `fusermount3`, which has to be there and has to be willing to pass
+/// `allow_other` on. Getting this wrong only costs a failed attempt, since the
+/// mount is tried again without it.
+fn auto_unmountable() -> bool {
+    fusermount().is_some() && (sys::euid() == 0 || allows_other())
+}
+
+fn fusermount() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FUSERMOUNT_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|directory| {
+        ["fusermount3", "fusermount"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|at| at.is_file())
+    })
+}
+
+/// `fusermount3` refuses `allow_other` from an unprivileged caller unless the
+/// host has said otherwise.
+fn allows_other() -> bool {
+    let Ok(config) = std::fs::read_to_string(FUSE_CONF) else {
+        return false;
+    };
+    config
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "user_allow_other")
 }
 
 fn workers() -> usize {

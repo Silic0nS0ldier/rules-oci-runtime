@@ -261,6 +261,59 @@ case_served_rootfs() {
   assert_equals "${extracted%%$'\n'*}" "$served" "the next run sees the image again"
 }
 
+# A bundle goes away with the launcher however the launcher goes. A served
+# rootfs is a mount rather than a directory, and one left standing needs a hand
+# to remove, so the host is asked for a mount that takes itself down.
+case_auto_unmount() {
+  local out="${TEST_TMPDIR}/auto-unmount.out" err="${TEST_TMPDIR}/auto-unmount.err"
+  RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse \
+    /bin/sh -c 'echo ready; sleep 30' </dev/null >"$out" 2>"$err" &
+  local pid=$!
+
+  local waited=0
+  while ! grep -q ready "$out" 2>/dev/null; do
+    sleep 0.2
+    waited=$((waited + 1))
+    if [[ "$waited" -gt 150 ]]; then
+      kill -9 "$pid" 2>/dev/null
+      fail "container never started"
+      return
+    fi
+  done
+
+  local rootfs
+  rootfs=$(sed -n 's/^Serving .* at \(.*\) on [0-9]* threads$/\1/p' "$err")
+  if [[ -z "$rootfs" ]]; then
+    fail "the image was not served: $(cat "$err")"
+    kill -9 "$pid" 2>/dev/null
+    return
+  fi
+  if ! grep -q "goes away with this process" "$err"; then
+    # No `fusermount3`, or a host that will not let this user open a mount to
+    # others. Nothing to hold the launcher to then, but say so: a case that
+    # quietly tests nothing is worse than one that fails.
+    echo "SKIP: this host does not give out mounts that take themselves down" >&2
+    kill -9 "$pid" 2>/dev/null
+    return
+  fi
+  if ! grep -qF " ${rootfs} " /proc/self/mountinfo; then
+    fail "nothing is mounted at ${rootfs}"
+    kill -9 "$pid" 2>/dev/null
+    return
+  fi
+
+  kill -9 "$pid"
+  waited=0
+  while grep -qF " ${rootfs} " /proc/self/mountinfo; do
+    sleep 0.2
+    waited=$((waited + 1))
+    if [[ "$waited" -gt 50 ]]; then
+      fail "the mount at ${rootfs} outlived the launcher"
+      return
+    fi
+  done
+}
+
 case_signal_forwarding() {
   "$container" /bin/sh -c 'trap "echo caught; exit 7" TERM; echo ready; while true; do sleep 0.1; done' \
     </dev/null >"${TEST_TMPDIR}/signal.out" &
