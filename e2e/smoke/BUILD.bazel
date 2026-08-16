@@ -71,6 +71,7 @@ CASES = [
     "rule_env_and_workdir",
     "rule_mounts",
     "runtime_mount",
+    "served_rootfs",
     "signal_forwarding",
     "stdin_is_piped",
     "verbose_logging",

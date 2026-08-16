@@ -33,6 +33,7 @@ use crate::zinfo;
 use pipeline::{ChunkReader, PIPELINE_DEPTH, Sink, buffer_pool, inflate_blob, inflate_indexed};
 
 pub use pipeline::{Compression, compression_of, decompressed};
+pub use plan::{Plan, Work};
 
 /// Applies layers in order, deferring directory permissions so that read-only
 /// directories in one layer do not block writes from the next.
@@ -166,6 +167,20 @@ impl RootfsExtractor {
     fn indexes_for(&self, descriptors: &[Descriptor]) -> Option<Vec<zinfo::Index>> {
         let dir = self.index_dir.as_deref()?;
         descriptors.iter().map(|d| index_at(dir, d)).collect()
+    }
+
+    /// Everything a caller needs to serve the image rather than extract it:
+    /// what survives the layers, and where each layer can be inflated from.
+    ///
+    /// `None` under exactly the conditions that keep extraction off the span
+    /// route, so an image is never served by one set of rules and extracted by
+    /// another.
+    pub fn resolved(
+        &self,
+        descriptors: &[Descriptor],
+    ) -> Option<(&Plan, &Work, Vec<zinfo::Index>)> {
+        let work = self.plan.work()?;
+        Some((&self.plan, work, self.indexes_for(descriptors)?))
     }
 
     /// Decompression is CPU bound and writing the rootfs is IO bound, so a

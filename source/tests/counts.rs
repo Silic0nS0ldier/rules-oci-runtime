@@ -255,6 +255,7 @@ fn extract(name: &str, layout: &Path, indexes: Option<&Path>) -> Extraction {
         .arg(layout)
         .args(["--runtime", "/nonexistent/runc"])
         .args(["--keep-bundle", "--verbose", "--strict-xattrs=false"])
+        .args(["--rootfs", "extract"])
         .env("TMPDIR", &run);
     if let Some(indexes) = indexes {
         command.arg("--index").arg(indexes);
@@ -292,6 +293,7 @@ fn traced(name: &str, layout: &Path, indexes: Option<&Path>) -> BTreeMap<String,
         .arg(layout)
         .args(["--runtime", "/nonexistent/runc"])
         .args(["--keep-bundle", "--strict-xattrs=false"])
+        .args(["--rootfs", "extract"])
         .env("TMPDIR", &run);
     if let Some(indexes) = indexes {
         command.arg("--index").arg(indexes);
