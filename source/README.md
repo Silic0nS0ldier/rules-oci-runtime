@@ -65,6 +65,24 @@ nothing: entries placed, what the plan skipped, and the syscalls each route
 makes. Its numbers come from `bench_image --profile small`; when the generator
 changes, run the test and update them from what it reports.
 
+### The served route
+
+`bench_run` measures extraction, and has no served mode: what a served rootfs
+costs depends on what the container reads, which is not something the harness
+knows. Until it has one, run the launcher against a generated layout with a
+stand-in runtime that reads part of the tree, and read the count the launcher
+reports itself:
+
+```
+.bazel/bin/oci_runtime run --layout /tmp/bench-full --index /tmp/idx-full \
+    --rootfs=fuse --runtime ./reads-some-files.sh --verbose 2>&1 | grep waited
+```
+
+`The container waited for N files to be fetched` is the number to compare. It
+is the count of opens that had to inflate a span before they could be answered,
+so it does not move with the host the way the clock does, and it is what a
+profile is meant to drive to zero.
+
 ## Profile-guided optimisation
 
 Release launchers are built against `pgo/oci_runtime.profdata`, which is

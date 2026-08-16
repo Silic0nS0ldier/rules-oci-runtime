@@ -159,6 +159,35 @@ impl Bodies {
     }
 }
 
+/// What the image called each inode, which is the only place the two things
+/// working from a recorded list of paths can agree with it.
+pub struct Names(HashMap<Vec<u8>, u64>);
+
+impl Names {
+    pub fn ino(&self, path: &[u8]) -> Option<u64> {
+        self.0.get(path).copied()
+    }
+
+    /// The image's name for each inode, indexed by inode, empty where an
+    /// inode has none.
+    ///
+    /// Hard linked files have several and take the first in order, so what a
+    /// recording writes down does not depend on which name the container
+    /// happened to open or on the order a hash map gave them up.
+    pub fn by_ino(&self, inodes: usize) -> Vec<Vec<u8>> {
+        let mut names = vec![Vec::new(); inodes];
+        for (path, &ino) in &self.0 {
+            let Some(name) = names.get_mut(ino as usize - 1) else {
+                continue;
+            };
+            if name.is_empty() || path < name {
+                name.clone_from(path);
+            }
+        }
+        names
+    }
+}
+
 impl Tree {
     /// The namespace the image ends up with, or `None` when the plan describes
     /// one that cannot be built: a hard link naming nothing, or an entry whose
@@ -171,7 +200,7 @@ impl Tree {
         directories: &[(Vec<u8>, u32)],
         tables: &[Table],
         work: &Work,
-    ) -> Option<(Tree, Bodies)> {
+    ) -> Option<(Tree, Bodies, Names)> {
         let mut tree = Tree {
             nodes: vec![Node::directory(DEFAULT_DIRECTORY_MODE)],
         };
@@ -222,7 +251,7 @@ impl Tree {
             tree.attach(&mut by_path, &entry.path, target)?;
         }
 
-        Some((tree, bodies))
+        Some((tree, bodies, Names(by_path)))
     }
 
     pub fn get(&self, ino: u64) -> Option<&Node> {
@@ -383,7 +412,7 @@ mod tests {
     #[test]
     fn the_namespace_is_the_one_the_plan_describes() {
         let (directories, tables, work) = image();
-        let (tree, _) = Tree::build(&directories, &tables, &work).expect("tree");
+        let (tree, ..) = Tree::build(&directories, &tables, &work).expect("tree");
 
         let etc = tree.lookup(ROOT, b"etc").expect("etc");
         let passwd = tree.lookup(etc, b"passwd").expect("passwd");
@@ -405,7 +434,7 @@ mod tests {
     #[test]
     fn a_hard_link_is_another_name_for_the_same_inode() {
         let (directories, tables, work) = image();
-        let (tree, _) = Tree::build(&directories, &tables, &work).expect("tree");
+        let (tree, ..) = Tree::build(&directories, &tables, &work).expect("tree");
         let etc = tree.lookup(ROOT, b"etc").expect("etc");
         let passwd = tree.lookup(etc, b"passwd").expect("passwd");
 
@@ -416,7 +445,7 @@ mod tests {
     #[test]
     fn a_subdirectory_is_a_name_for_its_parent() {
         let directories = vec![(b"usr".to_vec(), 0o755), (b"usr/bin".to_vec(), 0o755)];
-        let (tree, _) = Tree::build(&directories, &[], &Work::default()).expect("tree");
+        let (tree, ..) = Tree::build(&directories, &[], &Work::default()).expect("tree");
 
         let usr = tree.lookup(ROOT, b"usr").expect("usr");
         let bin = tree.lookup(usr, b"bin").expect("bin");
@@ -454,7 +483,7 @@ mod tests {
     #[test]
     fn the_last_name_taken_away_takes_the_inode_with_it() {
         let (directories, tables, work) = image();
-        let (mut tree, _) = Tree::build(&directories, &tables, &work).expect("tree");
+        let (mut tree, ..) = Tree::build(&directories, &tables, &work).expect("tree");
         let etc = tree.lookup(ROOT, b"etc").expect("etc");
         let passwd = tree.lookup(etc, b"passwd").expect("passwd");
 
@@ -467,8 +496,25 @@ mod tests {
 
     #[test]
     fn the_root_takes_the_mode_the_image_gives_it() {
-        let (tree, _) =
+        let (tree, ..) =
             Tree::build(&[(b".".to_vec(), 0o750)], &[], &Work::default()).expect("tree");
         assert_eq!(tree.get(ROOT).expect("root").mode, 0o750);
+    }
+
+    #[test]
+    fn every_entry_can_be_found_by_the_name_the_image_gave_it() {
+        let (directories, tables, work) = image();
+        let (tree, _, names) = Tree::build(&directories, &tables, &work).expect("tree");
+        let etc = tree.lookup(ROOT, b"etc").expect("etc");
+        let passwd = tree.lookup(etc, b"passwd").expect("passwd");
+
+        assert_eq!(names.ino(b"etc/passwd"), Some(passwd));
+        assert_eq!(names.ino(b"etc/nothing"), None);
+
+        let by_ino = names.by_ino(tree.len());
+        assert_eq!(by_ino[etc as usize - 1], b"etc");
+        // `etc/same` is the same inode, and the first name in order is what a
+        // recording says whichever of them was opened.
+        assert_eq!(by_ino[passwd as usize - 1], b"etc/passwd");
     }
 }
