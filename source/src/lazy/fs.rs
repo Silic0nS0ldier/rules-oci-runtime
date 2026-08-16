@@ -19,19 +19,20 @@ use std::fs::{self, File};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    BackingId, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
 use super::source::{Scratch, Source};
 use super::tree::{Bodies, Body, Content, Kind, Node, ROOT, Special, Tree};
 use crate::error::IoContext;
+use crate::log::log;
 
 /// How long the kernel may trust what it was told. Everything that changes the
 /// tree comes through here, so a longer life would only risk a stale answer to
@@ -80,6 +81,8 @@ impl Rootfs {
                 gid,
                 handles: Mutex::new(HashMap::new()),
                 next_handle: AtomicU64::new(1),
+                backings: Mutex::new(HashMap::new()),
+                passthrough: AtomicBool::new(false),
             }),
         }
     }
@@ -116,8 +119,21 @@ pub struct Served {
     /// which is what extraction leaves behind as well.
     uid: u32,
     gid: u32,
-    handles: Mutex<HashMap<u64, Arc<File>>>,
+    handles: Mutex<HashMap<u64, Handle>>,
     next_handle: AtomicU64,
+    /// The backing file the kernel serves an inode's reads and writes from
+    /// once it has taken it over. One per inode, which is what it requires,
+    /// and held for as long as anything has the inode open.
+    backings: Mutex<HashMap<u64, Weak<BackingId>>>,
+    /// Whether the kernel agreed to take files over at all. Cleared when it
+    /// turns out to want a privilege this process does not have.
+    passthrough: AtomicBool,
+}
+
+/// An open file, and the reason the kernel may not be asking about it.
+struct Handle {
+    file: Arc<File>,
+    _backing: Option<Arc<BackingId>>,
 }
 
 impl Served {
@@ -239,12 +255,18 @@ impl Served {
         Ok(Arc::new(file))
     }
 
-    fn hold(&self, file: Arc<File>) -> FileHandle {
+    fn hold(&self, file: Arc<File>, backing: Option<Arc<BackingId>>) -> FileHandle {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(handle, file);
+            .insert(
+                handle,
+                Handle {
+                    file,
+                    _backing: backing,
+                },
+            );
         FileHandle(handle)
     }
 
@@ -253,8 +275,47 @@ impl Served {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&handle.0)
-            .cloned()
+            .map(|handle| handle.file.clone())
             .ok_or(Errno::EBADF)
+    }
+
+    /// The reference the kernel needs to answer an inode's reads and writes
+    /// itself, or `None` where it will not.
+    ///
+    /// One reference per inode: the kernel takes an inode over, not a handle,
+    /// and a second one for a file already open is refused. It lives as long
+    /// as the handles that carry it and no longer.
+    fn backing(
+        &self,
+        ino: u64,
+        file: &File,
+        open: impl FnOnce(&File) -> std::io::Result<BackingId>,
+    ) -> Option<Arc<BackingId>> {
+        if !self.passthrough.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut backings = self
+            .backings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(backing) = backings.get(&ino).and_then(Weak::upgrade) {
+            return Some(backing);
+        }
+        match open(file) {
+            Ok(backing) => {
+                let backing = Arc::new(backing);
+                backings.insert(ino, Arc::downgrade(&backing));
+                Some(backing)
+            }
+            Err(err) => {
+                // Taking a file over needs a privilege, so a refusal is about
+                // this process rather than this file: nothing is gained by
+                // asking again.
+                log!("The kernel will not read and write the backing files itself: {err}");
+                self.passthrough.store(false, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     fn attr(&self, ino: u64, node: &Node) -> FileAttr {
@@ -369,7 +430,18 @@ macro_rules! answer {
 }
 
 impl Filesystem for Rootfs {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Handing the kernel the backing file takes this out of every read and
+        // write of it, leaving only the fetch that put it there. The stacking
+        // depth has to be set as well, or the capability is negotiated and
+        // never offered.
+        let taken_over = config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok()
+            && config.set_max_stack_depth(1).is_ok();
+        self.passthrough.store(taken_over, Ordering::Relaxed);
+        log!(
+            "The kernel {} read and write the backing files itself",
+            if taken_over { "will" } else { "will not" }
+        );
         Ok(())
     }
 
@@ -452,7 +524,13 @@ impl Filesystem for Rootfs {
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let file = answer!(reply, self.open_backing(ino.0));
-        reply.opened(self.hold(file), FopenFlags::empty());
+        match self.backing(ino.0, &file, |fd| reply.open_backing(fd)) {
+            Some(backing) => {
+                let handle = self.hold(file, Some(backing.clone()));
+                reply.opened_passthrough(handle, FopenFlags::empty(), &backing);
+            }
+            None => reply.opened(self.hold(file, None), FopenFlags::empty()),
+        }
     }
 
     fn read(
@@ -539,7 +617,7 @@ impl Filesystem for Rootfs {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
@@ -550,6 +628,18 @@ impl Filesystem for Rootfs {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&fh.0);
+        // The last handle to go takes the kernel's reference with it, and the
+        // entry that was holding it is no use to the next open.
+        let mut backings = self
+            .backings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if backings
+            .get(&ino.0)
+            .is_some_and(|backing| backing.strong_count() == 0)
+        {
+            backings.remove(&ino.0);
+        }
         reply.ok();
     }
 
@@ -621,13 +711,27 @@ impl Filesystem for Rootfs {
                 .open(self.backing_path(ino))
                 .map_err(Errno::from)
         });
-        reply.created(
-            &TTL,
-            &attr,
-            GENERATION,
-            self.hold(Arc::new(file)),
-            FopenFlags::empty(),
-        );
+        let file = Arc::new(file);
+        match self.backing(ino, &file, |fd| reply.open_backing(fd)) {
+            Some(backing) => {
+                let handle = self.hold(file, Some(backing.clone()));
+                reply.created_passthrough(
+                    &TTL,
+                    &attr,
+                    GENERATION,
+                    handle,
+                    FopenFlags::empty(),
+                    &backing,
+                );
+            }
+            None => reply.created(
+                &TTL,
+                &attr,
+                GENERATION,
+                self.hold(file, None),
+                FopenFlags::empty(),
+            ),
+        }
     }
 
     fn mknod(
