@@ -1,11 +1,25 @@
 load("@rules_oci//oci:defs.bzl", "oci_image")
-load("@rules_oci_runtime//lib:defs.bzl", "runc_binary")
+load("@rules_oci_runtime//lib:defs.bzl", "oci_runtime_profile", "runc_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("@tar.bzl", "tar")
 
 runc_binary(
     name = "container",
     image = "@alpine",
+)
+
+# The committed profile is checked against the image at build time, so a build
+# of this target is the check.
+oci_runtime_profile(
+    name = "container_profile",
+    srcs = glob(["profiles/container.*.profile"], allow_empty = True),
+    record_to = "profiles/container",
+)
+
+runc_binary(
+    name = "profiled_container",
+    image = "@alpine",
+    profile = ":container_profile",
 )
 
 runc_binary(
@@ -68,6 +82,7 @@ CASES = [
     "layer_indexes",
     "missing_command",
     "read_only_rootfs",
+    "recorded_profile",
     "rootfs_contents",
     "rule_env_and_workdir",
     "rule_mounts",
@@ -88,6 +103,7 @@ CASES = [
             ":configured_container",
             ":container",
             ":mounting_container",
+            ":profiled_container",
             ":read_only_container",
             ":zstd_container",
         ],
@@ -95,6 +111,7 @@ CASES = [
             "CONFIGURED_CONTAINER": "$(rlocationpath :configured_container)",
             "CONTAINER": "$(rlocationpath :container)",
             "MOUNTING_CONTAINER": "$(rlocationpath :mounting_container)",
+            "PROFILED_CONTAINER": "$(rlocationpath :profiled_container)",
             "READ_ONLY_CONTAINER": "$(rlocationpath :read_only_container)",
             "ZSTD_CONTAINER": "$(rlocationpath :zstd_container)",
         },

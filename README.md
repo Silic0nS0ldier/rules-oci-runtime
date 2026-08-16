@@ -89,6 +89,53 @@ Handing a file to the kernel to read and write itself, rather than through the
 launcher, needs a 6.9 kernel built with `CONFIG_FUSE_PASSTHROUGH` and the
 privilege to ask. `--verbose` says which of them the run got.
 
+### Fetching ahead
+
+A served file is paid for when the container opens it, one at a time and with
+the container waiting for each. What a container reads barely changes from run
+to run, so a recording of one run says what the next will want, and those files
+can be fetched before it asks and several at once.
+
+What a container reads is not something a build can work out, so a profile is
+recorded by running the container rather than by building it:
+
+```starlark
+load("@rules_oci_runtime//lib:defs.bzl", "oci_runtime_profile", "runc_binary")
+
+oci_runtime_profile(
+    name = "container_profile",
+    srcs = glob(["profiles/container.*.profile"], allow_empty = True),
+    record_to = "profiles/container",
+)
+
+runc_binary(
+    name = "container",
+    image = "@alpine",
+    profile = ":container_profile",
+)
+```
+
+```sh
+bazel run //:container -- --record-profile /bin/sh -c 'echo "Hello, world!"'
+```
+```
+recorded 4 files this run read into .../profiles/container.linux-amd64.profile, 4 in all over 1 runs
+```
+
+The profile is a sorted text file, one path a line with the number of runs that
+read it, and recording merges into it rather than replacing it: a container
+takes a different path through itself every time it is asked something
+different, and recording a few of them covers more than any one of them does.
+The name carries the platform because the run only saw one manifest of the
+image, and another platform's holds other files.
+
+The container starts as soon as the first file in the profile is there and the
+rest are fetched while it runs, giving way to whatever the container asks for
+itself; a profile that has gone stale therefore costs a lookup rather than a
+wait. `runc_binary` checks each profile against the image it is used with, so
+one left behind by a rename, or recorded against another image, fails the build
+instead.
+
 ### Extended attributes
 
 Extended attributes are not restored. The one images use in practice,
@@ -209,6 +256,9 @@ Flags accepted before the container command override the rule attributes:
 | `--rootless auto\|true\|false` | Use a user namespace. Defaults to `auto`. |
 | `--read-only` | Mount the container root filesystem read-only. |
 | `--rootfs auto\|fuse\|extract` | Serve the image or extract it. Defaults to `auto`, which serves it where the host and the image allow. |
+| `--profile PATH` | Fetch what a recorded profile names ahead of the container. Repeatable. |
+| `--record-profile[=PATH]` | Record what this run reads. Without a path it writes where the rule said to, and it serves the image or fails. |
+| `--prefetch-barrier COUNT` | How many of a profile's files to fetch before the container starts. Defaults to `1`. |
 | `--strict-xattrs BOOL` | Refuse an image that sets extended attributes. Defaults to `true`. |
 | `--keep-bundle` | Leave the generated bundle on disk for inspection. |
 | `--verbose` | Same as `RULES_OCI_RUNTIME_VERBOSE=1`. |

@@ -18,7 +18,19 @@ bzl_library(
         "//docs:__subpackages__",
         "//lib:__subpackages__",
     ],
-    deps = [":toolchains"],
+    deps = [
+        ":profile",
+        ":toolchains",
+    ],
+)
+
+bzl_library(
+    name = "profile",
+    srcs = ["profile.bzl"],
+    visibility = [
+        "//docs:__subpackages__",
+        "//lib:__subpackages__",
+    ],
 )
 
 bzl_library(

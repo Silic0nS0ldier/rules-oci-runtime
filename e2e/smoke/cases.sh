@@ -10,6 +10,7 @@ container="${runfiles}/${CONTAINER}"
 configured_container="${runfiles}/${CONFIGURED_CONTAINER}"
 read_only_container="${runfiles}/${READ_ONLY_CONTAINER}"
 mounting_container="${runfiles}/${MOUNTING_CONTAINER}"
+profiled_container="${runfiles}/${PROFILED_CONTAINER}"
 zstd_container="${runfiles}/${ZSTD_CONTAINER}"
 
 failures=0
@@ -259,6 +260,69 @@ case_served_rootfs() {
   assert_equals "written" "$served" "a served rootfs is writable"
   served=$("$container" --rootfs=fuse /bin/cat /etc/alpine-release </dev/null)
   assert_equals "${extracted%%$'\n'*}" "$served" "the next run sees the image again"
+}
+
+# What a container read is recorded from a run of it and fetched ahead of the
+# next one. Recording is a run time thing rather than a build time one, so this
+# records into the test's own directory rather than a source tree.
+case_recorded_profile() {
+  local base="${TEST_TMPDIR}/profiles/alpine"
+  local platform err
+  err="${TEST_TMPDIR}/record.err"
+
+  RULES_OCI_RUNTIME_VERBOSE=1 "$container" --record-profile="$base" \
+    /bin/sh -c 'cat /etc/alpine-release >/dev/null' </dev/null 2>"$err"
+  if grep -q "cannot serve the image" "$err"; then
+    return
+  fi
+
+  local profile
+  profile=$(echo "${base}".*.profile)
+  if [[ ! -f "$profile" ]]; then
+    fail "recording wrote no profile: $(cat "$err")"
+    return
+  fi
+  # The platform is in the name so two of them cannot land on one file.
+  assert_contains "$profile" "$(uname -s | tr 'A-Z' 'a-z')-" "the profile is named for a platform"
+  assert_contains "$(cat "$profile")" "/etc/alpine-release" "the file the container read"
+  assert_contains "$(cat "$profile")" "runs 1" "one recorded run"
+
+  # A second recording adds to the first rather than replacing it.
+  "$container" --record-profile="$base" \
+    /bin/sh -c 'cat /etc/hostname >/dev/null' </dev/null 2>/dev/null
+  assert_contains "$(cat "$profile")" "runs 2" "a second recorded run"
+  assert_contains "$(cat "$profile")" "/etc/alpine-release" "what the first run read"
+  assert_equals "1" "$(grep -c ' /etc/alpine-release$' "$profile")" "one line per file"
+
+  # Reading it back fetches those files before the container asks for them.
+  local output
+  output=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse --profile "$profile" \
+    /bin/cat /etc/alpine-release </dev/null 2>"${TEST_TMPDIR}/replay.err")
+  assert_equals "$("$container" --rootfs=extract /bin/cat /etc/alpine-release </dev/null)" \
+    "$output" "a profiled run reads what an extracted one does"
+  assert_contains "$(cat "${TEST_TMPDIR}/replay.err")" "ahead of the container" "files fetched ahead"
+  # The point of the profile: nothing the container opened had to be fetched
+  # while it waited.
+  assert_contains "$(cat "${TEST_TMPDIR}/replay.err")" "waited for 0 files" "no blocking fetches"
+
+  # There is nothing to record from a rootfs that is written out in full before
+  # the container starts.
+  "$container" --rootfs=extract --record-profile="$base" /bin/true </dev/null \
+    2>"${TEST_TMPDIR}/extracted.err"
+  assert_contains "$(cat "${TEST_TMPDIR}/extracted.err")" "nothing to record" \
+    "recording from an extracted rootfs"
+
+  # A profile recorded for another platform is not this one's to use.
+  local other="${TEST_TMPDIR}/other.linux-nosucharch.profile"
+  sed 's|^platform .*|platform linux/nosucharch|' "$profile" >"$other"
+  RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse --profile "$other" \
+    /bin/true </dev/null 2>"${TEST_TMPDIR}/other.err"
+  assert_contains "$(cat "${TEST_TMPDIR}/other.err")" "Ignoring" "another platform's profile"
+
+  # The rule wires its own profile in, whether or not one has been recorded.
+  output=$("$profiled_container" /bin/cat /etc/alpine-release </dev/null)
+  assert_equals "$("$container" --rootfs=extract /bin/cat /etc/alpine-release </dev/null)" \
+    "$output" "the rule's profiled container"
 }
 
 # A bundle goes away with the launcher however the launcher goes. A served
