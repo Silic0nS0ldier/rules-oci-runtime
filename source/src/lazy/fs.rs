@@ -55,6 +55,56 @@ thread_local! {
 }
 
 pub struct Rootfs {
+    served: Arc<Served>,
+}
+
+impl Rootfs {
+    pub fn new(
+        tree: Tree,
+        bodies: Bodies,
+        source: Source,
+        layers: usize,
+        backing: PathBuf,
+        uid: u32,
+        gid: u32,
+    ) -> Rootfs {
+        Rootfs {
+            served: Arc::new(Served {
+                tree: RwLock::new(tree),
+                source,
+                bodies,
+                layers,
+                backing,
+                fetching: (0..SHARDS).map(|_| Mutex::new(())).collect(),
+                uid,
+                gid,
+                handles: Mutex::new(HashMap::new()),
+                next_handle: AtomicU64::new(1),
+            }),
+        }
+    }
+}
+
+/// `Session::new` takes the filesystem by value and drops it when the mount
+/// fails, and a mount is worth more than one attempt, so what is served is
+/// shared rather than owned.
+impl Clone for Rootfs {
+    fn clone(&self) -> Rootfs {
+        Rootfs {
+            served: self.served.clone(),
+        }
+    }
+}
+
+impl std::ops::Deref for Rootfs {
+    type Target = Served;
+
+    fn deref(&self) -> &Served {
+        &self.served
+    }
+}
+
+pub struct Served {
     tree: RwLock<Tree>,
     source: Source,
     bodies: Bodies,
@@ -70,35 +120,15 @@ pub struct Rootfs {
     next_handle: AtomicU64,
 }
 
-impl Rootfs {
-    pub fn new(
-        tree: Tree,
-        bodies: Bodies,
-        source: Source,
-        layers: usize,
-        backing: PathBuf,
-        uid: u32,
-        gid: u32,
-    ) -> Rootfs {
-        Rootfs {
-            tree: RwLock::new(tree),
-            source,
-            bodies,
-            layers,
-            backing,
-            fetching: (0..SHARDS).map(|_| Mutex::new(())).collect(),
-            uid,
-            gid,
-            handles: Mutex::new(HashMap::new()),
-            next_handle: AtomicU64::new(1),
-        }
-    }
-
-    fn read(&self) -> Result<RwLockReadGuard<'_, Tree>, Errno> {
+impl Served {
+    /// Named for the tree rather than the lock: behind the `Deref` above, a
+    /// bare `read` or `write` would find the trait's own methods of those
+    /// names instead.
+    fn read_tree(&self) -> Result<RwLockReadGuard<'_, Tree>, Errno> {
         self.tree.read().map_err(|_| Errno::EIO)
     }
 
-    fn write(&self) -> Result<RwLockWriteGuard<'_, Tree>, Errno> {
+    fn write_tree(&self) -> Result<RwLockWriteGuard<'_, Tree>, Errno> {
         self.tree.write().map_err(|_| Errno::EIO)
     }
 
@@ -108,7 +138,7 @@ impl Rootfs {
 
     /// The bytes still owed to a file, or `None` when it is already backed.
     fn owed(&self, ino: u64) -> Result<Option<(Body, u64)>, Errno> {
-        let tree = self.read()?;
+        let tree = self.read_tree()?;
         let node = tree.get(ino).ok_or(Errno::ENOENT)?;
         match &node.kind {
             Kind::File(Content::Layer(body)) => Ok(Some((*body, node.mtime))),
@@ -155,7 +185,7 @@ impl Rootfs {
     fn fetch_span(&self, body: Body, scratch: &mut Scratch) -> crate::error::Result<()> {
         let window = self.source.inflate(body, scratch)?;
         let owed: Vec<(u64, Body, u64)> = {
-            let tree = self.read().map_err(io_error)?;
+            let tree = self.read_tree().map_err(io_error)?;
             self.bodies
                 .within(body.layer, window.base..window.end)
                 .iter()
@@ -186,7 +216,7 @@ impl Rootfs {
     /// while it was being written. Both halves happen under the tree lock, so
     /// nothing can come between them and lose what the container wrote.
     fn commit(&self, ino: u64, staged: &std::path::Path) -> crate::error::Result<()> {
-        let mut tree = self.write().map_err(io_error)?;
+        let mut tree = self.write_tree().map_err(io_error)?;
         match tree.get_mut(ino).map(|node| &mut node.kind) {
             Some(Kind::File(content @ Content::Layer(_))) => {
                 fs::rename(staged, self.backing_path(ino))
@@ -267,14 +297,14 @@ impl Rootfs {
     }
 
     fn attr_of(&self, ino: u64) -> Result<FileAttr, Errno> {
-        let tree = self.read()?;
+        let tree = self.read_tree()?;
         let node = tree.get(ino).ok_or(Errno::ENOENT)?;
         Ok(self.attr(ino, node))
     }
 
     /// Adds a freshly made node under `parent`, refusing a name already taken.
     fn make(&self, parent: u64, name: &OsStr, node: Node) -> Result<(u64, FileAttr), Errno> {
-        let mut tree = self.write()?;
+        let mut tree = self.write_tree()?;
         if !tree.get(parent).ok_or(Errno::ENOENT)?.is_directory() {
             return Err(Errno::ENOTDIR);
         }
@@ -291,7 +321,7 @@ impl Rootfs {
     /// Takes a name away, and with it the backing file when nothing else names
     /// what it held.
     fn remove(&self, parent: u64, name: &OsStr, directory: bool) -> Result<(), Errno> {
-        let mut tree = self.write()?;
+        let mut tree = self.write_tree()?;
         let ino = tree.lookup(parent, name.as_bytes()).ok_or(Errno::ENOENT)?;
         let node = tree.get(ino).ok_or(Errno::ENOENT)?;
         match (directory, node.is_directory()) {
@@ -345,7 +375,7 @@ impl Filesystem for Rootfs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let ino = answer!(reply, {
-            self.read()
+            self.read_tree()
                 .and_then(|tree| tree.lookup(parent.0, name.as_bytes()).ok_or(Errno::ENOENT))
         });
         let attr = answer!(reply, self.attr_of(ino));
@@ -389,7 +419,7 @@ impl Filesystem for Rootfs {
             answer!(reply, file.set_len(size).map_err(Errno::from));
         }
         if let Some(mode) = mode {
-            let mut tree = answer!(reply, self.write());
+            let mut tree = answer!(reply, self.write_tree());
             let node = answer!(reply, tree.get_mut(ino.0).ok_or(Errno::ENOENT));
             node.mode = mode & 0o7777;
         }
@@ -402,7 +432,7 @@ impl Filesystem for Rootfs {
                     .map_or(0, |since| since.as_secs()),
                 TimeOrNow::Now => now(),
             };
-            let mut tree = answer!(reply, self.write());
+            let mut tree = answer!(reply, self.write_tree());
             answer!(reply, tree.get_mut(ino.0).ok_or(Errno::ENOENT)).mtime = when;
             drop(tree);
             touch(&self.backing_path(ino.0), when);
@@ -412,7 +442,7 @@ impl Filesystem for Rootfs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        let tree = answer!(reply, self.read());
+        let tree = answer!(reply, self.read_tree());
         let node = answer!(reply, tree.get(ino.0).ok_or(Errno::ENOENT));
         match &node.kind {
             Kind::Symlink(target) => reply.data(target),
@@ -531,7 +561,7 @@ impl Filesystem for Rootfs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let tree = answer!(reply, self.read());
+        let tree = answer!(reply, self.read_tree());
         let node = answer!(reply, tree.get(ino.0).ok_or(Errno::ENOENT));
         let children = answer!(reply, node.children().ok_or(Errno::ENOTDIR));
         let parent = node.parent().unwrap_or(ROOT);
@@ -649,7 +679,7 @@ impl Filesystem for Rootfs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let mut tree = answer!(reply, self.write());
+        let mut tree = answer!(reply, self.write_tree());
         if answer!(reply, tree.get(ino.0).ok_or(Errno::ENOENT)).is_directory() {
             return reply.error(Errno::EPERM);
         }
@@ -688,7 +718,7 @@ impl Filesystem for Rootfs {
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
             return reply.error(Errno::ENOSYS);
         }
-        let mut tree = answer!(reply, self.write());
+        let mut tree = answer!(reply, self.write_tree());
         let ino = answer!(
             reply,
             tree.lookup(parent.0, name.as_bytes()).ok_or(Errno::ENOENT)
@@ -746,7 +776,7 @@ impl Filesystem for Rootfs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        let files = self.read().map_or(0, |tree| tree.len() as u64);
+        let files = self.read_tree().map_or(0, |tree| tree.len() as u64);
         // Writes land in the backing directory, so what it sits on is the
         // space the container actually has.
         let space = space_at(&self.backing);
