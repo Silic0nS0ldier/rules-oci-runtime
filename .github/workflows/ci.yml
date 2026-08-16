@@ -49,6 +49,11 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      # A mount that takes itself down when the launcher is killed is only
+      # handed to an unprivileged caller where the host has said so, and
+      # without this the case that proves it does nothing at all.
+      - name: Permit mounts open to others
+        run: sudo sed --in-place 's/^#user_allow_other$/user_allow_other/' /etc/fuse.conf
       - run: bazel test //...
         working-directory: ${{ matrix.module }}
   # Publishes the same assets a release does, as workflow artifacts, so a change
