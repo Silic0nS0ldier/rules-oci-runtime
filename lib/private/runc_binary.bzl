@@ -172,12 +172,17 @@ Switch it off to extract the image anyway, dropping the attributes.
         ),
         "index": attr.bool(
             default = True,
-            doc = """Index the gzip layers at build time so extraction can run in parallel.
+            doc = """Index the layers at build time so the image can be served rather than extracted.
 
-Each checkpoint index is a small sidecar in the runfiles tree; the image
-layout and its digests are unchanged. Indexing decompresses every layer once
-per build of the image, so switch it off if build time matters more than
-startup time.
+Each sidecar is a small file in the runfiles tree saying what a layer holds
+and where inflating it can resume; the image layout and its digests are
+unchanged. With one beside every layer the launcher can describe the whole
+root filesystem without reading it, mount that, and fetch a file's bytes only
+when something opens it. Without them it extracts the image, and where it does
+extract the sidecars still let it do so in parallel.
+
+Indexing decompresses every layer once per build of the image, so switch it
+off if build time matters more than startup time.
 """,
         ),
         "data": attr.label_list(

@@ -134,9 +134,11 @@ impl Rootfs {
             return Ok(());
         };
         let claim = self.source.span_of(body) * self.layers + body.layer as usize;
+        // The lock guards nothing of its own, so a worker that panicked while
+        // holding it leaves the rest of the session usable.
         let _claim = self.fetching[claim % SHARDS]
             .lock()
-            .expect("a fetching worker");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Whoever held the claim was inflating this very span.
         let Some((body, _)) = self.owed(ino)? else {
             return Ok(());
@@ -211,7 +213,7 @@ impl Rootfs {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handles
             .lock()
-            .expect("the open files")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(handle, file);
         FileHandle(handle)
     }
@@ -219,7 +221,7 @@ impl Rootfs {
     fn held(&self, handle: FileHandle) -> Result<Arc<File>, Errno> {
         self.handles
             .lock()
-            .expect("the open files")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&handle.0)
             .cloned()
             .ok_or(Errno::EBADF)
@@ -514,7 +516,10 @@ impl Filesystem for Rootfs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.handles.lock().expect("the open files").remove(&fh.0);
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&fh.0);
         reply.ok();
     }
 

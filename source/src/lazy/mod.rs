@@ -8,6 +8,16 @@
 //!
 //! Everything the kernel needs to serve one is there or it is not, and where
 //! it is not the run extracts as it always has. Nothing is half served.
+//!
+//! # Fetching ahead
+//!
+//! What a container reads is nearly the same on every run of it, so a recorded
+//! list of paths would say what to fetch before it asks. There is nothing to
+//! build for that beyond the recording and the list: [`fs::Rootfs`] resolves a
+//! path to an inode through the same tree `lookup` uses, and fetching one is
+//! safe from any thread and already reaches the whole span the file is in. A
+//! profile is therefore a walk of paths handed to the same fetch a read takes,
+//! on a pool, between the mount going up here and the bundle reaching runc.
 
 mod fs;
 mod source;

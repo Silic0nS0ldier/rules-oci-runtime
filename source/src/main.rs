@@ -99,6 +99,13 @@ fn run(args: RunArgs) -> Result<i32> {
     )?;
     if _mount.is_none() {
         extractor.apply(&layout, &manifest.layers)?;
+    } else if args.keep_bundle {
+        // The rootfs only ever existed as a mount, so what is kept is what the
+        // container actually read.
+        log::warn(format!(
+            "the rootfs was served: the kept bundle holds only the files the container read, under {}",
+            bundle.backing_dir()
+        ));
     }
 
     let hostname = args
