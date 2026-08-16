@@ -54,13 +54,32 @@ there is no image tarball round-trip and no container runtime daemon.
 A single Rust binary, the launcher, does all of the work:
 
 1. Reads `index.json`, walks nested indexes and selects the manifest matching the requested platform (defaults to the host).
-2. Verifies every blob against its digest and size while streaming it.
-3. Extracts the layers into a private bundle directory, applying `.wh.` whiteouts and rejecting entries that would escape the rootfs.
+2. Verifies every blob against its digest and size.
+3. Puts the layers where the container can see them, applying `.wh.` whiteouts and rejecting entries that would escape the rootfs: [served](#serving-the-rootfs) where the host allows it, extracted where it does not.
 4. Generates an OCI runtime `config.json` (rootless when run as an unprivileged user, otherwise a plain privileged spec).
 5. Copies the host `/etc/resolv.conf` and writes `/etc/hosts` and `/etc/hostname` so DNS works out of the box.
 6. Executes `runc` against a private state root, forwards signals to the container, propagates its exit code and removes the bundle afterwards.
 
 Containers share the host network namespace, and each run gets a unique container ID, so concurrent runs of the same target do not interfere.
+
+### Serving the rootfs
+
+Extraction writes every file an image holds before the container starts, and
+most images are mostly files nothing ever opens. When `runc_binary` is built
+with `index = True` the layers come with sidecars saying what each one holds and
+where inflating can resume, which is enough to describe the whole rootfs without
+reading a single byte of it. The launcher mounts that description over FUSE and
+fetches a file's bytes the first time something opens it.
+
+A container that reads a handful of files out of
+`ghcr.io/browserless/chromium` (22 layers, 2545 MiB of files) starts in 0.7s
+this way against 3.0s extracted.
+
+What the container sees is the same tree either way, down to modes, timestamps
+and hard link groups, and writes go to the container's own copy rather than back
+into the image. Where the host has no `/dev/fuse`, or the image has no sidecars,
+the launcher extracts as it always has; `--rootfs` overrides the choice either
+way.
 
 ### Extended attributes
 
@@ -82,7 +101,7 @@ entries carried one, all of them `security.capability`.
 
 2 debugging oriented flags exist within the launcher;
 1. `--verbose` (or `RULES_OCI_RUNTIME_VERBOSE=1` env var) to log container startup operations.
-2. `--keep-bundle` to preserve the [filesystem bundle](https://github.com/opencontainers/runtime-spec/blob/6999a89a76a0329f440d5740497bedb9dd431297/bundle.md) on exit.
+2. `--keep-bundle` to preserve the [filesystem bundle](https://github.com/opencontainers/runtime-spec/blob/6999a89a76a0329f440d5740497bedb9dd431297/bundle.md) on exit. A served rootfs only exists while the container runs, so what is kept is the files it read; pass `--rootfs=extract` to keep the whole tree.
 
 e.g.
 
@@ -181,6 +200,7 @@ Flags accepted before the container command override the rule attributes:
 | `--tty auto\|true\|false` | Allocate a terminal. Defaults to `auto`. |
 | `--rootless auto\|true\|false` | Use a user namespace. Defaults to `auto`. |
 | `--read-only` | Mount the container root filesystem read-only. |
+| `--rootfs auto\|fuse\|extract` | Serve the image or extract it. Defaults to `auto`, which serves it where the host and the image allow. |
 | `--strict-xattrs BOOL` | Refuse an image that sets extended attributes. Defaults to `true`. |
 | `--keep-bundle` | Leave the generated bundle on disk for inspection. |
 | `--verbose` | Same as `RULES_OCI_RUNTIME_VERBOSE=1`. |
