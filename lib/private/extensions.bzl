@@ -63,6 +63,12 @@ def _hub_impl(repository_ctx):
         ))
     repository_ctx.file("BUILD.bazel", "".join(content))
 
+    # Bazel <8.3.0 lacks repository_ctx.repo_metadata
+    if not hasattr(repository_ctx, "repo_metadata"):
+        return None
+
+    return repository_ctx.repo_metadata(reproducible = True)
+
 _hub = repository_rule(
     implementation = _hub_impl,
     attrs = {
