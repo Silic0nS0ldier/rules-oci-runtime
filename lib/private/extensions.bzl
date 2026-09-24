@@ -9,16 +9,16 @@ _CONSTRAINTS = {
 }
 
 # Hashes are published as `runc.sha256sum` with each release.
-_RUNC_VERSION = "1.3.0"
+_RUNC_VERSION = "1.5.1"
 
 _RUNC_PLATFORMS = {
     "linux_amd64": struct(
         asset = "runc.amd64",
-        sha256 = "028986516ab5646370edce981df2d8e8a8d12188deaf837142a02097000ae2f2",
+        sha256 = "177df879d50c913eb205e898d5c1c05a18f574053c0ce5524c471208eaf06f6f",
     ),
     "linux_arm64": struct(
         asset = "runc.arm64",
-        sha256 = "85c5e4e4f72e442c8c17bac07527cd4f961ee48e4f2b71797f7533c94f4a52b9",
+        sha256 = "ca70e7dbd6616ca782a59b5d3ac86909123fdaa9fa3f89dcf29051c70eee7ce9",
     ),
 }
 
