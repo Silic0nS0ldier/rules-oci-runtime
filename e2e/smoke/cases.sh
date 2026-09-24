@@ -187,7 +187,7 @@ case_zstd_layer() {
     /bin/sh -c 'cat /zstd-marker; cat /etc/alpine-release' \
     </dev/null 2>"${TEST_TMPDIR}/zstd.err")
   assert_contains "$output" "from-the-zstd-layer" "the file the zstd layer adds"
-  assert_contains "$output" "3.22" "the gzip base underneath it"
+  assert_contains "$output" "3.24" "the gzip base underneath it"
 
   # Without this the case would pass on a gzip layer too, which is what
   # `oci_image` writes if the archive is not the one we think it is. The span
@@ -209,7 +209,7 @@ case_zstd_layer() {
 case_rootfs_contents() {
   local output
   output=$("$container" /bin/sh -c 'cat /etc/alpine-release; test -L /bin/sh && echo sh-is-a-symlink' </dev/null)
-  assert_contains "$output" "3.22" "extracted image contents"
+  assert_contains "$output" "3.24" "extracted image contents"
   assert_contains "$output" "sh-is-a-symlink" "symlinks preserved during extraction"
 }
 
