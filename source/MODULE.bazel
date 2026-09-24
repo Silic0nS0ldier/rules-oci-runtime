@@ -66,7 +66,7 @@ crate.from_cargo(
 use_repo(crate, "rules_oci_runtime_source_crates")
 
 # Development only: a hermetic C toolchain for the Rust toolchain's linker.
-bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
+bazel_dep(name = "llvm", version = "0.8.23", dev_dependency = True)
 bazel_dep(name = "platforms", version = "1.1.0", dev_dependency = True)
 
 register_toolchains("@llvm//toolchain:all", dev_dependency = True)
