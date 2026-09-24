@@ -6,7 +6,7 @@ module(
 # To fully update lockfile: bazel mod deps --lockfile_mode=refresh
 
 bazel_dep(name = "rules_oci_runtime", version = "0.0.0")
-bazel_dep(name = "rules_rust", version = "0.72.0")
+bazel_dep(name = "rules_rust", version = "0.74.0")
 
 # Ignored when this module is not the root, where the enclosing repository is
 # already overridden.
