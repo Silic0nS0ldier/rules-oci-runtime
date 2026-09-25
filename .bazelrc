@@ -2,6 +2,7 @@
 
 common --symlink_prefix=.bazel/
 common --lockfile_mode=error
+common --test_summary=short_uncached
 common --experimental_repository_downloader_retries=5
 
 # Build runfile links only when required
