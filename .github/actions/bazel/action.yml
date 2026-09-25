@@ -25,6 +25,9 @@ runs:
         # 10 GB cache quota is full) that staging grows unbounded and exhausts the disk, killing
         # the runner rather than the build. Fail the request instead.
         fail-on-cache-error: ${{ inputs.fail-on-cache-error }}
+        # Anonymous pull tokens for official images, whose blobs are public and digest addressed.
+        asset-header-routes: |
+          https://index.docker.io/v2/library/*
     - uses: bazel-contrib/setup-bazel@0.19.0
       with:
         bazelrc: |
