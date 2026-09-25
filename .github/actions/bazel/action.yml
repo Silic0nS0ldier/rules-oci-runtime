@@ -1,0 +1,51 @@
+name: Set up Bazel
+description: Bazel backed by a remote cache kept in GitHub Actions cache, profiling every invocation
+inputs:
+  name:
+    description: "Prefixes the profiles written to the runner's temp directory, so each job's are told apart"
+    required: true
+  fail-on-cache-error:
+    description: "Fail Bazel requests when the cache is unavailable, rather than treating them as misses"
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    # Only a push to the default branch writes, see `write: auto`. The job needs
+    # `actions: read` for manifest discovery.
+    - id: remote_cache
+      continue-on-error: true
+      uses: silic0ns0ldier/bazel-github-actions-cache-v2@bedd6a3d80e676435e5a9a88049e43380b571454
+      with:
+        pack-size-mb: 32
+        # Applies to initial manifest discovery and individual operations thereafter.
+        backend-timeout-seconds: 120
+        storage-mode: packs
+        # Packs are staged on the runner's disk until published. When publication stalls (e.g. the
+        # 10 GB cache quota is full) that staging grows unbounded and exhausts the disk, killing
+        # the runner rather than the build. Fail the request instead.
+        fail-on-cache-error: ${{ inputs.fail-on-cache-error }}
+    - uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelrc: |
+          startup --experimental_remote_repo_contents_cache
+          common --color=yes
+          common --curses=no
+          common --show_progress_rate_limit=5
+          # Repo contents cache adds considerable pressure on GH Actions cache storage.
+          common --repo_contents_cache=
+          common --remote_cache=${{ steps.remote_cache.outputs.grpc-url || '' }}
+          common --remote_upload_local_results=${{ steps.remote_cache.outputs.writable || 'false' }}
+          common --remote_download_outputs=minimal
+          common --experimental_remote_downloader=${{ steps.remote_cache.outputs.grpc-url || '' }}
+          common --experimental_remote_downloader_local_fallback
+          common --experimental_remote_downloader_propagate_credentials
+          common --noslim_profile
+          mod --profile=${{ runner.temp }}/${{ inputs.name }}.mod.profile.gz
+          build --profile=${{ runner.temp }}/${{ inputs.name }}.build.profile.gz
+          build --experimental_profile_include_target_label
+          test --profile=${{ runner.temp }}/${{ inputs.name }}.test.profile.gz
+          run --profile=${{ runner.temp }}/${{ inputs.name }}.run.profile.gz
+        cache-save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        bazelisk-cache: true
+        repository-cache: false

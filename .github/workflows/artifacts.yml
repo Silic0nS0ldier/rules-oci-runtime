@@ -16,14 +16,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.19.0
+      - uses: ./.github/actions/bazel
         with:
-          bazelisk-cache: true
-          disk-cache: "artifacts-${{ matrix.arch }}"
-          repository-cache: true
+          name: launcher-${{ matrix.arch }}
       - run: >
           bazel build --config=release_linux_${{ matrix.arch }}
           --//pgo:profile=$PWD/pgo/oci_runtime.profdata //:oci_runtime
+          --remote_download_outputs=toplevel
         working-directory: source
       - run: install -m 0755 source/.bazel/bin/oci_runtime oci_runtime.${{ matrix.arch }}
       # Unarchived, so the asset can be downloaded as-is. The file name becomes
@@ -33,6 +32,12 @@ jobs:
           path: oci_runtime.${{ matrix.arch }}
           if-no-files-found: error
           archive: false
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bazel-profiles-launcher-${{ matrix.arch }}
+          path: ${{ runner.temp }}/*.profile.gz
+          if-no-files-found: ignore
   # The ruleset archive carries the launcher version and hashes, so it can only
   # be built once both binaries exist.
   archive:
@@ -40,13 +45,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.19.0
+      - uses: ./.github/actions/bazel
         with:
-          bazelisk-cache: true
-          disk-cache: "artifacts-archive"
-          repository-cache: true
+          name: archive
       - uses: actions/download-artifact@v8
         with:
+          # Leaves out the profiles and cache usage records.
+          pattern: oci_runtime.*
           merge-multiple: true
           path: artifacts
       - name: Assemble release assets
@@ -99,3 +104,9 @@ jobs:
           path: artifacts/sha256sums.txt
           if-no-files-found: error
           archive: false
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bazel-profiles-archive
+          path: ${{ runner.temp }}/*.profile.gz
+          if-no-files-found: ignore

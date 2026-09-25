@@ -10,21 +10,39 @@ on:
       - opened
       # Updated (excludes change of base branch)
       - synchronize
+permissions:
+  contents: read
+  # Manifest discovery for the Bazel remote cache.
+  actions: read
 jobs:
   test:
     strategy:
       matrix:
-        module: [".", "source"]
+        include:
+          - module: "."
+            name: root
+          - module: source
+            name: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.19.0
+      - uses: ./.github/actions/bazel
         with:
-          bazelisk-cache: true
-          disk-cache: "${{ github.workflow }}-test-${{ matrix.module }}"
-          repository-cache: true
+          name: ${{ matrix.name }}
       - run: bazel test //...
         working-directory: ${{ matrix.module }}
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: test-logs-${{ matrix.name }}
+          path: ${{ matrix.module }}/.bazel/testlogs/**/test.log
+          include-hidden-files: true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bazel-profiles-${{ matrix.name }}
+          path: ${{ runner.temp }}/*.profile.gz
+          if-no-files-found: ignore
   # The end to end modules are kept apart from the unit tests: they reach the
   # network for an image and for `umoci`, they run outside the Bazel sandbox,
   # and they need user namespaces. A flake in one should not be read as the
@@ -33,15 +51,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: ["e2e/smoke", "e2e/conformance"]
+        include:
+          - module: e2e/smoke
+            name: e2e-smoke
+          - module: e2e/conformance
+            name: e2e-conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.19.0
+      - uses: ./.github/actions/bazel
         with:
-          bazelisk-cache: true
-          disk-cache: "${{ github.workflow }}-test-${{ matrix.module }}"
-          repository-cache: true
+          name: ${{ matrix.name }}
       # A rootless container is a user namespace, which Ubuntu confines by
       # default. Older images have no such knob, hence the check.
       - name: Permit unprivileged user namespaces
@@ -51,6 +71,18 @@ jobs:
           fi
       - run: bazel test //...
         working-directory: ${{ matrix.module }}
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: test-logs-${{ matrix.name }}
+          path: ${{ matrix.module }}/.bazel/testlogs/**/test.log
+          include-hidden-files: true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bazel-profiles-${{ matrix.name }}
+          path: ${{ runner.temp }}/*.profile.gz
+          if-no-files-found: ignore
   # Publishes the same assets a release does, as workflow artifacts, so a change
   # can be tried out before it is released.
   artifacts:
