@@ -81,10 +81,12 @@ into the image. Where the host has no `/dev/fuse`, or the image has no sidecars,
 the launcher extracts as it always has; `--rootfs` overrides the choice either
 way.
 
-Two things are asked of the host and done without where it will not. A mount
-that takes itself down when the launcher is killed needs `fusermount3` and,
-for an unprivileged caller, `user_allow_other` in `/etc/fuse.conf`; without
-it a launcher that is killed outright leaves a mount to be removed by hand.
+Two things are asked of the host and done without where it will not. The
+mount is made in a mount namespace of the launcher's own, which the kernel
+takes down however the launcher ends, so nothing is left for Bazel to trip over
+where the bundle was; an unprivileged caller needs the same user namespaces a
+rootless container does, and Linux 4.18 or later. Where the launcher cannot
+have one the image is extracted rather than served.
 Handing a file to the kernel to read and write itself, rather than through the
 launcher, needs a 6.9 kernel built with `CONFIG_FUSE_PASSTHROUGH` and the
 privilege to ask. `--verbose` says which of them the run got.
