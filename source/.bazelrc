@@ -1,4 +1,4 @@
-common --symlink_prefix=.bazel/
+import %workspace%/../.bazelrc
 
 common --downloader_config=downloader.cfg
 
