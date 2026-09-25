@@ -15,7 +15,46 @@ permissions:
   # Manifest discovery for the Bazel remote cache.
   actions: read
 jobs:
+  # Commits pushed with the workflow token start no new run, so the other Bazel
+  # jobs wait for this one and check out what it committed.
+  renovate_tasks:
+    if: github.event_name == 'pull_request' && github.actor == 'renovate[bot]'
+    permissions:
+      contents: write
+      actions: read
+    runs-on: ubuntu-latest
+    outputs:
+      commit_hash: ${{ steps.get_commit.outputs.COMMIT_HASH }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Required to have correct ref for git-auto-commit-action
+          ref: ${{ github.head_ref }}
+      - uses: ./.github/actions/bazel
+        with:
+          name: renovate
+          # Pull requests do not upload, so there is no staging to run away.
+          fail-on-cache-error: "false"
+      # A module's lockfile covers the modules it overrides, so any of them can
+      # go stale.
+      - run: |
+          for module in . source e2e/smoke e2e/conformance; do
+            (cd "${module}" && bazel mod deps --lockfile_mode=update)
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bazel-profiles-renovate
+          path: ${{ runner.temp }}/*.profile.gz
+          if-no-files-found: ignore
+      - uses: stefanzweifel/git-auto-commit-action@v6
+      - id: get_commit
+        run: echo "COMMIT_HASH=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
   test:
+    # `renovate_tasks` is skipped on most runs, and a skip propagates down the
+    # `needs` chain unless a status function is used.
+    if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
+    needs: renovate_tasks
     strategy:
       matrix:
         include:
@@ -26,6 +65,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
       - uses: ./.github/actions/bazel
         with:
           name: ${{ matrix.name }}
@@ -48,6 +89,8 @@ jobs:
   # and they need user namespaces. A flake in one should not be read as the
   # launcher being broken.
   e2e:
+    if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
+    needs: renovate_tasks
     strategy:
       fail-fast: false
       matrix:
@@ -59,6 +102,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
       - uses: ./.github/actions/bazel
         with:
           name: ${{ matrix.name }}
@@ -86,7 +131,11 @@ jobs:
   # Publishes the same assets a release does, as workflow artifacts, so a change
   # can be tried out before it is released.
   artifacts:
+    if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
+    needs: renovate_tasks
     uses: $/.github/workflows/artifacts.yml
+    with:
+      ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
   devcontainer:
     strategy:
       matrix:
