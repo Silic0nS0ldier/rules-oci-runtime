@@ -1,0 +1,47 @@
+name: Optimise Bazel Cache
+
+on:
+  schedule:
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Plan the optimisation without deleting or replacing cache entries"
+        type: boolean
+        default: true
+      reap-unmanifested-packs:
+        description: "Whether to reap unmanifested packs during optimisation"
+        type: boolean
+        default: true
+      reap-older-than-hours:
+        description: "Reap packs older than this many hours during optimisation"
+        type: number
+        default: 24
+
+permissions:
+  contents: read
+
+# A second pass would plan against a view the first is already changing.
+concurrency:
+  group: optimise-bazel-cache
+  cancel-in-progress: false
+
+jobs:
+  optimise:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Deleting the cache entries this pass replaces is the only thing that
+      # needs write.
+      actions: write
+    steps:
+      - uses: Silic0nS0ldier/bazel-github-actions-cache-v2/optimise@bedd6a3d80e676435e5a9a88049e43380b571454
+        with:
+          # Scheduled runs only plan, a person decides when to rewrite the cache.
+          dry-run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
+          github-token: ${{ github.token }}
+          min-runs: 1
+          pack-size-mb: 32
+          max-new-mb: 4096
+          reap-older-than-hours: ${{ github.event_name != 'workflow_dispatch' && 24 || inputs.reap-older-than-hours }}
+          reap-unmanifested-packs: ${{ github.event_name != 'workflow_dispatch' || inputs.reap-unmanifested-packs }}
