@@ -326,8 +326,10 @@ case_recorded_profile() {
 }
 
 # A bundle goes away with the launcher however the launcher goes. A served
-# rootfs is a mount rather than a directory, and one left standing needs a hand
-# to remove, so the host is asked for a mount that takes itself down.
+# rootfs is a mount rather than a directory, and one left standing under
+# `TEST_TMPDIR` is one Bazel cannot remove, so it is only ever made in a mount
+# namespace of the launcher's own: never seen from here, and taken down by the
+# kernel.
 case_auto_unmount() {
   local out="${TEST_TMPDIR}/auto-unmount.out" err="${TEST_TMPDIR}/auto-unmount.err"
   RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse \
@@ -336,6 +338,9 @@ case_auto_unmount() {
 
   local waited=0
   while ! grep -q ready "$out" 2>/dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
     sleep 0.2
     waited=$((waited + 1))
     if [[ "$waited" -gt 150 ]]; then
@@ -348,34 +353,31 @@ case_auto_unmount() {
   local rootfs
   rootfs=$(sed -n 's/^Serving .* at \(.*\) on [0-9]* threads$/\1/p' "$err")
   if [[ -z "$rootfs" ]]; then
+    kill -9 "$pid" 2>/dev/null
+    if grep -q "cannot have a namespace of its own" "$err"; then
+      # Nothing to hold the launcher to, but say so: a case that quietly tests
+      # nothing is worse than one that fails.
+      echo "SKIP: this host gives the launcher no mount namespace of its own" >&2
+      return
+    fi
     fail "the image was not served: $(cat "$err")"
+    return
+  fi
+  if ! grep -qF " ${rootfs} " "/proc/${pid}/mountinfo"; then
+    fail "the launcher has nothing mounted at ${rootfs}"
     kill -9 "$pid" 2>/dev/null
     return
   fi
-  if ! grep -q "goes away with this process" "$err"; then
-    # No `fusermount3`, or a host that will not let this user open a mount to
-    # others. Nothing to hold the launcher to then, but say so: a case that
-    # quietly tests nothing is worse than one that fails.
-    echo "SKIP: this host does not give out mounts that take themselves down" >&2
-    kill -9 "$pid" 2>/dev/null
-    return
-  fi
-  if ! grep -qF " ${rootfs} " /proc/self/mountinfo; then
-    fail "nothing is mounted at ${rootfs}"
-    kill -9 "$pid" 2>/dev/null
-    return
+  if grep -qF " ${rootfs} " /proc/self/mountinfo; then
+    fail "the mount at ${rootfs} is visible outside the launcher"
   fi
 
   kill -9 "$pid"
-  waited=0
-  while grep -qF " ${rootfs} " /proc/self/mountinfo; do
-    sleep 0.2
-    waited=$((waited + 1))
-    if [[ "$waited" -gt 50 ]]; then
-      fail "the mount at ${rootfs} outlived the launcher"
-      return
-    fi
-  done
+  wait "$pid" 2>/dev/null
+  # What Bazel does with a test's temporary directory once the test is done.
+  if ! rm -rf "$(dirname "$rootfs")"; then
+    fail "the bundle a killed launcher left could not be removed"
+  fi
 }
 
 case_signal_forwarding() {

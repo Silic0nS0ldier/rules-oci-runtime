@@ -133,6 +133,51 @@ pub fn egid() -> u32 {
     unsafe { libc::getegid() }
 }
 
+/// Moves this process into a mount namespace the kernel takes down, mounts and
+/// all, once its last process has gone. An unprivileged caller also gets a user
+/// namespace mapping only itself, which is what lets it mount there at all.
+///
+/// Only a single threaded process can do this. An inner error leaves the
+/// process able to carry on; an outer one strands it in a user namespace it
+/// has no identity in.
+pub fn unshare_mounts() -> Result<std::io::Result<()>> {
+    let (uid, gid) = (euid(), egid());
+    let flags = if uid == 0 {
+        libc::CLONE_NEWNS
+    } else {
+        libc::CLONE_NEWUSER | libc::CLONE_NEWNS
+    };
+    // SAFETY: unshare only changes which namespaces this process is in.
+    if unsafe { libc::unshare(flags) } != 0 {
+        return Ok(Err(std::io::Error::last_os_error()));
+    }
+    if uid != 0 {
+        for (path, contents) in [
+            ("/proc/self/setgroups", "deny".to_string()),
+            ("/proc/self/uid_map", format!("{uid} {uid} 1")),
+            ("/proc/self/gid_map", format!("{gid} {gid} 1")),
+        ] {
+            std::fs::write(path, contents).io_context(|| format!("writing {path}"))?;
+        }
+    }
+    // Nothing mounted from here on may propagate back out.
+    // SAFETY: the target is a NUL terminated literal and the rest may be null
+    // for a propagation change.
+    let changed = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_SLAVE,
+            std::ptr::null(),
+        )
+    };
+    if changed != 0 {
+        return Ok(Err(std::io::Error::last_os_error()));
+    }
+    Ok(Ok(()))
+}
+
 pub fn stdin_is_tty() -> bool {
     // SAFETY: isatty only inspects the given descriptor.
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
