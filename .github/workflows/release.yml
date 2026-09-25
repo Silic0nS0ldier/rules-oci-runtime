@@ -13,8 +13,10 @@ permissions:
   actions: read
 jobs:
   artifacts:
+    name: Artifacts
     uses: $/.github/workflows/artifacts.yml
   publish:
+    name: Publish
     needs: artifacts
     if: github.event_name == 'release'
     permissions:
@@ -62,16 +64,21 @@ jobs:
   # The archive can only be checked end to end once its assets are up, as that
   # is when the launcher binaries it pins become downloadable.
   verify:
+    name: Verify ${{ matrix.arch }}
     needs: publish
     strategy:
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/bazel
         with:
-          name: verify-${{ matrix.runner }}
+          name: verify-${{ matrix.arch }}
       # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, which
       # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -84,6 +91,6 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: bazel-profiles-verify-${{ matrix.runner }}
+          name: bazel-profiles-verify-${{ matrix.arch }}
           path: ${{ runner.temp }}/*.profile.gz
           if-no-files-found: ignore

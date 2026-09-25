@@ -18,6 +18,7 @@ jobs:
   # Commits pushed with the workflow token start no new run, so the other Bazel
   # jobs wait for this one and check out what it committed.
   renovate_tasks:
+    name: Renovate lockfiles
     if: github.event_name == 'pull_request' && github.actor == 'renovate[bot]'
     permissions:
       contents: write
@@ -51,6 +52,7 @@ jobs:
       - id: get_commit
         run: echo "COMMIT_HASH=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
   test:
+    name: Test ${{ matrix.name }}
     # `renovate_tasks` is skipped on most runs, and a skip propagates down the
     # `needs` chain unless a status function is used.
     if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
@@ -89,6 +91,7 @@ jobs:
   # and they need user namespaces. A flake in one should not be read as the
   # launcher being broken.
   e2e:
+    name: E2E ${{ matrix.name }}
     if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
     needs: renovate_tasks
     strategy:
@@ -96,9 +99,9 @@ jobs:
       matrix:
         include:
           - module: e2e/smoke
-            name: e2e-smoke
+            name: smoke
           - module: e2e/conformance
-            name: e2e-conformance
+            name: conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -106,7 +109,7 @@ jobs:
           ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
       - uses: ./.github/actions/bazel
         with:
-          name: ${{ matrix.name }}
+          name: e2e-${{ matrix.name }}
       # A rootless container is a user namespace, which Ubuntu confines by
       # default. Older images have no such knob, hence the check.
       - name: Permit unprivileged user namespaces
@@ -119,27 +122,33 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
-          name: test-logs-${{ matrix.name }}
+          name: test-logs-e2e-${{ matrix.name }}
           path: ${{ matrix.module }}/.bazel/testlogs/**/test.log
           include-hidden-files: true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: bazel-profiles-${{ matrix.name }}
+          name: bazel-profiles-e2e-${{ matrix.name }}
           path: ${{ runner.temp }}/*.profile.gz
           if-no-files-found: ignore
   # Publishes the same assets a release does, as workflow artifacts, so a change
   # can be tried out before it is released.
   artifacts:
+    name: Artifacts
     if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
     needs: renovate_tasks
     uses: $/.github/workflows/artifacts.yml
     with:
       ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
   devcontainer:
+    name: Devcontainer ${{ matrix.arch }}
     strategy:
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5

@@ -11,6 +11,7 @@ on:
         default: ""
 jobs:
   launcher:
+    name: Launcher ${{ matrix.arch }}
     strategy:
       matrix:
         include:
@@ -48,6 +49,7 @@ jobs:
   # The ruleset archive carries the launcher version and hashes, so it can only
   # be built once both binaries exist.
   archive:
+    name: Archive
     needs: launcher
     runs-on: ubuntu-latest
     steps:
