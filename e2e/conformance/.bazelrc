@@ -1,4 +1,4 @@
-common --symlink_prefix=.bazel/
+import %workspace%/../../.bazelrc
 
 # The launcher under test is the one built by `rules_oci_runtime_source`.
 build --@rules_oci_runtime//lib:prebuilt_launcher=false
