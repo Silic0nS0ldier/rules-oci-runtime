@@ -7,6 +7,10 @@ on:
   # Builds the assets without attaching them, to validate changes to this
   # workflow before releasing.
   workflow_dispatch:
+permissions:
+  contents: read
+  # Manifest discovery for the Bazel remote cache.
+  actions: read
 jobs:
   artifacts:
     uses: $/.github/workflows/artifacts.yml
@@ -24,8 +28,13 @@ jobs:
         with:
           merge-multiple: true
           path: artifacts
-      # The archive pins the launcher binaries, so they go up alongside it.
-      - run: gh release upload "${GITHUB_REF_NAME}" --clobber artifacts/*
+      # The archive pins the launcher binaries, so they go up alongside it. The
+      # profiles and cache usage records do not.
+      - run: >
+          gh release upload "${GITHUB_REF_NAME}" --clobber
+          artifacts/oci_runtime.*
+          artifacts/rules_oci_runtime-*.tar.gz
+          artifacts/sha256sums.txt
       - name: Append installation instructions
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -60,11 +69,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: bazel-contrib/setup-bazel@0.19.0
+      - uses: ./.github/actions/bazel
         with:
-          bazelisk-cache: true
-          disk-cache: "${{ github.workflow }}-verify"
-          repository-cache: true
+          name: verify-${{ matrix.runner }}
       # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, which
       # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -74,3 +81,9 @@ jobs:
             --version "${version}" \
             --archive "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/rules_oci_runtime-${version}.tar.gz" \
             --run-container
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bazel-profiles-verify-${{ matrix.runner }}
+          path: ${{ runner.temp }}/*.profile.gz
+          if-no-files-found: ignore
