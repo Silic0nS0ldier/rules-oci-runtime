@@ -1461,14 +1461,18 @@ enum Route {
     /// The same, over zstd layers, whose spans resume from a frame boundary
     /// rather than an inflate window.
     ZstdSpans,
+    /// Uncompressed layers with entry tables: the spans are windows over the
+    /// blob, made at run time since there is nothing to record.
+    StoredSpans,
 }
 
 impl Route {
-    const ALL: [Route; 4] = [
+    const ALL: [Route; 5] = [
         Route::Streaming,
         Route::Planned,
         Route::Spans,
         Route::ZstdSpans,
+        Route::StoredSpans,
     ];
 
     /// Frames are the only place a zstd span can start, so the fixtures are
@@ -1476,6 +1480,7 @@ impl Route {
     fn compress(self, tar: &[u8]) -> (&'static str, Vec<u8>) {
         match self {
             Route::ZstdSpans => (ZSTD_LAYER, zstd_framed(tar, 2048)),
+            Route::StoredSpans => (PLAIN_LAYER, tar.to_vec()),
             _ => (GZIP_LAYER, gzip_default(tar)),
         }
     }
@@ -1503,7 +1508,7 @@ fn install_for(
         let descriptor = install_blob(root, media_type, &blob);
         let hex = parse_digest(&descriptor.digest).expect("digest").hex;
 
-        if matches!(route, Route::Planned | Route::Spans | Route::ZstdSpans) {
+        if !matches!(route, Route::Streaming) {
             let mut table = crate::entries::Table::build(&tar[..]).expect("entry table");
             table.layer = descriptor.digest.clone();
             let mut bytes = Vec::new();
@@ -1538,7 +1543,7 @@ fn extract_by(
     let rootfs = root.join("rootfs");
     let dir = match route {
         Route::Streaming => None,
-        Route::Planned | Route::Spans | Route::ZstdSpans => Some(index_dir.as_path()),
+        _ => Some(index_dir.as_path()),
     };
     let mut extractor = RootfsExtractor::new(&rootfs, dir, strict_xattrs)?;
     extractor.plan(&descriptors)?;
@@ -1559,7 +1564,7 @@ fn extract_by(
                 "the planned route must have no checkpoint index to fall back on"
             );
         }
-        Route::Spans | Route::ZstdSpans => {
+        Route::Spans | Route::ZstdSpans | Route::StoredSpans => {
             assert!(
                 extractor.plan.work().is_some(),
                 "the plan must produce work"
@@ -1585,7 +1590,7 @@ fn apply_by(route: Route, root: &Utf8Path, layers: &[Vec<u8>]) -> (Result<Utf8Pa
     let rootfs = root.join("rootfs");
     let dir = match route {
         Route::Streaming => None,
-        Route::Planned | Route::Spans | Route::ZstdSpans => Some(index_dir.as_path()),
+        _ => Some(index_dir.as_path()),
     };
 
     let mut placed = false;
