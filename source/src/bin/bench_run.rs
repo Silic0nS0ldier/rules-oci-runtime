@@ -282,7 +282,13 @@ fn launcher(args: &Args, subject: &Subject, run: &Utf8Path) -> Command {
         .arg(&args.layout)
         // Extraction is what is being measured, so the container is never
         // started: the bundle is built and left where it can be counted.
-        .args(["--runtime", "/nonexistent/runc", "--keep-bundle"])
+        .args([
+            "--runtime",
+            "/nonexistent/runc",
+            "--keep-bundle",
+            "--rootfs",
+            "extract",
+        ])
         .arg(format!("--strict-xattrs={}", args.strict_xattrs))
         .env("TMPDIR", run)
         .stdout(Stdio::null())
@@ -470,7 +476,13 @@ fn syscalls(args: &Args, subjects: &[Subject]) -> io::Result<()> {
             .arg(&subject.binary)
             .args(["run", "--layout"])
             .arg(&args.layout)
-            .args(["--runtime", "/nonexistent/runc", "--keep-bundle"])
+            .args([
+                "--runtime",
+                "/nonexistent/runc",
+                "--keep-bundle",
+                "--rootfs",
+                "extract",
+            ])
             .arg(format!("--strict-xattrs={}", args.strict_xattrs))
             .env("TMPDIR", &run)
             .stdout(Stdio::null())
@@ -601,7 +613,13 @@ fn perf(args: &Args, subjects: &[Subject]) -> io::Result<()> {
             .arg(&subject.binary)
             .args(["run", "--layout"])
             .arg(&args.layout)
-            .args(["--runtime", "/nonexistent/runc", "--keep-bundle"])
+            .args([
+                "--runtime",
+                "/nonexistent/runc",
+                "--keep-bundle",
+                "--rootfs",
+                "extract",
+            ])
             .arg(format!("--strict-xattrs={}", args.strict_xattrs))
             .env("TMPDIR", &run)
             .stdout(Stdio::null())
