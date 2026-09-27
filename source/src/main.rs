@@ -222,6 +222,13 @@ fn run(args: RunArgs) -> Result<i32> {
         record(destination, &platform, &manifest.config.digest, mount)?;
     }
     log!("Container has exited, cleaning up...");
+    // The mount has to go before the bundle holding it, and both before
+    // collection drops this thread to idle priority.
+    drop(mount);
+    drop(bundle);
+    if let Some(store) = &store {
+        store.collect();
+    }
     result
 }
 

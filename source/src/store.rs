@@ -38,6 +38,14 @@ const TOUCH_AFTER_SECS: i64 = 24 * 60 * 60;
 const OBJECTS: &str = "objects";
 const BUNDLES: &str = "bundles";
 const CLAIMS: &str = "claims";
+const GC_LOCK: &str = "gc.lock";
+const GC_CURSOR: &str = "gc.cursor";
+
+/// How often any launch collects, going by when the last one did.
+const GC_INTERVAL_SECS: i64 = 60 * 60;
+
+/// How long an object may go unread before it is collected.
+const RETENTION_SECS: i64 = 14 * 24 * 60 * 60;
 
 /// Tells stores apart for the descriptors each thread keeps on their claims.
 static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
@@ -326,6 +334,97 @@ impl Store {
         self.taken_over.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Removes objects nobody has read for the retention period, from one
+    /// shard, if no launch has in the last interval.
+    ///
+    /// Called as a launch ends. One shard a run means no launch ever walks the
+    /// whole store, and being killed part way leaves nothing to put right.
+    /// Removing an object another launch has open is harmless: its descriptor
+    /// keeps working, and a lookup racing the unlink just misses.
+    pub fn collect(&self) {
+        if !self.is_writable() {
+            return;
+        }
+        let open = |name| {
+            open_beneath(
+                self.root.as_raw_fd(),
+                name,
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+                0o600,
+            )
+            .map(File::from)
+        };
+        let Ok(lock) = open(GC_LOCK) else {
+            return;
+        };
+        // SAFETY: the descriptor is open for the duration of the call.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return;
+        }
+        let Ok(cursor) = open(GC_CURSOR) else {
+            return;
+        };
+        let Ok(meta) = cursor.metadata() else {
+            return;
+        };
+        if meta.len() > 0 && now() - meta.mtime() < GC_INTERVAL_SECS {
+            return;
+        }
+        let mut next = [0u8; 2];
+        let shard = match std::os::unix::fs::FileExt::read_exact_at(&cursor, &mut next, 0) {
+            Ok(()) => std::str::from_utf8(&next)
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        idle();
+        let reaped = self.reap(shard, now() - RETENTION_SECS);
+        let _ = std::os::unix::fs::FileExt::write_all_at(
+            &cursor,
+            format!("{:02x}\n", shard.wrapping_add(1)).as_bytes(),
+            0,
+        );
+        log!(
+            "Collected shard {shard:02x} of the content cache: {reaped} objects unread for 14 days"
+        );
+    }
+
+    /// Unlinks the objects of `shard` last read before `before`. Only regular
+    /// files the caller owns, named as an object is, are ever touched.
+    fn reap(&self, shard: u8, before: i64) -> usize {
+        let Some(dir) = self.shard(shard, false) else {
+            return 0;
+        };
+        let mut reaped = 0;
+        for name in names_in(dir) {
+            let is_object = name.as_bytes().len() == 64
+                && name
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+            if !is_object {
+                continue;
+            }
+            // SAFETY: stat is plain data, and zero is a valid value for it.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: the name is NUL terminated, `stat` is the struct fstatat
+            // fills, and the descriptor is open.
+            let found =
+                unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+            let stale = found == 0
+                && stat.st_mode & libc::S_IFMT == libc::S_IFREG
+                && stat.st_uid == crate::sys::euid()
+                && (stat.st_atime as i64) < before;
+            // SAFETY: as above, for unlinkat.
+            if stale && unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } == 0 {
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
     /// Stops writing, for this launch, what the store will not take.
     fn refuse(&self, err: io::Error) {
         let read_only = matches!(
@@ -610,6 +709,61 @@ fn now() -> i64 {
         .map_or(0, |since| since.as_secs() as i64)
 }
 
+/// The names in the directory `dir` is open on.
+fn names_in(dir: RawFd) -> Vec<CString> {
+    // SAFETY: duplicating a descriptor has no preconditions.
+    let copy = unsafe { libc::fcntl(dir, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Vec::new();
+    }
+    // SAFETY: the stream takes over the duplicate, and is closed below.
+    let stream = unsafe { libc::fdopendir(copy) };
+    if stream.is_null() {
+        // SAFETY: fdopendir failed, so the duplicate is still ours to close.
+        unsafe { libc::close(copy) };
+        return Vec::new();
+    }
+    // The duplicate shares the original's offset, which an earlier read may
+    // have left at the end.
+    // SAFETY: the stream is open.
+    unsafe { libc::rewinddir(stream) };
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: the stream is open; the entry stays valid until the next
+        // call, and its name is copied out before then.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: readdir returned an entry whose name is NUL terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        names.push(name.to_owned());
+    }
+    // SAFETY: the stream is open, and closing it closes the duplicate.
+    unsafe { libc::closedir(stream) };
+    names
+}
+
+/// Collection is nobody's priority, so it runs only when nothing else wants
+/// the processor or the disk. This is the launch's last thread of work.
+fn idle() {
+    // SAFETY: sched_param is plain data; SCHED_IDLE takes a priority of zero.
+    let param: libc::sched_param = unsafe { std::mem::zeroed() };
+    // SAFETY: zero names the calling thread, and the parameters are valid.
+    let _ = unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) };
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    // SAFETY: ioprio_set takes three integers and changes only this thread.
+    let _ = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0 as libc::c_long,
+            IOPRIO_CLASS_IDLE << 13,
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -788,6 +942,65 @@ mod tests {
             read_only.claim("sha256:layer", 3),
             Claim::Unavailable
         ));
+        let _ = crate::fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn collection_reaps_stale_objects_of_one_shard_and_nothing_else() {
+        let root = scratch("collect");
+        let store = Store::open(CacheMode::Auto, Some(&root)).expect("store");
+        let named_in = |shard: u8, n: u8| {
+            let mut sha = [n; 32];
+            sha[0] = shard;
+            sha
+        };
+        let age = |file: &File, secs: i64| {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+            file.set_times(std::fs::FileTimes::new().set_accessed(when))
+                .expect("atime");
+        };
+        let stale = store.publish(&named_in(0xab, 1), b"stale").expect("stale");
+        age(&stale, now() - 2 * RETENTION_SECS);
+        let fresh = store.publish(&named_in(0xab, 2), b"fresh").expect("fresh");
+        let elsewhere = store.publish(&named_in(0xac, 3), b"other").expect("other");
+        age(&elsewhere, now() - 2 * RETENTION_SECS);
+        let shard = root.join("objects/ab");
+        std::fs::write(shard.join("not-an-object"), b"x").expect("foreign");
+        std::os::unix::fs::symlink("/etc/passwd", shard.join("f".repeat(64))).expect("symlink");
+
+        std::fs::write(root.join(GC_CURSOR), "ab\n").expect("cursor");
+        let cursor = File::open(root.join(GC_CURSOR)).expect("cursor");
+        let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        cursor
+            .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+            .expect("mtime");
+
+        store.collect();
+        let object = |sha: &[u8; 32]| shard.join(crate::image::hex_encode(sha));
+        assert!(!object(&named_in(0xab, 1)).exists(), "a stale object goes");
+        assert!(object(&named_in(0xab, 2)).exists(), "a fresh object stays");
+        assert!(
+            root.join("objects/ac")
+                .join(crate::image::hex_encode(&named_in(0xac, 3)))
+                .exists(),
+            "another shard waits its turn"
+        );
+        assert!(shard.join("not-an-object").exists());
+        assert!(shard.join("f".repeat(64)).symlink_metadata().is_ok());
+        assert_eq!(
+            std::fs::read_to_string(root.join(GC_CURSOR)).expect("cursor"),
+            "ac\n"
+        );
+
+        // Within the interval, nothing is collected at all.
+        std::fs::write(root.join(GC_CURSOR), "ac\n").expect("cursor");
+        store.collect();
+        assert!(
+            root.join("objects/ac")
+                .join(crate::image::hex_encode(&named_in(0xac, 3)))
+                .exists()
+        );
+        drop((stale, fresh, elsewhere));
         let _ = crate::fsutil::force_remove_dir_all(root.as_std_path());
     }
 
