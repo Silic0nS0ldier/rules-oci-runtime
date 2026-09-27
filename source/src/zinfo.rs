@@ -39,6 +39,9 @@ const MAX_CHECKPOINTS: u32 = 1 << 20;
 pub enum Flavor {
     Gzip,
     Zstd,
+    /// An uncompressed layer: offsets in the stream are offsets in the blob,
+    /// and a span is only a window over it. Never written to disk.
+    Stored,
 }
 
 impl Flavor {
@@ -46,6 +49,7 @@ impl Flavor {
         match self {
             Flavor::Gzip => 0,
             Flavor::Zstd => 1,
+            Flavor::Stored => 2,
         }
     }
 
@@ -91,6 +95,27 @@ impl Index {
         match flavor {
             Flavor::Gzip => Self::build_gzip(blob, span),
             Flavor::Zstd => Self::build_zstd(blob, span),
+            Flavor::Stored => Ok(Self::stored(blob.len() as u64, span)),
+        }
+    }
+
+    /// Windows of `span` bytes over an uncompressed blob of `len` bytes. There
+    /// is nothing to resume, so nothing needs building from the blob.
+    pub fn stored(len: u64, span: u64) -> Self {
+        let span = span.max(1);
+        let checkpoints = (0..len.div_ceil(span).max(1))
+            .map(|n| Checkpoint {
+                in_offset: n * span,
+                bits: 0,
+                out_offset: n * span,
+                window: Vec::new(),
+                crc: 0,
+            })
+            .collect();
+        Index {
+            flavor: Flavor::Stored,
+            uncompressed_len: len,
+            checkpoints,
         }
     }
 
@@ -284,6 +309,16 @@ impl Index {
         match self.flavor {
             Flavor::Gzip => inflate_span(blob, point, span, &mut crc, decoders)?,
             Flavor::Zstd => decode_span(blob, point, span, &mut crc, decoders)?,
+            // The layer digest covers these bytes directly, so there is no
+            // span checksum to hold them to.
+            Flavor::Stored => {
+                let from = point.in_offset as usize;
+                let bytes = blob.get(from..from + len).ok_or_else(|| {
+                    Error::io(context, io::Error::other("the blob ends inside a span"))
+                })?;
+                span.copy_from_slice(bytes);
+                return Ok(len);
+            }
         }
 
         if crc.sum() != point.crc {
@@ -997,6 +1032,28 @@ mod tests {
         // A gzip window in a zstd index would be read as a frame start.
         bytes[4] = Flavor::Zstd.code();
         assert!(Index::read_from(&bytes[..]).is_err());
+    }
+
+    #[test]
+    fn a_stored_layer_is_cut_into_windows_over_the_blob() {
+        let data = sample_data(10_000);
+        let index = Index::stored(data.len() as u64, 4096);
+        assert_eq!(index.checkpoints.len(), 3);
+
+        let mut decoders = Decoders::default();
+        let mut joined = Vec::new();
+        for i in 0..index.checkpoints.len() {
+            joined.extend(index.extract_span(&data, i, &mut decoders).unwrap());
+        }
+        assert_eq!(joined, data);
+
+        assert!(
+            index
+                .extract_span(&data[..9_000], 2, &mut decoders)
+                .is_err(),
+            "a blob shorter than its descriptor says ends inside a span"
+        );
+        assert_eq!(Index::stored(0, 4096).checkpoints.len(), 1);
     }
 
     #[test]

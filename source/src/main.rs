@@ -422,20 +422,23 @@ fn index_blob(
             .ok_or_else(|| Error::UnsupportedMediaType(descriptor.media_type.clone()))?,
         None => sniff(bytes).ok_or_else(|| {
             Error::io(
-                format!("{blob} is not gzip or zstd"),
+                format!("{blob} is not a gzip, zstd or tar layer"),
                 std::io::Error::from(std::io::ErrorKind::InvalidData),
             )
         })?,
     };
+    // An uncompressed layer has nothing to resume from, so it gets a table
+    // and no checkpoints.
     let flavor = match compression {
-        extract::Compression::Gzip => zinfo::Flavor::Gzip,
-        extract::Compression::Zstd => zinfo::Flavor::Zstd,
-        // Nothing to resume from, so the layer is walked at run time.
-        extract::Compression::None => return Ok(()),
+        extract::Compression::Gzip => Some(zinfo::Flavor::Gzip),
+        extract::Compression::Zstd => Some(zinfo::Flavor::Zstd),
+        extract::Compression::None => None,
     };
 
-    let index = zinfo::Index::build(flavor, bytes, span).map_err(named)?;
-    write_sidecar(checkpoints, |writer| index.write_to(writer))?;
+    if let Some(flavor) = flavor {
+        let index = zinfo::Index::build(flavor, bytes, span).map_err(named)?;
+        write_sidecar(checkpoints, |writer| index.write_to(writer))?;
+    }
 
     // The table names the layer it describes, so that one left beside another
     // layer is refused rather than trusted.
@@ -472,6 +475,7 @@ fn sniff(bytes: &[u8]) -> Option<extract::Compression> {
         [0x1f, 0x8b, ..] => Some(extract::Compression::Gzip),
         [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(extract::Compression::Zstd),
         _ if zinfo::skippable_frame_len(bytes).is_some() => Some(extract::Compression::Zstd),
+        _ if bytes.get(257..262) == Some(b"ustar") => Some(extract::Compression::None),
         _ => None,
     }
 }
@@ -486,7 +490,7 @@ fn write_sidecar(
         .map_err(|source| Error::io(format!("writing {path}"), source))
 }
 
-/// Indexes every compressed layer of every manifest in the layout, so a
+/// Indexes every layer of every manifest in the layout, so a
 /// multi-architecture image gets indexes for whichever platform runs it.
 ///
 /// Blobs are independent, so they are indexed concurrently. This runs as a
@@ -647,12 +651,23 @@ mod tests {
         }
 
         #[test]
-        fn a_layout_gets_one_index_per_compressed_layer() {
+        fn a_layout_gets_checkpoints_per_compressed_layer_and_a_table_per_tar() {
             let root = scratch("layout");
             let gzip_layer = gzip(b"pretend this is a tar");
             let gzip_hex = image::hex_encode(&Sha256::digest(&gzip_layer));
             let zstd_layer = zstd(b"pretend this is another tar");
             let zstd_hex = image::hex_encode(&Sha256::digest(&zstd_layer));
+            let plain_layer = {
+                let mut builder = tar::Builder::new(Vec::new());
+                let mut header = tar::Header::new_ustar();
+                header.set_size(5);
+                header.set_mode(0o644);
+                builder
+                    .append_data(&mut header, "file", &b"hello"[..])
+                    .expect("entry");
+                builder.into_inner().expect("tar")
+            };
+            let plain_hex = image::hex_encode(&Sha256::digest(&plain_layer));
 
             let gzip_descriptor = install_blob(
                 &root,
@@ -667,7 +682,7 @@ mod tests {
             let plain_descriptor = install_blob(
                 &root,
                 "application/vnd.oci.image.layer.v1.tar",
-                b"uncompressed tar",
+                &plain_layer,
             );
             let config_descriptor =
                 install_blob(&root, "application/vnd.oci.image.config.v1+json", b"{}");
@@ -701,9 +716,19 @@ mod tests {
                 })
                 .collect();
             entries.sort();
-            let mut expected = [format!("{gzip_hex}.zinfo"), format!("{zstd_hex}.zinfo")];
+            let mut expected = [
+                format!("{gzip_hex}.zinfo"),
+                format!("{zstd_hex}.zinfo"),
+                format!("{plain_hex}.entries"),
+            ];
             expected.sort();
             assert_eq!(entries, expected);
+
+            let file = std::fs::File::open(output.join(format!("{plain_hex}.entries")))
+                .expect("open table");
+            let table = entries::Table::read_from(std::io::BufReader::new(file)).expect("table");
+            assert_eq!(table.layer, format!("sha256:{plain_hex}"));
+            assert_eq!(table.entries[0].path, b"file");
 
             for (name, flavor) in [
                 (format!("{gzip_hex}.zinfo"), zinfo::Flavor::Gzip),
