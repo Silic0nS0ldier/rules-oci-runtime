@@ -386,6 +386,7 @@ mod tests {
             path: path.as_bytes().to_vec(),
             link: link.as_bytes().to_vec(),
             xattrs: Vec::new(),
+            sha256: None,
         }
     }
 
@@ -399,6 +400,7 @@ mod tests {
                 entry(EntryKind::Symlink, "etc/link", "passwd", 0),
                 entry(EntryKind::HardLink, "etc/same", "etc/passwd", 0),
             ],
+            ..Table::default()
         };
         let directories = vec![(b"etc".to_vec(), 0o755)];
         let work = Work {
@@ -459,6 +461,7 @@ mod tests {
     fn an_entry_with_no_directory_to_go_in_refuses_the_image() {
         let table = Table {
             entries: vec![entry(EntryKind::File, "etc/passwd", "", 1)],
+            ..Table::default()
         };
         let work = Work {
             files: vec![vec![0]],
@@ -471,6 +474,7 @@ mod tests {
     fn a_hard_link_naming_nothing_refuses_the_image() {
         let table = Table {
             entries: vec![entry(EntryKind::HardLink, "etc/same", "etc/passwd", 0)],
+            ..Table::default()
         };
         let work = Work {
             files: vec![Vec::new()],

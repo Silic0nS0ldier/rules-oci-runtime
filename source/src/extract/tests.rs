@@ -963,7 +963,8 @@ fn extract_planned(root: &Utf8Path, layers: &[Vec<u8>]) -> Result<Utf8PathBuf> {
     for tar in layers {
         let descriptor = install_blob(root, PLAIN_LAYER, tar);
         let hex = parse_digest(&descriptor.digest).expect("digest").hex;
-        let table = crate::entries::Table::build(&tar[..]).expect("entry table");
+        let mut table = crate::entries::Table::build(&tar[..]).expect("entry table");
+        table.layer = descriptor.digest.clone();
         let mut bytes = Vec::new();
         table.write_to(&mut bytes).expect("serialise");
         fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
@@ -990,6 +991,31 @@ fn tar_of(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
     builder.into_inner().expect("tar")
 }
 
+/// A missing table falls back, but one naming another layer means the inputs
+/// are wrong, and planning from it would place some other image.
+#[test]
+fn a_table_built_from_another_layer_fails_the_run() {
+    let root = scratch("mismatched-table");
+    let tar = tar_of(|builder| append_file(builder, "a", b"a\n"));
+    let descriptor = install_blob(&root, PLAIN_LAYER, &tar);
+    let index_dir = root.join("indexes");
+    fs::create_dir_all(&index_dir).expect("index dir");
+    let mut table = crate::entries::Table::build(&tar[..]).expect("entry table");
+    table.layer = format!("sha256:{}", "0".repeat(64));
+    let mut bytes = Vec::new();
+    table.write_to(&mut bytes).expect("serialise");
+    let hex = parse_digest(&descriptor.digest).expect("digest").hex;
+    fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
+
+    let mut extractor =
+        RootfsExtractor::new(&root.join("rootfs"), Some(&index_dir), false).expect("extractor");
+    match extractor.plan(&[descriptor]) {
+        Err(Error::MismatchedSidecar { .. }) => {}
+        other => panic!("expected a mismatched sidecar, got {other:?}"),
+    }
+    let _ = fsutil::force_remove_dir_all(root.as_std_path());
+}
+
 /// Installs `layers` as alternating gzip and zstd blobs, optionally with the
 /// sidecars beside each: the shape `oci_image` produces when it adds a zstd
 /// layer to a gzip base.
@@ -1011,7 +1037,8 @@ fn install_mixed_compression(
         let descriptor = install_blob(root, media_type, &blob);
         if sidecars {
             let hex = parse_digest(&descriptor.digest).expect("digest").hex;
-            let table = crate::entries::Table::build(&tar[..]).expect("entry table");
+            let mut table = crate::entries::Table::build(&tar[..]).expect("entry table");
+            table.layer = descriptor.digest.clone();
             let mut bytes = Vec::new();
             table.write_to(&mut bytes).expect("serialise");
             fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
@@ -1477,7 +1504,8 @@ fn install_for(
         let hex = parse_digest(&descriptor.digest).expect("digest").hex;
 
         if matches!(route, Route::Planned | Route::Spans | Route::ZstdSpans) {
-            let table = crate::entries::Table::build(&tar[..]).expect("entry table");
+            let mut table = crate::entries::Table::build(&tar[..]).expect("entry table");
+            table.layer = descriptor.digest.clone();
             let mut bytes = Vec::new();
             table.write_to(&mut bytes).expect("serialise");
             fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");

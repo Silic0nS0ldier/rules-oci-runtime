@@ -98,7 +98,7 @@ impl RootfsExtractor {
     /// replaces are never written. Without an entry table for every layer this
     /// plans nothing and each layer is placed in full, as before.
     pub fn plan(&mut self, layers: &[Descriptor]) -> Result<()> {
-        self.plan = plan::Plan::build(self.index_dir.as_deref(), layers);
+        self.plan = plan::Plan::build(self.index_dir.as_deref(), layers)?;
         if !self.plan.is_resolved() {
             return Ok(());
         }
