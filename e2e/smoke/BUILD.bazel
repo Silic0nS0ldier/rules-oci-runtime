@@ -88,6 +88,7 @@ CASES = [
     "rule_mounts",
     "runtime_mount",
     "served_rootfs",
+    "shared_store",
     "signal_forwarding",
     "stdin_is_piped",
     "verbose_logging",
