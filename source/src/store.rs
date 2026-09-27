@@ -81,6 +81,8 @@ pub struct Store {
     deferred: AtomicU64,
     done_elsewhere: AtomicU64,
     taken_over: AtomicU64,
+    helped: AtomicU64,
+    found_after_helping: AtomicU64,
 }
 
 /// What trying for a claim came to.
@@ -183,6 +185,8 @@ impl Store {
             deferred: AtomicU64::new(0),
             done_elsewhere: AtomicU64::new(0),
             taken_over: AtomicU64::new(0),
+            helped: AtomicU64::new(0),
+            found_after_helping: AtomicU64::new(0),
         })
     }
 
@@ -332,6 +336,16 @@ impl Store {
     /// Counts a claimed unit done here anyway, with nothing else left to do.
     pub fn taken_over(&self) {
         self.taken_over.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a span inflated while another launch held the one wanted.
+    pub fn helped(&self) {
+        self.helped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a wanted file found in the store after helping.
+    pub fn found_after_helping(&self) {
+        self.found_after_helping.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Removes objects nobody has read for the retention period, from one
@@ -495,10 +509,13 @@ impl Store {
             self.lost_races.load(Ordering::Relaxed),
         );
         log!(
-            "Claims: {} deferred, {} of them done by another launch, {} taken over",
+            "Claims: {} deferred, {} of them done by another launch, {} taken over, \
+             {} helped with while waiting, {} found done after helping",
             self.deferred.load(Ordering::Relaxed),
             self.done_elsewhere.load(Ordering::Relaxed),
             self.taken_over.load(Ordering::Relaxed),
+            self.helped.load(Ordering::Relaxed),
+            self.found_after_helping.load(Ordering::Relaxed),
         );
     }
 }
