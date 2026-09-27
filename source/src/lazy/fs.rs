@@ -51,6 +51,10 @@ const BLOCK_SIZE: u32 = 4096;
 /// whole filesystem, so two threads fetching two files do not queue.
 const SHARDS: usize = 64;
 
+/// How many spans past a claimed one a blocked fetch looks for one to help
+/// with.
+const HELP_REACH: usize = 4;
+
 thread_local! {
     /// The buffer and decoders a thread reuses from body to body. The session
     /// runs a fixed set of threads, so this is a fixed cost.
@@ -357,6 +361,17 @@ impl Served {
                 return Ok(Fetched::Deferred);
             }
             (Claim::Held, _) => {
+                // Launches started together read in step, so the next span is
+                // usually one this launch will want and another has not begun.
+                if urgency == Urgency::Now
+                    && self.help(body.layer, span)
+                    && self.from_store_into(ino, body)?
+                {
+                    if let Some(store) = &self.store {
+                        store.found_after_helping();
+                    }
+                    return Ok(Fetched::Inflated);
+                }
                 if let Some(store) = &self.store {
                     store.taken_over();
                 }
@@ -373,6 +388,59 @@ impl Served {
             .map_err(|err| self.failed(err))?;
         drop(claim);
         Ok(Fetched::Inflated)
+    }
+
+    /// Inflates one span shortly after `span` in `layer` that this launch
+    /// still needs and no launch has claimed, answering whether it did.
+    ///
+    /// For a container blocked on a span another launch is inflating: doing
+    /// this costs it about what taking over would, and leaves both spans in
+    /// the store rather than one of them inflated twice.
+    fn help(&self, layer: u32, span: usize) -> bool {
+        let Some(store) = &self.store else {
+            return false;
+        };
+        for next in span + 1..=span + HELP_REACH {
+            let Some(window) = self.source.window_of(layer, next) else {
+                break;
+            };
+            if self.first_owed(layer, window.clone()).is_none() {
+                continue;
+            }
+            // Never waited for: a thread here may hold the lock of `span`.
+            let Ok(_local) =
+                self.fetching[(next * self.layers + layer as usize) % SHARDS].try_lock()
+            else {
+                continue;
+            };
+            let Some(body) = self.first_owed(layer, window) else {
+                continue;
+            };
+            let Claim::Acquired(claim) = store.claim(self.source.digest(layer), next as u64) else {
+                continue;
+            };
+            let inflated = SCRATCH.with(|scratch| self.fetch_span(body, &mut scratch.borrow_mut()));
+            drop(claim);
+            if let Err(err) = inflated {
+                self.failed(err);
+                return false;
+            }
+            store.helped();
+            return true;
+        }
+        false
+    }
+
+    /// The first file of `layer` starting in `window` that is still owed.
+    fn first_owed(&self, layer: u32, window: std::ops::Range<u64>) -> Option<Body> {
+        let tree = self.read_tree().ok()?;
+        self.bodies
+            .within(layer, window)
+            .iter()
+            .find_map(|&(_, ino)| match tree.get(ino)?.kind {
+                Kind::File(Content::Layer(body)) if body.size > 0 => Some(body),
+                _ => None,
+            })
     }
 
     /// Serves `ino` from the store if the store has its body.

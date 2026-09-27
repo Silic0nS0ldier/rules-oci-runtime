@@ -342,9 +342,12 @@ CPU. Only a writable store takes claims. Read-only scopes inflate locally.
 - **What counts as other pending work:**
   - eager: the remaining span units in the extraction queue;
   - FUSE fetch-ahead: the rest of the profile queue;
-  - FUSE demand (the container is blocked on this file): nothing. The worker
-    looks up once more and takes over immediately, since any other work would
-    only delay the container.
+  - FUSE demand (the container is blocked on this file): one unclaimed span
+    among the next four of the same layer that still holds files this launch
+    needs. The worker inflates and publishes it, looks the wanted file up
+    again, and takes over only if it is still missing. Launches started
+    together read in step, so this costs the container about what taking over
+    would, and splits the spans between them instead of repeating them.
 - **In-process:** the shard mutex in `Served::fetch` stays. It is the one
   remaining wait, and it is on another thread of the same launch, whose span
   is certainly being worked on.
@@ -394,6 +397,12 @@ today.
   next sweep would take a kept bundle in the store.
 - The FUSE mount lives in the launcher's private mount namespace, so the
   mount point being under `$HOME` is invisible to anything else.
+- Where the bundle lives only matters to files the container writes: reads
+  are served from objects, which are in the store either way. On
+  `bench_image --profile medium`, copying up every file cost about 35 ms more
+  with the store on the disk-backed overlay than on tmpfs, and a cold launch
+  about 100 ms more, which is the cost of publishing rather than of where the
+  bundle is.
 
 ### FUSE route
 
@@ -500,7 +509,8 @@ cold-store and warm-store cases.
   - the ownership and mode check refuses a foreign or group-writable root;
   - two open file descriptions contend for a claim: the loser defers, then
     takes over once it has nothing else to do;
-  - a FUSE demand fetch takes over at once rather than deferring;
+  - a FUSE demand fetch helps with a nearby span rather than deferring, and
+    takes over if that did not bring its file into the store;
   - GC reaps by atime, skips young objects, and ignores foreign names and
     symlinks;
   - the touch threshold.
@@ -554,9 +564,8 @@ bodies carry the numbers.
 - Whether read-only scopes should check writers' claims with `F_OFD_GETLK` on
   a read-only fd, and defer claimed spans the same way, without ever taking a
   claim.
-- Whether a FUSE demand fetch should first run one deferred or fetch-ahead
-  unit before taking over, trading a little latency for fewer duplicated
-  spans. With claims as they stand, four concurrent cold launches of
-  `bench_image --profile full` inflate 307 spans in all when each fetches
-  ahead from a profile (one launch alone: 293), but 1080 when they only read
-  on demand, with 787 claims taken over.
+- How to close the rest of the gap for launches that only read on demand.
+  Four concurrent cold launches of `bench_image --profile full` inflate about
+  470 spans between them where one launch alone inflates 227 (1080 before
+  demand fetches helped). Looking further ahead than four spans made no
+  measurable difference.

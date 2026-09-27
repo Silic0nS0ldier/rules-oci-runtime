@@ -115,6 +115,17 @@ impl Source {
             .saturating_sub(1)
     }
 
+    /// The stretch of `layer`'s stream span `span` covers, if it has one.
+    pub fn window_of(&self, layer: u32, span: usize) -> Option<std::ops::Range<u64>> {
+        let index = &self.layers.get(layer as usize)?.index;
+        let start = index.checkpoints.get(span)?.out_offset;
+        let end = index
+            .checkpoints
+            .get(span + 1)
+            .map_or(index.uncompressed_len, |next| next.out_offset);
+        Some(start..end)
+    }
+
     /// Inflates the span `body` starts in, and however far past it the body
     /// runs, into `scratch`.
     ///
