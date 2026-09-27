@@ -88,6 +88,9 @@ struct Subject {
     binary: Utf8PathBuf,
     indexes: Option<Utf8PathBuf>,
     route: String,
+    /// Arguments only some binaries understand, for holding them to the same
+    /// work: a binary with a content store runs without it.
+    extra: Vec<&'static str>,
 }
 
 /// What one run cost. Times come from `wait4`, so they are the child's own and
@@ -221,11 +224,17 @@ fn prepare(args: &Args) -> io::Result<Vec<Subject>> {
             }
         };
 
+        let help = Command::new(binary).args(["run", "--help"]).output()?;
+        let extra = match String::from_utf8_lossy(&help.stdout).contains("--cache <") {
+            true => vec!["--cache", "off"],
+            false => Vec::new(),
+        };
         let mut subject = Subject {
             label,
             binary: binary.clone(),
             indexes,
             route: String::new(),
+            extra,
         };
         subject.route = route_of(args, &subject)?;
         subjects.push(subject);
@@ -290,6 +299,7 @@ fn launcher(args: &Args, subject: &Subject, run: &Utf8Path) -> Command {
             "extract",
         ])
         .arg(format!("--strict-xattrs={}", args.strict_xattrs))
+        .args(&subject.extra)
         .env("TMPDIR", run)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -484,6 +494,7 @@ fn syscalls(args: &Args, subjects: &[Subject]) -> io::Result<()> {
                 "extract",
             ])
             .arg(format!("--strict-xattrs={}", args.strict_xattrs))
+            .args(&subject.extra)
             .env("TMPDIR", &run)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -621,6 +632,7 @@ fn perf(args: &Args, subjects: &[Subject]) -> io::Result<()> {
                 "extract",
             ])
             .arg(format!("--strict-xattrs={}", args.strict_xattrs))
+            .args(&subject.extra)
             .env("TMPDIR", &run)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
