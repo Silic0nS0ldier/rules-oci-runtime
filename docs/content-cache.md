@@ -1,8 +1,8 @@
 # Shared content cache
 
 Status: in progress. Delivery steps 1 (tables), 2 (store, publishing and
-FUSE) and 3 (claims, on the FUSE route) are implemented; the rest is
-proposed.
+FUSE), 3 (claims, on the FUSE route) and 4 (lazy verification) are
+implemented; the rest is proposed.
 
 ## Problem
 
@@ -428,10 +428,13 @@ today.
   each is used. A launch where every file is a hit hashes no blobs, including
   uncompressed ones.
 - Layers the rootfs table holds no entries for are never verified.
-- On the FUSE route, a background low-priority pass may verify the
-  contributing layers early, so the first miss does not pay for a full hash.
-  The first inflate from a layer still waits for that layer's check. That
-  wait is on this launch's own thread, like the in-process mutex.
+- On the FUSE route, the first inflate from a layer checks that layer, and
+  other threads needing it wait for that check, like the in-process mutex. A
+  layer that fails fails the run as a hash mismatch does. There is no
+  background pass verifying layers early: it would hash every blob on warm
+  launches, which is what this step removes.
+- On the eager span route, a layer with no files to place gets no digest
+  unit.
 - A hit trusts the rootfs table and the store. The table is a build output in
   the same runfiles as the layout, so it has the same trust as today's
   sidecars. The store is protected by invariants 2 and 4.

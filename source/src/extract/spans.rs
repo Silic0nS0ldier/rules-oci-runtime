@@ -165,7 +165,11 @@ fn open_layers<'a>(
 fn plan_units(layers: &[Layer], work: &Work, plan: &Plan) -> Vec<Unit> {
     let mut units = Vec::new();
     for (l, layer) in layers.iter().enumerate() {
-        units.push(Unit::Digest { layer: l });
+        // A layer no file is read from contributes only what the tables say,
+        // so there is nothing of its blob to check.
+        if !work.files[l].is_empty() {
+            units.push(Unit::Digest { layer: l });
+        }
 
         let files = &work.files[l];
         let table = plan.table(l);

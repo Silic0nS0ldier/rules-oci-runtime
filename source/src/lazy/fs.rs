@@ -392,10 +392,16 @@ impl Served {
     }
 
     /// What a failed fetch tells the kernel. A body that does not hash to what
-    /// the tables say means the image's inputs are wrong, which ends the run
-    /// rather than just the read.
+    /// the tables say, or a layer that does not match its digest, means the
+    /// image's inputs are wrong, which ends the run rather than just the read.
     fn failed(&self, err: Error) -> Errno {
-        if !matches!(err, Error::ContentMismatch { .. }) {
+        let wrong_inputs = matches!(
+            err,
+            Error::ContentMismatch { .. }
+                | Error::DigestMismatch { .. }
+                | Error::SizeMismatch { .. }
+        );
+        if !wrong_inputs {
             crate::log::warn(format!("could not fetch an image file: {err}"));
             return Errno::EIO;
         }
@@ -430,6 +436,11 @@ impl Served {
     /// How many spans were inflated.
     pub fn inflated(&self) -> u64 {
         self.inflated.load(Ordering::Relaxed)
+    }
+
+    /// How many layers were checked against their digests, of how many.
+    pub fn verified(&self) -> (usize, usize) {
+        self.source.verified()
     }
 
     /// Fetches for the container itself. What the container is waiting on is
