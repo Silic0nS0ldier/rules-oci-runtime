@@ -11,8 +11,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::OnceLock;
 
 use crate::error::{Error, IoContext, Result};
 use crate::image::{Descriptor, Layout};
@@ -21,15 +20,13 @@ use crate::zinfo;
 
 use super::tree::Body;
 
-/// Checking digests is memory bound like everything else here, so the same cap
-/// the span route settled on applies.
-const MAX_WORKERS: usize = 8;
-
 /// One layer, held open for the length of the run.
 struct Layer {
-    digest: String,
+    descriptor: Descriptor,
     blob: Blob,
     index: zinfo::Index,
+    /// Whether the blob matched its digest, once something has needed to know.
+    verified: OnceLock<bool>,
 }
 
 /// The layers an image is served out of.
@@ -56,57 +53,53 @@ impl Source {
             .zip(indexes)
             .map(|(descriptor, index)| {
                 Ok(Layer {
-                    digest: descriptor.digest.clone(),
+                    descriptor: descriptor.clone(),
                     blob: layout.map_blob(descriptor)?,
                     index,
+                    verified: OnceLock::new(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Source { layers })
     }
 
-    /// Checks every blob against the digest its descriptor names.
+    /// Checks a layer's blob against its digest before the first byte of it
+    /// is used, and never again.
     ///
-    /// Extraction reads each blob whole and so gets this for the cost of a
-    /// pass over memory. Serving reads only what is asked for, so this is the
-    /// one thing it has to do eagerly: a blob checked after the container has
-    /// already read from it has not been checked at all. The blobs are
-    /// independent, so the check runs on as many threads as there are layers.
-    pub fn verify(&self, descriptors: &[Descriptor]) -> Result<()> {
-        let next = AtomicUsize::new(0);
-        let stop = AtomicBool::new(false);
-        let failure: std::sync::Mutex<Option<(usize, Error)>> = std::sync::Mutex::new(None);
-        let workers = thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(descriptors.len().max(1))
-            .min(MAX_WORKERS);
-
-        thread::scope(|scope| {
-            for _ in 0..workers {
-                let (next, stop, failure) = (&next, &stop, &failure);
-                scope.spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(descriptor) = descriptors.get(i) else {
-                            break;
-                        };
-                        if let Err(err) = crate::image::verify(descriptor, &self.layers[i].blob) {
-                            let mut slot = failure.lock().expect("a worker failure");
-                            if slot.as_ref().is_none_or(|(first, _)| i < *first) {
-                                *slot = Some((i, err));
-                            }
-                            stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                });
+    /// Only the layers something is read from are checked, and only when it
+    /// is: a launch whose every file comes out of the content store hashes no
+    /// blob at all. Threads needing the same layer wait for the one checking
+    /// it, which is a wait on this launch alone.
+    fn verify(&self, layer: u32) -> Result<()> {
+        let layer = &self.layers[layer as usize];
+        let mut failure = None;
+        let matched = *layer.verified.get_or_init(|| {
+            match crate::image::verify(&layer.descriptor, &layer.blob) {
+                Ok(()) => true,
+                Err(err) => {
+                    failure = Some(err);
+                    false
+                }
             }
         });
-
-        match failure.into_inner().expect("a worker failure") {
-            Some((_, err)) => Err(err),
-            None => Ok(()),
+        match (matched, failure) {
+            (true, _) => Ok(()),
+            (false, Some(err)) => Err(err),
+            (false, None) => Err(Error::io(
+                format!("reading layer {}", layer.descriptor.digest),
+                std::io::Error::other("it does not match its digest"),
+            )),
         }
+    }
+
+    /// How many layers were checked against their digests, of how many.
+    pub fn verified(&self) -> (usize, usize) {
+        let checked = self
+            .layers
+            .iter()
+            .filter(|layer| layer.verified.get().is_some())
+            .count();
+        (checked, self.layers.len())
     }
 
     /// Which of the layer's spans a body starts in. Two requests for the same
@@ -128,6 +121,7 @@ impl Source {
     /// The window is what came back, which is everything the caller can place
     /// without inflating anything again.
     pub fn inflate(&self, body: Body, scratch: &mut Scratch) -> Result<Window> {
+        self.verify(body.layer)?;
         let layer = &self.layers[body.layer as usize];
         let checkpoints = &layer.index.checkpoints;
         let start = self.span_of(body);
@@ -190,12 +184,15 @@ impl Source {
 
     /// The digest of layer `layer`, for saying which one something came from.
     pub fn digest(&self, layer: u32) -> &str {
-        &self.layers[layer as usize].digest
+        &self.layers[layer as usize].descriptor.digest
     }
 
     fn malformed(&self, layer: u32, what: &str) -> Error {
         Error::io(
-            format!("serving layer {}", self.layers[layer as usize].digest),
+            format!(
+                "serving layer {}",
+                self.layers[layer as usize].descriptor.digest
+            ),
             std::io::Error::other(what),
         )
     }

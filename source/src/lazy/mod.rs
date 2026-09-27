@@ -108,6 +108,8 @@ impl Drop for Mount {
             self.served.waited()
         );
         log!("Inflated {} spans", self.served.inflated());
+        let (checked, layers) = self.served.verified();
+        log!("Checked {checked} of {layers} layers against their digests");
         log!("Unmounting {}", self.at.display());
         if let Err(err) = session.umount_and_join() {
             warning!("could not unmount {}: {err}", self.at.display());
@@ -189,11 +191,10 @@ pub fn serve(
         ));
     }
 
-    // Nothing here reads a layer whole, so this is the one thing serving has
-    // to do eagerly: a blob checked after the container has read from it has
-    // not been checked at all.
+    // Nothing here reads a layer whole, so each is checked the first time
+    // anything is inflated from it: a blob checked after the container has
+    // read from it has not been checked at all.
     let source = source::Source::open(layout, descriptors, indexes)?;
-    source.verify(descriptors)?;
 
     std::fs::create_dir_all(backing).io_context(|| format!("creating {backing}"))?;
     let recorder = fetching
