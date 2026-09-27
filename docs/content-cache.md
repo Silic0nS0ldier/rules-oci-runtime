@@ -1,7 +1,8 @@
 # Shared content cache
 
-Status: in progress. Delivery steps 1 (tables) and 2 (store, publishing and
-FUSE) are implemented; the rest is proposed.
+Status: in progress. Delivery steps 1 (tables), 2 (store, publishing and
+FUSE) and 3 (claims, on the FUSE route) are implemented; the rest is
+proposed.
 
 ## Problem
 
@@ -550,4 +551,7 @@ bodies carry the numbers.
   claim.
 - Whether a FUSE demand fetch should first run one deferred or fetch-ahead
   unit before taking over, trading a little latency for fewer duplicated
-  spans.
+  spans. With claims as they stand, four concurrent cold launches of
+  `bench_image --profile full` inflate 307 spans in all when each fetches
+  ahead from a profile (one launch alone: 293), but 1080 when they only read
+  on demand, with 787 claims taken over.

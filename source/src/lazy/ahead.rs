@@ -48,9 +48,9 @@ impl Ahead {
 
         // The container is held up by exactly this much, and a fetch reaches
         // the whole span its file is in, so one entry is usually the whole of
-        // the first read.
+        // the first read. It is waiting, so nothing here is put off.
         for &ino in order.iter().take(barrier) {
-            rootfs.fetch_ahead(ino);
+            rootfs.fetch_ahead(ino, true);
             fetched.fetch_add(1, Ordering::Relaxed);
         }
         log!(
@@ -69,12 +69,26 @@ impl Ahead {
                 let stop = stop.clone();
                 let fetched = fetched.clone();
                 thread::spawn(move || {
+                    // Files another launch is already inflating, come back to
+                    // once there is nothing else, by which time they are
+                    // usually in the store.
+                    let mut deferred = Vec::new();
                     while !stop.load(Ordering::Relaxed) {
                         let at = cursor.fetch_add(1, Ordering::Relaxed);
                         let Some(&ino) = order.get(at) else {
                             break;
                         };
-                        rootfs.fetch_ahead(ino);
+                        if rootfs.fetch_ahead(ino, false) {
+                            fetched.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            deferred.push(ino);
+                        }
+                    }
+                    for ino in deferred {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        rootfs.fetch_ahead(ino, true);
                         fetched.fetch_add(1, Ordering::Relaxed);
                     }
                 })
