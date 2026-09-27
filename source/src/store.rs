@@ -11,11 +11,14 @@
 //! the caller's alone, or turns out not to be writable leaves the launch doing
 //! what it did before, for as much as it cannot share.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -34,6 +37,17 @@ const TOUCH_AFTER_SECS: i64 = 24 * 60 * 60;
 
 const OBJECTS: &str = "objects";
 const BUNDLES: &str = "bundles";
+const CLAIMS: &str = "claims";
+
+/// Tells stores apart for the descriptors each thread keeps on their claims.
+static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This thread's own descriptor on each store's claims file. OFD locks on
+    /// one open file description never conflict with each other, so two
+    /// threads sharing one would never see each other's claims.
+    static CLAIM_FILES: RefCell<HashMap<u64, Option<Rc<File>>>> = RefCell::new(HashMap::new());
+}
 
 /// How many bundles one launch looks at when sweeping, so that no launch pays
 /// for a backlog.
@@ -55,6 +69,32 @@ pub struct Store {
     hits: AtomicU64,
     published: AtomicU64,
     lost_races: AtomicU64,
+    id: u64,
+    deferred: AtomicU64,
+    done_elsewhere: AtomicU64,
+    taken_over: AtomicU64,
+}
+
+/// What trying for a claim came to.
+pub enum Claim {
+    /// This launch has it until the guard goes.
+    Acquired(#[allow(dead_code)] ClaimGuard),
+    /// Another launch is on it.
+    Held,
+    /// There is no claiming here, so everyone works alone.
+    Unavailable,
+}
+
+/// A claim, released when dropped. Held by the thread that took it.
+pub struct ClaimGuard {
+    file: Rc<File>,
+    offset: i64,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let _ = lock_byte(&self.file, self.offset, libc::F_UNLCK as libc::c_short);
+    }
 }
 
 impl Store {
@@ -131,6 +171,10 @@ impl Store {
             hits: AtomicU64::new(0),
             published: AtomicU64::new(0),
             lost_races: AtomicU64::new(0),
+            id: NEXT_STORE.fetch_add(1, Ordering::Relaxed),
+            deferred: AtomicU64::new(0),
+            done_elsewhere: AtomicU64::new(0),
+            taken_over: AtomicU64::new(0),
         })
     }
 
@@ -221,6 +265,67 @@ impl Store {
         Some(file)
     }
 
+    /// Tries once for the claim on inflating span `span` of `layer`.
+    ///
+    /// A claim is a hint, not what keeps the store right: two launches that
+    /// inflate the same span only cost CPU. So nothing ever waits for one.
+    pub fn claim(&self, layer: &str, span: u64) -> Claim {
+        if !self.is_writable() {
+            return Claim::Unavailable;
+        }
+        let Some(file) = self.claims_file() else {
+            return Claim::Unavailable;
+        };
+        let mut key = Sha256::new();
+        key.update(layer.as_bytes());
+        key.update(span.to_le_bytes());
+        let key = key.finalize();
+        let mut offset = [0u8; 8];
+        offset[..5].copy_from_slice(&key[..5]);
+        let offset = i64::from_le_bytes(offset);
+        match lock_byte(&file, offset, libc::F_WRLCK as libc::c_short) {
+            Ok(()) => Claim::Acquired(ClaimGuard { file, offset }),
+            Err(err) if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) => {
+                Claim::Held
+            }
+            Err(_) => Claim::Unavailable,
+        }
+    }
+
+    fn claims_file(&self) -> Option<Rc<File>> {
+        CLAIM_FILES.with(|files| {
+            files
+                .borrow_mut()
+                .entry(self.id)
+                .or_insert_with(|| {
+                    open_beneath(
+                        self.root.as_raw_fd(),
+                        CLAIMS,
+                        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+                        0o600,
+                    )
+                    .ok()
+                    .map(|fd| Rc::new(File::from(fd)))
+                })
+                .clone()
+        })
+    }
+
+    /// Counts a unit of work put off because another launch had claimed it.
+    pub fn deferred(&self) {
+        self.deferred.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a deferred unit that another launch finished in the meantime.
+    pub fn done_elsewhere(&self) {
+        self.done_elsewhere.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a claimed unit done here anyway, with nothing else left to do.
+    pub fn taken_over(&self) {
+        self.taken_over.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Stops writing, for this launch, what the store will not take.
     fn refuse(&self, err: io::Error) {
         let read_only = matches!(
@@ -290,7 +395,29 @@ impl Store {
             self.published.load(Ordering::Relaxed),
             self.lost_races.load(Ordering::Relaxed),
         );
+        log!(
+            "Claims: {} deferred, {} of them done by another launch, {} taken over",
+            self.deferred.load(Ordering::Relaxed),
+            self.done_elsewhere.load(Ordering::Relaxed),
+            self.taken_over.load(Ordering::Relaxed),
+        );
     }
+}
+
+/// Takes or releases the lock on one byte of `file`, never waiting.
+fn lock_byte(file: &File, offset: i64, kind: libc::c_short) -> io::Result<()> {
+    // SAFETY: flock is plain data, and zero is a valid value for it.
+    let mut range: libc::flock = unsafe { std::mem::zeroed() };
+    range.l_type = kind;
+    range.l_whence = libc::SEEK_SET as libc::c_short;
+    range.l_start = offset;
+    range.l_len = 1;
+    // SAFETY: the descriptor is open and `range` is the struct F_OFD_SETLK
+    // reads.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &range) } == 0 {
+        return Ok(());
+    }
+    Err(io::Error::last_os_error())
 }
 
 /// True when `bytes` are what `sha256` names.
@@ -630,6 +757,38 @@ mod tests {
     fn a_body_is_held_to_its_hash() {
         assert!(holds(&named(b"hello"), b"hello"));
         assert!(!holds(&named(b"hello"), b"hellp"));
+    }
+
+    #[test]
+    fn a_claim_is_held_against_every_other_open_file_description() {
+        let root = scratch("claims");
+        let store = std::sync::Arc::new(Store::open(CacheMode::Auto, Some(&root)).expect("store"));
+        let elsewhere = |store: &std::sync::Arc<Store>, span| {
+            let store = store.clone();
+            std::thread::spawn(move || match store.claim("sha256:layer", span) {
+                Claim::Acquired(_) => "acquired",
+                Claim::Held => "held",
+                Claim::Unavailable => "unavailable",
+            })
+            .join()
+            .expect("thread")
+        };
+
+        let guard = match store.claim("sha256:layer", 3) {
+            Claim::Acquired(guard) => guard,
+            _ => panic!("a free claim is acquired"),
+        };
+        assert_eq!(elsewhere(&store, 3), "held");
+        assert_eq!(elsewhere(&store, 4), "acquired", "another span is free");
+        drop(guard);
+        assert_eq!(elsewhere(&store, 3), "acquired", "a released claim is free");
+
+        let read_only = Store::open(CacheMode::ReadOnly, Some(&root)).expect("store");
+        assert!(matches!(
+            read_only.claim("sha256:layer", 3),
+            Claim::Unavailable
+        ));
+        let _ = crate::fsutil::force_remove_dir_all(root.as_std_path());
     }
 
     #[test]

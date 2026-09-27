@@ -34,7 +34,7 @@ use super::source::{Scratch, Source};
 use super::tree::{Bodies, Body, Content, Kind, Node, ROOT, Special, Tree};
 use crate::error::{Error, IoContext};
 use crate::log::log;
-use crate::store::{self, Store};
+use crate::store::{self, Claim, Store};
 
 /// How long the kernel may trust what it was told. Everything that changes the
 /// tree comes through here, so a longer life would only risk a stale answer to
@@ -243,6 +243,24 @@ impl Demand {
     }
 }
 
+/// Who is asking for a file, which decides whether another launch's claim on
+/// its span is worth waiting out by doing something else first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Urgency {
+    /// The container is blocked on it: anything else would only delay it.
+    Now,
+    /// Fetching ahead, with more of the profile still to go.
+    Ahead,
+    /// Fetching ahead, come back to after everything else.
+    Deferred,
+}
+
+enum Fetched {
+    Nothing,
+    Inflated,
+    Deferred,
+}
+
 /// An open file, and the reason the kernel may not be asking about it.
 struct Handle {
     file: Arc<File>,
@@ -293,35 +311,76 @@ impl Served {
     /// The tree lock is not held while a span is inflated. That is the one
     /// slow thing here, and holding it would stop every other request for as
     /// long as it took.
-    fn fetch(&self, ino: u64) -> Result<bool, Errno> {
+    ///
+    /// Another launch inflating the same span holds its claim. Fetching ahead
+    /// puts such a file off; anything else does the span itself rather than
+    /// wait, since the claim may belong to a launch that is stopped or dead.
+    fn fetch(&self, ino: u64, urgency: Urgency) -> Result<Fetched, Errno> {
         let Some((body, mtime)) = self.owed(ino)? else {
-            return Ok(false);
+            return Ok(Fetched::Nothing);
         };
         // Neither of these has anything to inflate.
         if body.size == 0 {
             self.place(ino, &[], mtime)
                 .map_err(|err| self.failed(err))?;
-            return Ok(false);
+            return Ok(Fetched::Nothing);
         }
-        if let Some(object) = self.from_store(body) {
-            self.commit_object(ino, object, body.size)
-                .map_err(|err| self.failed(err))?;
-            return Ok(false);
+        if self.from_store_into(ino, body)? {
+            if urgency == Urgency::Deferred
+                && let Some(store) = &self.store
+            {
+                store.done_elsewhere();
+            }
+            return Ok(Fetched::Nothing);
         }
 
-        let claim = self.source.span_of(body) * self.layers + body.layer as usize;
+        let span = self.source.span_of(body);
         // The lock guards nothing of its own, so a worker that panicked while
         // holding it leaves the rest of the session usable.
-        let _claim = self.fetching[claim % SHARDS]
+        let _local = self.fetching[(span * self.layers + body.layer as usize) % SHARDS]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Whoever held the claim was inflating this very span.
+        // Whoever held the lock was inflating this very span.
         let Some((body, _)) = self.owed(ino)? else {
-            return Ok(false);
+            return Ok(Fetched::Nothing);
         };
+
+        let claim = match &self.store {
+            Some(store) => store.claim(self.source.digest(body.layer), span as u64),
+            None => Claim::Unavailable,
+        };
+        match (&claim, urgency) {
+            (Claim::Held, Urgency::Ahead) => {
+                if let Some(store) = &self.store {
+                    store.deferred();
+                }
+                return Ok(Fetched::Deferred);
+            }
+            (Claim::Held, _) => {
+                if let Some(store) = &self.store {
+                    store.taken_over();
+                }
+            }
+            // Whoever held it before may have just published this.
+            (Claim::Acquired(_), _) if self.from_store_into(ino, body)? => {
+                return Ok(Fetched::Nothing);
+            }
+            _ => {}
+        }
 
         SCRATCH
             .with(|scratch| self.fetch_span(body, &mut scratch.borrow_mut()))
+            .map_err(|err| self.failed(err))?;
+        drop(claim);
+        Ok(Fetched::Inflated)
+    }
+
+    /// Serves `ino` from the store if the store has its body.
+    fn from_store_into(&self, ino: u64, body: Body) -> Result<bool, Errno> {
+        let Some(object) = self.from_store(body) else {
+            return Ok(false);
+        };
+        self.commit_object(ino, object, body.size)
             .map_err(|err| self.failed(err))?;
         Ok(true)
     }
@@ -377,18 +436,24 @@ impl Served {
     /// counted while it waits, so anything fetching ahead of it stands aside.
     fn fetch_now(&self, ino: u64) -> Result<(), Errno> {
         self.demand.entered();
-        let fetched = self.fetch(ino);
+        let fetched = self.fetch(ino, Urgency::Now);
         self.demand.left();
-        if matches!(fetched, Ok(true)) {
+        if matches!(fetched, Ok(Fetched::Inflated)) {
             self.waited.fetch_add(1, Ordering::Relaxed);
         }
         fetched.map(|_| ())
     }
 
-    /// Fetches a file the container has not asked for yet.
-    pub fn fetch_ahead(&self, ino: u64) {
+    /// Fetches a file the container has not asked for yet, answering false
+    /// when another launch has claimed its span and it is worth coming back
+    /// to later. `last_resort` says there is nothing else left to do first.
+    pub fn fetch_ahead(&self, ino: u64, last_resort: bool) -> bool {
         self.demand.wait_out();
-        let _ = self.fetch(ino);
+        let urgency = match last_resort {
+            true => Urgency::Deferred,
+            false => Urgency::Ahead,
+        };
+        !matches!(self.fetch(ino, urgency), Ok(Fetched::Deferred))
     }
 
     /// How many files the container opened and had to wait to be fetched.
