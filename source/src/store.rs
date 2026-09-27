@@ -33,9 +33,19 @@ const LAYOUT: &str = "v1";
 const TOUCH_AFTER_SECS: i64 = 24 * 60 * 60;
 
 const OBJECTS: &str = "objects";
+const BUNDLES: &str = "bundles";
+
+/// How many bundles one launch looks at when sweeping, so that no launch pays
+/// for a backlog.
+const SWEEP_LIMIT: usize = 16;
+
+/// A bundle with no lock file is one a launch died making, or one being
+/// removed. Only the first is worth sweeping, and it has to be old to be sure.
+const UNLOCKED_AFTER_SECS: i64 = 24 * 60 * 60;
 
 pub struct Store {
     root_path: Utf8PathBuf,
+    root: OwnedFd,
     objects: OwnedFd,
     shards: Vec<OnceLock<OwnedFd>>,
     writable: AtomicBool,
@@ -112,6 +122,7 @@ impl Store {
         );
         Ok(Store {
             root_path,
+            root,
             objects,
             shards: (0..256).map(|_| OnceLock::new()).collect(),
             writable: AtomicBool::new(writable),
@@ -125,6 +136,21 @@ impl Store {
 
     pub fn is_writable(&self) -> bool {
         self.writable.load(Ordering::Relaxed)
+    }
+
+    /// Where bundles go while the store is writable, which puts them on the
+    /// same mount as the objects they are cloned from. Sweeps it on the way.
+    pub fn bundles(&self) -> Option<Utf8PathBuf> {
+        if !self.is_writable() {
+            return None;
+        }
+        if let Err(err) = make_dir(self.root.as_raw_fd(), BUNDLES) {
+            self.refuse(err);
+            return None;
+        }
+        let dir = self.root_path.join(BUNDLES);
+        sweep(&dir, SWEEP_LIMIT);
+        Some(dir)
     }
 
     /// The object holding `size` bytes named `sha256`, or `None` for a miss.
@@ -270,6 +296,45 @@ impl Store {
 /// True when `bytes` are what `sha256` names.
 pub fn holds(sha256: &[u8; 32], bytes: &[u8]) -> bool {
     Sha256::digest(bytes).as_slice() == sha256
+}
+
+/// Removes up to `limit` bundles no launch holds the lock of.
+///
+/// Nothing else cleans up after a launch that was killed, or a remover the
+/// sandbox took down with it, the way `/tmp` is cleaned. Two launches may
+/// sweep the same bundle at once, and whichever gets there second finds
+/// nothing to remove.
+fn sweep(dir: &Utf8Path, limit: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut swept = 0;
+    for entry in entries.flatten().take(limit) {
+        let path = entry.path();
+        let lock = match File::open(path.join(crate::bundle::LOCK)) {
+            Ok(lock) => lock,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let old = entry
+                    .metadata()
+                    .is_ok_and(|meta| now() - meta.mtime() > UNLOCKED_AFTER_SECS);
+                if old && crate::fsutil::force_remove_dir_all(&path).is_ok() {
+                    swept += 1;
+                }
+                continue;
+            }
+            Err(_) => continue,
+        };
+        // SAFETY: the descriptor is open for the duration of the call.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        if crate::fsutil::force_remove_dir_all(&path).is_ok() {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        log!("Removed {swept} bundles left behind in {dir}");
+    }
 }
 
 fn split(sha256: &[u8; 32]) -> (u8, String) {
@@ -494,6 +559,7 @@ mod tests {
         let store = Store::open(CacheMode::ReadOnly, Some(&root)).expect("store");
         assert!(store.lookup(&sha, 5).is_some());
         assert!(store.publish(&named(b"other"), b"other").is_none());
+        assert!(store.bundles().is_none());
         let _ = crate::fsutil::force_remove_dir_all(root.as_std_path());
     }
 
@@ -564,5 +630,26 @@ mod tests {
     fn a_body_is_held_to_its_hash() {
         assert!(holds(&named(b"hello"), b"hello"));
         assert!(!holds(&named(b"hello"), b"hellp"));
+    }
+
+    #[test]
+    fn only_bundles_nothing_holds_are_swept() {
+        let root = scratch("sweep");
+        let store = Store::open(CacheMode::Auto, Some(&root)).expect("store");
+        let dir = store.bundles().expect("bundles");
+        let live = crate::bundle::Bundle::create(&dir, "live", false, true).expect("live");
+        let dead = crate::bundle::Bundle::create(&dir, "dead", true, true).expect("dead");
+        drop(dead);
+        std::fs::create_dir_all(dir.join("young-and-unlocked")).expect("unlocked");
+
+        store.bundles().expect("bundles");
+        assert!(live.dir().exists(), "a held bundle stays");
+        assert!(!dir.join("dead").exists(), "a bundle nothing holds goes");
+        assert!(
+            dir.join("young-and-unlocked").exists(),
+            "a bundle without a lock may be one being made"
+        );
+        drop(live);
+        let _ = crate::fsutil::force_remove_dir_all(root.as_std_path());
     }
 }

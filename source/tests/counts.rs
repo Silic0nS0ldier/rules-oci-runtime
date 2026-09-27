@@ -256,6 +256,9 @@ fn extract(name: &str, layout: &Path, indexes: Option<&Path>) -> Extraction {
         .args(["--runtime", "/nonexistent/runc"])
         .args(["--keep-bundle", "--verbose", "--strict-xattrs=false"])
         .args(["--rootfs", "extract"])
+        // The store has cases of its own; these hold the route to what it
+        // asks of the kernel without one.
+        .args(["--cache", "off"])
         .env("TMPDIR", &run);
     if let Some(indexes) = indexes {
         command.arg("--index").arg(indexes);
@@ -294,6 +297,9 @@ fn traced(name: &str, layout: &Path, indexes: Option<&Path>) -> BTreeMap<String,
         .args(["--runtime", "/nonexistent/runc"])
         .args(["--keep-bundle", "--strict-xattrs=false"])
         .args(["--rootfs", "extract"])
+        // The store has cases of its own; these hold the route to what it
+        // asks of the kernel without one.
+        .args(["--cache", "off"])
         .env("TMPDIR", &run);
     if let Some(indexes) = indexes {
         command.arg("--index").arg(indexes);

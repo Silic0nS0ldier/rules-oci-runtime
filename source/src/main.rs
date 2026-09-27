@@ -92,7 +92,18 @@ fn run(args: RunArgs) -> Result<i32> {
             std::io::Error::from(std::io::ErrorKind::InvalidData),
         )
     })?;
-    let bundle = Bundle::create(&temp_dir, &id, args.keep_bundle)?;
+    // A kept bundle stays out of the store, whose sweep would take it once
+    // nothing held it.
+    let in_store = store
+        .as_ref()
+        .filter(|_| !args.keep_bundle)
+        .and_then(|store| store.bundles());
+    let bundle = Bundle::create(
+        in_store.as_deref().unwrap_or(&temp_dir),
+        &id,
+        args.keep_bundle,
+        in_store.is_some(),
+    )?;
     log!("Using {} for the container bundle", bundle.dir());
 
     let rootfs = bundle.rootfs();

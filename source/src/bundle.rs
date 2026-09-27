@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -20,6 +21,10 @@ const REMOVE_ARG: &str = "__remove";
 /// Suffix given to a bundle once it has been renamed out of the way.
 const REMOVE_SUFFIX: &str = ".removing";
 
+/// The file a bundle in the content store is locked through while anything
+/// still needs it, which is what tells a sweep it is not debris.
+pub const LOCK: &str = "lock";
+
 /// The bundle a detached remover was asked to delete, or `None` for an ordinary
 /// invocation. Checked before the launcher sidecar so a bundle path can never
 /// be mistaken for a command line.
@@ -35,16 +40,23 @@ pub fn remover_target(argv: &[String]) -> Option<&str> {
 pub struct Bundle {
     root: Utf8PathBuf,
     keep: bool,
+    /// Held for as long as the bundle is in use, and then by whoever removes
+    /// it. Only a bundle somewhere shared needs one.
+    lock: Option<fs::File>,
 }
 
 impl Bundle {
-    pub fn create(parent: &Utf8Path, id: &str, keep: bool) -> Result<Self> {
+    pub fn create(parent: &Utf8Path, id: &str, keep: bool, locked: bool) -> Result<Self> {
         let root = parent.join(id);
         fs::create_dir_all(&root).io_context(|| format!("creating {root}"))?;
         // The bundle can contain host paths under a shared /tmp.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .io_context(|| format!("securing {root}"))?;
-        let bundle = Bundle { root, keep };
+        let lock = match locked {
+            true => Some(lock(&root.join(LOCK))?),
+            false => None,
+        };
+        let bundle = Bundle { root, keep, lock };
         fs::create_dir_all(bundle.rootfs())
             .io_context(|| format!("creating {}", bundle.rootfs()))?;
         fs::create_dir_all(bundle.state_dir())
@@ -92,7 +104,7 @@ impl Drop for Bundle {
             Some(staged) => staged,
             None => self.root.clone(),
         };
-        if spawn_remover(&staged) {
+        if spawn_remover(&staged, self.lock.as_ref()) {
             return;
         }
         if let Err(err) = fsutil::force_remove_dir_all(staged.as_std_path()) {
@@ -115,13 +127,35 @@ impl Bundle {
     }
 }
 
+/// Takes the lock a bundle is held through, which is never contended: the
+/// bundle is this launch's own.
+fn lock(path: &Utf8Path) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .io_context(|| format!("creating {path}"))?;
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(Error::io(
+            format!("locking {path}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(file)
+}
+
 /// Hands the tree to a copy of this binary that outlives it. Detaching from the
 /// session keeps a terminal signal from orphaning a half deleted tree, and null
 /// standard streams keep the child from holding a caller's pipe open.
-fn spawn_remover(path: &Utf8Path) -> bool {
+///
+/// The child inherits the bundle's lock, so the bundle is never unheld while
+/// it still exists and no sweep takes it from under the remover.
+fn spawn_remover(path: &Utf8Path, lock: Option<&fs::File>) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
+    let lock = lock.map(|file| file.as_raw_fd());
     let mut command = Command::new(exe);
     command
         .arg(REMOVE_ARG)
@@ -129,10 +163,14 @@ fn spawn_remover(path: &Utf8Path) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: setsid is async-signal-safe and touches nothing this process owns.
+    // SAFETY: setsid and fcntl are async-signal-safe and touch nothing this
+    // process owns.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             libc::setsid();
+            if let Some(fd) = lock {
+                libc::fcntl(fd, libc::F_SETFD, 0);
+            }
             Ok(())
         });
     }
@@ -234,7 +272,7 @@ mod tests {
     #[test]
     fn bundles_create_their_subdirectories() {
         let parent = scratch("bundle-create");
-        let bundle = Bundle::create(&parent, "abc", false).expect("bundle");
+        let bundle = Bundle::create(&parent, "abc", false, false).expect("bundle");
         assert!(bundle.rootfs().is_dir());
         assert!(bundle.state_dir().is_dir());
         assert_eq!(bundle.dir(), parent.join("abc"));
@@ -244,7 +282,7 @@ mod tests {
     #[test]
     fn bundles_are_private_to_the_owner() {
         let parent = scratch("bundle-perms");
-        let bundle = Bundle::create(&parent, "abc", false).expect("bundle");
+        let bundle = Bundle::create(&parent, "abc", false, false).expect("bundle");
         let mode = fs::metadata(bundle.dir())
             .expect("metadata")
             .permissions()
@@ -257,7 +295,7 @@ mod tests {
     fn dropping_a_bundle_removes_it() {
         let parent = scratch("bundle-drop");
         let path = {
-            let bundle = Bundle::create(&parent, "abc", false).expect("bundle");
+            let bundle = Bundle::create(&parent, "abc", false, false).expect("bundle");
             // A read-only directory must not defeat cleanup.
             let locked = bundle.rootfs().join("locked");
             fs::create_dir_all(&locked).expect("dir");
@@ -292,7 +330,7 @@ mod tests {
     #[test]
     fn staging_moves_the_bundle_aside() {
         let parent = scratch("bundle-stage");
-        let bundle = Bundle::create(&parent, "abc", true).expect("bundle");
+        let bundle = Bundle::create(&parent, "abc", true, false).expect("bundle");
         let staged = bundle.stage_for_removal().expect("staged");
         assert_eq!(staged, parent.join(format!("abc{REMOVE_SUFFIX}")));
         assert!(!bundle.dir().exists());
@@ -304,7 +342,7 @@ mod tests {
     fn keeping_a_bundle_leaves_it_behind() {
         let parent = scratch("bundle-keep");
         let path = {
-            let bundle = Bundle::create(&parent, "abc", true).expect("bundle");
+            let bundle = Bundle::create(&parent, "abc", true, false).expect("bundle");
             bundle.dir().to_owned()
         };
         assert!(path.exists());
