@@ -91,6 +91,20 @@ Handing a file to the kernel to read and write itself, rather than through the
 launcher, needs a 6.9 kernel built with `CONFIG_FUSE_PASSTHROUGH` and the
 privilege to ask. `--verbose` says which of them the run got.
 
+### Sharing between launches
+
+A served file's bytes are kept in a store under
+`~/.cache/rules_oci_runtime/v1`, named by their SHA-256, so the next launch of
+the image, or of any image holding the same file, reads them from there rather
+than inflating them again. Nothing in the store is ever written to: a container
+writing to a file gets its own copy first. The store is only used when it
+belongs to the caller alone and is not on NFS, and a scope that cannot write to
+it, such as Bazel's `linux-sandbox`, still reads from it (pass
+`--sandbox_writable_path` with the path to let it write). `--cache=off` leaves
+it alone, and `--verbose` reports how much each launch got out of it.
+
+See [docs/content-cache.md](docs/content-cache.md) for the design.
+
 ### Fetching ahead
 
 A served file is paid for when the container opens it, one at a time and with
@@ -262,6 +276,8 @@ Flags accepted before the container command override the rule attributes:
 | `--record-profile[=PATH]` | Record what this run reads. Without a path it writes where the rule said to, and it serves the image or fails. |
 | `--prefetch-barrier COUNT` | How many of a profile's files to fetch before the container starts. Defaults to `1`. |
 | `--strict-xattrs BOOL` | Refuse an image that sets extended attributes. Defaults to `true`. |
+| `--cache auto\|read-only\|off` | Share file contents with other launches through the store. Defaults to `auto`. |
+| `--cache-dir DIR` | Use this store rather than the one under the home directory. |
 | `--keep-bundle` | Leave the generated bundle on disk for inspection. |
 | `--verbose` | Same as `RULES_OCI_RUNTIME_VERBOSE=1`. |
 

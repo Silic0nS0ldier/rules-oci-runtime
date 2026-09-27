@@ -280,6 +280,36 @@ case_served_rootfs() {
   assert_equals "${extracted%%$'\n'*}" "$served" "the next run sees the image again"
 }
 
+# Launches share file contents through the store, so a second launch of an
+# image inflates nothing, and none of them can change what the others read.
+case_shared_store() {
+  local store="${TEST_TMPDIR}/store" read='cat /etc/alpine-release; md5sum /bin/busybox'
+  local cold warm off stderr
+  cold=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse --cache-dir="$store" \
+    /bin/sh -c "$read" </dev/null 2>"${TEST_TMPDIR}/cold.err")
+  stderr=$(cat "${TEST_TMPDIR}/cold.err")
+  if [[ "$stderr" == *"cannot serve the image"* ]]; then
+    return
+  fi
+  assert_contains "$stderr" "read-write" "the store is written"
+  assert_not_contains "$stderr" "Inflated 0 spans" "a cold store inflates"
+
+  "$container" --rootfs=fuse --cache-dir="$store" /bin/sh -c \
+    'echo written > /etc/alpine-release; : > /bin/busybox.copy' </dev/null ||
+    fail "writing through a served rootfs"
+
+  warm=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse --cache-dir="$store" \
+    /bin/sh -c "$read" </dev/null 2>"${TEST_TMPDIR}/warm.err")
+  stderr=$(cat "${TEST_TMPDIR}/warm.err")
+  assert_contains "$stderr" "Inflated 0 spans" "a warm store inflates nothing"
+  assert_equals "$cold" "$warm" "a hit reads as a miss, whatever was written in between"
+
+  off=$(RULES_OCI_RUNTIME_VERBOSE=1 "$container" --rootfs=fuse --cache=off \
+    /bin/sh -c "$read" </dev/null 2>"${TEST_TMPDIR}/off.err")
+  assert_contains "$(cat "${TEST_TMPDIR}/off.err")" "content cache is off" "the store can be left alone"
+  assert_equals "$cold" "$off" "no store reads as a store"
+}
+
 # What a container read is recorded from a run of it and fetched ahead of the
 # next one. Recording is a run time thing rather than a build time one, so this
 # records into the test's own directory rather than a source tree.

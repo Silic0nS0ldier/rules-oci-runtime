@@ -1,7 +1,7 @@
 # Shared content cache
 
-Status: in progress. Delivery step 1 (tables) is implemented; the rest is
-proposed.
+Status: in progress. Delivery steps 1 (tables) and 2 (store, publishing and
+FUSE) are implemented; the rest is proposed.
 
 ## Problem
 
@@ -189,8 +189,9 @@ uses today's path (per-layer tables plus `Plan::build`).
   is not written into `.launch.json` by the rules, because an absolute host
   path in an action key hurts remote-cache hits.
 - `--cache auto|read-only|off`, default `auto`.
-- If the root resolves inside `$TEST_TMPDIR` or `$TMPDIR`, the launcher does
-  not write to it, since nothing written there would be read again.
+- If the default root resolves inside `$TEST_TMPDIR` or `$TMPDIR`, the
+  launcher does not write to it, since nothing written there would be read
+  again. A root named with `--cache-dir` is taken at its word.
 - `v1` is the layout version. A new version starts empty. Reaping old versions
   is an open question.
 
@@ -269,7 +270,9 @@ and GC never has to look for them.
 
 If the table's hash disagrees with bytes inflated from a verified layer, the
 launcher was given invalid or corrupted inputs, and the run fails. Nothing is
-published, and the error names the table and the path.
+published, and the error names the layer and the offset. Bodies are checked on
+the way into the store; a launch with no writable store trusts the layer
+digest alone, as it does today.
 
 - **Eager:** extraction stops and the launch exits with an error before the
   container starts.
@@ -284,7 +287,8 @@ Damage to the store is not an input error: a bad object counts as a miss
 
 ## Reading
 
-1. `openat2(objects_fd, "<aa>/<hex>", O_RDONLY | O_NOFOLLOW)`.
+1. `openat2(objects/<aa>, "<hex>", O_RDONLY | O_NOFOLLOW)`, with the shard
+   directory's descriptor opened once per launch.
 2. `statx(fd, STATX_SIZE | STATX_ATIME)`. If `st_size` differs from the index,
    the object counts as a miss. This catches a file emptied by a crash before
    its data reached disk.
@@ -376,26 +380,29 @@ filesystem. When the store is read-only or off, bundles stay where they are
 today.
 
 - The launcher holds `flock(LOCK_EX)` on `bundles/<id>/lock` for the bundle's
-  lifetime. The `__remove` helper ([bundle.rs](../source/src/bundle.rs)) takes
-  the same lock after the rename to `.removing`.
-- **Sweep:** at startup, with a bound of K entries, remove any `bundles/*`
-  whose lock can be taken with `LOCK_NB`. Two removals running at once are
-  tolerated: `ENOENT` is ignored. The sweep is needed because nothing cleans
+  lifetime. The detached `__remove` helper ([bundle.rs](../source/src/bundle.rs))
+  inherits that descriptor, so the bundle is never unheld while it exists.
+- **Sweep:** at startup, with a bound of 16 entries, remove any `bundles/*`
+  whose lock can be taken with `LOCK_NB`. A bundle with no lock file may be one
+  being made, so it is only removed once it is a day old. Two removals running
+  at once are tolerated. The sweep is needed because nothing cleans
   up a persistent directory the way `/tmp` is cleaned, and the sandbox kills
   the detached remover.
+- `--keep-bundle` keeps the bundle under the temporary directory, since the
+  next sweep would take a kept bundle in the store.
 - The FUSE mount lives in the launcher's private mount namespace, so the
   mount point being under `$HOME` is invisible to anything else.
 
 ### FUSE route
 
-- A tree node becomes `Content::Object(fd)` on a hit or after publishing.
-  Reads use `pread` on that fd, or FUSE passthrough where the kernel supports
-  it, which also shares page cache between containers.
+- A tree node becomes `Content::Object` on a hit or after publishing. Reads
+  use `pread` on that fd. FUSE passthrough is not used for objects: the kernel
+  keeps one backing reference per inode, which would outlive a later copy-up.
 - A write-intent open (`O_WRONLY`, `O_RDWR`, `O_TRUNC`) or a size-changing
   `setattr` copies into `backing/<ino>` (`FICLONE`, then `copy_file_range`,
-  then read/write) and switches the node to `Content::Backed`. Today
-  [`open_backing`](../source/src/lazy/fs.rs) always opens read-write; that
-  changes.
+  then read/write) and switches the node to `Content::Backed`. A handle on an
+  object refuses writes.
+- Empty files are placed without an object and without inflating anything.
 - Fetch-ahead from the profile goes through the same lookup, claim and
   publish path. Spans claimed elsewhere are deferred to the end of its queue.
 
