@@ -125,6 +125,16 @@ pub struct RunArgs {
     #[arg(long, value_name = "DIR")]
     pub rootfs_tables: Option<Utf8PathBuf>,
 
+    /// Whether file contents are shared with other launches through the
+    /// store under `~/.cache/rules_oci_runtime`.
+    #[arg(long, value_enum, default_value_t = CacheMode::Auto)]
+    pub cache: CacheMode,
+
+    /// The store to share through, in place of the one under the home
+    /// directory. For tests and benchmarks.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<Utf8PathBuf>,
+
     /// Profile of what a container read, fetched ahead of this one. Repeatable:
     /// the profile recorded for the image platform in use is the one read.
     #[arg(long = "profile", value_name = "PATH")]
@@ -216,6 +226,17 @@ pub enum Toggle {
     Auto,
     True,
     False,
+}
+
+/// How a launch uses the shared content store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CacheMode {
+    /// Read from it, and write to it where this scope can.
+    Auto,
+    /// Read from it and never write to it.
+    ReadOnly,
+    /// Leave it alone.
+    Off,
 }
 
 /// Where the container's root filesystem comes from.

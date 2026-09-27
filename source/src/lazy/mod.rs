@@ -36,6 +36,7 @@ use crate::extract::RootfsExtractor;
 use crate::image::{Descriptor, Layout};
 use crate::log::{log, warning};
 use crate::profile::Profile;
+use crate::store::Store;
 use crate::sys;
 
 use self::ahead::Ahead;
@@ -83,6 +84,16 @@ impl Mount {
     pub fn recorded(&self) -> Option<Vec<Vec<u8>>> {
         self.recorder.as_ref().map(|recorder| recorder.recorded())
     }
+
+    /// Says how to stop the container should the image turn out to be wrong.
+    pub fn on_failure(&self, stop: Box<dyn Fn() + Send + Sync>) {
+        self.served.on_failure(stop);
+    }
+
+    /// Why the run has to fail even though the container ran, if it does.
+    pub fn take_failure(&self) -> Option<Error> {
+        self.served.take_failure()
+    }
 }
 
 impl Drop for Mount {
@@ -96,6 +107,7 @@ impl Drop for Mount {
             "The container waited for {} files to be fetched",
             self.served.waited()
         );
+        log!("Inflated {} spans", self.served.inflated());
         log!("Unmounting {}", self.at.display());
         if let Err(err) = session.umount_and_join() {
             warning!("could not unmount {}: {err}", self.at.display());
@@ -142,6 +154,7 @@ pub fn serve(
     descriptors: &[Descriptor],
     extractor: &RootfsExtractor,
     fetching: Fetching<'_>,
+    store: Option<Arc<Store>>,
 ) -> Result<Option<Mount>> {
     if mode == RootfsMode::Extract {
         return Ok(None);
@@ -195,6 +208,7 @@ pub fn serve(
         sys::euid(),
         sys::egid(),
         recorder.clone(),
+        store,
     );
 
     let mut config = fuser::Config::default();

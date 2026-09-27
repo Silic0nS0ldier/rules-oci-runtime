@@ -10,6 +10,8 @@
 //! is what lets `forget` do nothing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::sync::Arc;
 
 use crate::entries::Table;
 use crate::extract::Work;
@@ -30,13 +32,19 @@ pub struct Body {
     pub layer: u32,
     pub offset: u64,
     pub size: u64,
+    /// What the bytes hash to, which names them in the content store.
+    pub sha256: Option<[u8; 32]>,
 }
 
 /// Where a regular file's contents currently are.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Content {
     /// Still only in the layer.
     Layer(Body),
+    /// An object in the content store, shared with other launches and never
+    /// written: anything that would change it copies it to a backing file
+    /// first.
+    Object { file: Arc<File>, size: u64 },
     /// Written out under the backing directory, which is the content from then
     /// on: the container may have changed it since.
     Backed,
@@ -228,6 +236,7 @@ impl Tree {
                     layer: layer as u32,
                     offset: entry.offset,
                     size: entry.size,
+                    sha256: entry.sha256,
                 };
                 let ino = tree.push(Node::file(Content::Layer(body), entry.mode, entry.mtime));
                 tree.attach(&mut by_path, &entry.path, ino)?;
@@ -424,7 +433,8 @@ mod tests {
             Kind::File(Content::Layer(Body {
                 layer: 0,
                 offset: 0,
-                size: 11
+                size: 11,
+                ..
             }))
         ));
         assert!(matches!(

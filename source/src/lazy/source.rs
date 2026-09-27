@@ -188,6 +188,11 @@ impl Source {
         Ok(())
     }
 
+    /// The digest of layer `layer`, for saying which one something came from.
+    pub fn digest(&self, layer: u32) -> &str {
+        &self.layers[layer as usize].digest
+    }
+
     fn malformed(&self, layer: u32, what: &str) -> Error {
         Error::io(
             format!("serving layer {}", self.layers[layer as usize].digest),

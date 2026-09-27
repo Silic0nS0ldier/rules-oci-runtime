@@ -13,8 +13,11 @@ mod rootfs;
 mod runtime;
 mod sidecar;
 mod spec;
+mod store;
 mod sys;
 mod zinfo;
+
+use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
@@ -82,6 +85,7 @@ fn run(args: RunArgs) -> Result<i32> {
     }
 
     let id = format!("rules-oci-runtime-{}", sys::random_hex(8)?);
+    let store = store::Store::open(args.cache, args.cache_dir.as_deref()).map(Arc::new);
     let temp_dir = Utf8PathBuf::from_path_buf(std::env::temp_dir()).map_err(|path| {
         Error::io(
             format!("temporary directory {} is not valid UTF-8", path.display()),
@@ -129,6 +133,7 @@ fn run(args: RunArgs) -> Result<i32> {
             record: recording.is_some(),
             barrier: args.prefetch_barrier,
         },
+        store.clone(),
     )?;
     if mount.is_none() {
         extractor.apply(&layout, &manifest.layers)?;
@@ -186,12 +191,21 @@ fn run(args: RunArgs) -> Result<i32> {
         state_dir: &state_dir,
     };
     let runc = Runc::new(&args.runtime);
+    if let Some(mount) = &mount {
+        mount.on_failure(Box::new(runc.killer(&request)));
+    }
     log!("Handing bundle {} to {}", bundle.dir(), runc.name());
     let result = runc.run(&request);
     runc.delete(&request);
     // Nothing is waiting on the image any more, however the container ended.
     if let Some(mount) = mount.as_mut() {
         mount.settle();
+    }
+    if let Some(store) = &store {
+        store.report();
+    }
+    if let Some(failure) = mount.as_ref().and_then(lazy::Mount::take_failure) {
+        return Err(failure);
     }
     if let (Some(destination), Some(mount)) = (&recording, mount.as_ref()) {
         record(destination, &platform, &manifest.config.digest, mount)?;
