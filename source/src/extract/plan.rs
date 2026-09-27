@@ -104,10 +104,15 @@ pub struct Plan {
     /// out; see [`Plan::placeable`].
     work: Option<Work>,
     tables: Vec<Table>,
+    /// Every entry naming extended attributes, shadowed or not, as `(layer,
+    /// path, names)` in the order the layers list them.
+    xattrs: Vec<Xattrs>,
 }
 
+pub type Xattrs = (u32, Vec<u8>, Vec<u8>);
+
 /// The surviving entries, grouped the way they have to be placed.
-#[derive(Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Work {
     /// Regular files, by layer, ordered by where their bodies sit in the
     /// layer's uncompressed stream.
@@ -152,7 +157,26 @@ impl Plan {
         Ok(Plan::resolve(layers, tables))
     }
 
-    fn resolve(layers: &[Descriptor], mut tables: Vec<Table>) -> Plan {
+    /// The plan a rootfs table recorded at build time. Only what survives is
+    /// in it, so nothing is known to be shadowed: a walk falling back from it
+    /// places every entry, as it would with no plan at all.
+    pub fn resolved(
+        directories: Vec<(Vec<u8>, u32)>,
+        tables: Vec<Table>,
+        work: Work,
+        xattrs: Vec<Xattrs>,
+    ) -> Plan {
+        Plan {
+            shadowed: HashMap::new(),
+            directories,
+            resolved: true,
+            work: Some(work),
+            tables,
+            xattrs,
+        }
+    }
+
+    pub fn resolve(layers: &[Descriptor], mut tables: Vec<Table>) -> Plan {
         // The paths the walk resolves and the paths the tables spell have to
         // be one and the same, or the tree below describes an image nobody
         // extracts.
@@ -219,12 +243,24 @@ impl Plan {
         let work = (blocked == Blocked::Nothing)
             .then(|| placeable(&tree, &tables))
             .flatten();
+        let xattrs = tables
+            .iter()
+            .enumerate()
+            .flat_map(|(l, table)| {
+                table
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.xattrs.is_empty())
+                    .map(move |entry| (l as u32, entry.path.clone(), entry.xattrs.clone()))
+            })
+            .collect();
         Plan {
             shadowed,
             directories,
             resolved: true,
             work,
             tables,
+            xattrs,
         }
     }
 
@@ -251,6 +287,10 @@ impl Plan {
 
     pub fn tables(&self) -> &[Table] {
         &self.tables
+    }
+
+    pub fn xattrs(&self) -> &[Xattrs] {
+        &self.xattrs
     }
 
     /// True when this layer's copy of `path` is replaced or removed by a later

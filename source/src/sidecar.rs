@@ -26,6 +26,11 @@ pub fn entries_at(dir: &Utf8Path, hex: &str) -> Utf8PathBuf {
     dir.join(format!("{hex}.entries"))
 }
 
+/// Where the rootfs table of a manifest goes.
+pub fn rootfs_at(dir: &Utf8Path, manifest_hex: &str) -> Utf8PathBuf {
+    dir.join(format!("{manifest_hex}.rootfs"))
+}
+
 /// Reads a sidecar, or `None` when there is not a usable one.
 ///
 /// One that is not there is ordinary: an image may simply not have been

@@ -117,6 +117,13 @@ pub struct Manifest {
     pub config: Descriptor,
     #[serde(default)]
     pub layers: Vec<Descriptor>,
+    /// The digest the manifest was read by, which is what a rootfs table is
+    /// named after.
+    #[serde(skip)]
+    pub digest: String,
+    /// The platform the index gave it, where it gave one.
+    #[serde(skip)]
+    pub platform: Option<Platform>,
 }
 
 /// The `config` object inside an image configuration blob. Field names are
@@ -250,9 +257,16 @@ impl Layout {
     /// Walks `index.json`, descending through nested indexes, to the manifest for `platform`.
     pub fn resolve_manifest(&self, platform: &Platform) -> Result<Manifest> {
         let descriptor = self.resolve_manifest_descriptor(platform)?;
+        self.read_manifest(descriptor)
+    }
+
+    fn read_manifest(&self, descriptor: Descriptor) -> Result<Manifest> {
         let bytes = self.read_metadata_blob(&descriptor)?;
-        serde_json::from_slice(&bytes)
-            .json_context(|| format!("parsing manifest {}", descriptor.digest))
+        let mut manifest: Manifest = serde_json::from_slice(&bytes)
+            .json_context(|| format!("parsing manifest {}", descriptor.digest))?;
+        manifest.digest = descriptor.digest;
+        manifest.platform = descriptor.platform;
+        Ok(manifest)
     }
 
     /// Every manifest reachable from `index.json`, regardless of platform.
@@ -275,12 +289,7 @@ impl Layout {
                         queue.push(index.manifests);
                     }
                     MEDIA_TYPE_OCI_MANIFEST | MEDIA_TYPE_DOCKER_MANIFEST | "" => {
-                        let bytes = self.read_metadata_blob(&descriptor)?;
-                        manifests.push(
-                            serde_json::from_slice(&bytes).json_context(|| {
-                                format!("parsing manifest {}", descriptor.digest)
-                            })?,
-                        );
+                        manifests.push(self.read_manifest(descriptor)?);
                     }
                     other => {
                         crate::log::log!("ignoring descriptor with media type {other}");

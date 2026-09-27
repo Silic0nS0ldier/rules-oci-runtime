@@ -19,10 +19,28 @@ pub struct Cli {
 pub enum Command {
     /// Unpack an image layout into a bundle and run it.
     Run(Box<RunArgs>),
-    /// Build parallel-decompression checkpoint indexes for gzip blobs.
+    /// Build parallel-decompression checkpoint indexes and entry tables for
+    /// layer blobs.
     Index(IndexArgs),
+    /// Resolve each manifest of a layout from its layers' entry tables.
+    Stitch(StitchArgs),
     /// Check that a recorded profile still describes an image.
     Profile(ProfileArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct StitchArgs {
+    /// Image layout whose manifests are resolved.
+    #[arg(long, value_name = "DIR")]
+    pub layout: Utf8PathBuf,
+
+    /// Directory of the layer sidecars written by `index`.
+    #[arg(long, value_name = "DIR")]
+    pub index: Utf8PathBuf,
+
+    /// Directory to write one `<manifest hex>.rootfs` into per manifest.
+    #[arg(long, value_name = "DIR")]
+    pub output: Utf8PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -39,6 +57,10 @@ pub struct ProfileArgs {
     /// holds without reading it.
     #[arg(long, value_name = "DIR")]
     pub index: Utf8PathBuf,
+
+    /// Directory of rootfs tables, checked against in place of planning.
+    #[arg(long, value_name = "DIR")]
+    pub rootfs_tables: Option<Utf8PathBuf>,
 
     /// File to write when the profile passes, for a build that needs an
     /// output to depend on.
@@ -67,6 +89,11 @@ pub struct IndexArgs {
     #[arg(long, value_name = "PATH")]
     pub output: Utf8PathBuf,
 
+    /// With `--layout`, also resolve every manifest into this directory, as
+    /// `stitch` does.
+    #[arg(long, value_name = "DIR", requires = "layout")]
+    pub rootfs_tables: Option<Utf8PathBuf>,
+
     /// Target uncompressed distance between checkpoints, in bytes.
     #[arg(long, value_name = "BYTES", default_value_t = 4 << 20)]
     pub span: u64,
@@ -92,6 +119,11 @@ pub struct RunArgs {
     /// compressed layer.
     #[arg(long, value_name = "DIR")]
     pub index: Option<Utf8PathBuf>,
+
+    /// Directory of rootfs tables, one `<manifest hex>.rootfs` per platform
+    /// manifest, used in place of planning the image at run time.
+    #[arg(long, value_name = "DIR")]
+    pub rootfs_tables: Option<Utf8PathBuf>,
 
     /// Profile of what a container read, fetched ahead of this one. Repeatable:
     /// the profile recorded for the image platform in use is the one read.

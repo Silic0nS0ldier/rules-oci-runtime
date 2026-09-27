@@ -1464,15 +1464,23 @@ enum Route {
     /// Uncompressed layers with entry tables: the spans are windows over the
     /// blob, made at run time since there is nothing to record.
     StoredSpans,
+    /// Every sidecar, and the rootfs table stitched from them: the plan is
+    /// read rather than made.
+    Stitched,
 }
 
+/// The manifest the stitched route's rootfs table is recorded for.
+const STITCHED_MANIFEST: &str =
+    "sha256:5717c4ed5717c4ed5717c4ed5717c4ed5717c4ed5717c4ed5717c4ed5717c4ed";
+
 impl Route {
-    const ALL: [Route; 5] = [
+    const ALL: [Route; 6] = [
         Route::Streaming,
         Route::Planned,
         Route::Spans,
         Route::ZstdSpans,
         Route::StoredSpans,
+        Route::Stitched,
     ];
 
     /// Frames are the only place a zstd span can start, so the fixtures are
@@ -1503,6 +1511,7 @@ fn install_for(
     fs::create_dir_all(&index_dir).expect("index dir");
 
     let mut descriptors = Vec::new();
+    let mut tables = Vec::new();
     for tar in layers {
         let (media_type, blob) = route.compress(tar);
         let descriptor = install_blob(root, media_type, &blob);
@@ -1514,8 +1523,9 @@ fn install_for(
             let mut bytes = Vec::new();
             table.write_to(&mut bytes).expect("serialise");
             fs::write(index_dir.join(format!("{hex}.entries")), bytes).expect("install table");
+            tables.push(table);
         }
-        if matches!(route, Route::Spans | Route::ZstdSpans) {
+        if matches!(route, Route::Spans | Route::ZstdSpans | Route::Stitched) {
             let flavor = flavor_of(media_type).expect("an indexable layer");
             let index = zinfo::Index::build(flavor, &blob, route.span_bytes()).expect("index");
             let mut bytes = Vec::new();
@@ -1524,7 +1534,25 @@ fn install_for(
         }
         descriptors.push(descriptor);
     }
+    if matches!(route, Route::Stitched) {
+        let dir = index_dir.join("rootfs");
+        fs::create_dir_all(&dir).expect("rootfs table dir");
+        let stitched = crate::rootfs::Table::stitch(STITCHED_MANIFEST, "", &descriptors, tables);
+        if let Some(table) = stitched {
+            let mut bytes = Vec::new();
+            table.write_to(&mut bytes).expect("serialise");
+            let hex = parse_digest(STITCHED_MANIFEST).expect("digest").hex;
+            fs::write(dir.join(format!("{hex}.rootfs")), bytes).expect("install rootfs table");
+        }
+    }
     (index_dir, descriptors)
+}
+
+/// Points the stitched route at its rootfs tables.
+fn read_rootfs_tables(route: Route, extractor: &mut RootfsExtractor, index_dir: &Utf8Path) {
+    if matches!(route, Route::Stitched) {
+        extractor.use_rootfs_tables(&index_dir.join("rootfs"), STITCHED_MANIFEST);
+    }
 }
 
 /// Applies `layers` by the given route, installing exactly the sidecars that
@@ -1546,6 +1574,7 @@ fn extract_by(
         _ => Some(index_dir.as_path()),
     };
     let mut extractor = RootfsExtractor::new(&rootfs, dir, strict_xattrs)?;
+    read_rootfs_tables(route, &mut extractor, &index_dir);
     extractor.plan(&descriptors)?;
 
     // A route that quietly falls back to another one would compare equal for
@@ -1564,7 +1593,13 @@ fn extract_by(
                 "the planned route must have no checkpoint index to fall back on"
             );
         }
-        Route::Spans | Route::ZstdSpans | Route::StoredSpans => {
+        Route::Spans | Route::ZstdSpans | Route::StoredSpans | Route::Stitched => {
+            if matches!(route, Route::Stitched) {
+                let hex = parse_digest(STITCHED_MANIFEST).expect("digest").hex;
+                let path = index_dir.join("rootfs").join(format!("{hex}.rootfs"));
+                let bytes = fs::read(&path).expect("a rootfs table was stitched");
+                crate::rootfs::Table::read_from(&bytes[..]).expect("a readable rootfs table");
+            }
             assert!(
                 extractor.plan.work().is_some(),
                 "the plan must produce work"
@@ -1597,6 +1632,7 @@ fn apply_by(route: Route, root: &Utf8Path, layers: &[Vec<u8>]) -> (Result<Utf8Pa
     let applied = (|| {
         let layout = Layout::open(root)?;
         let mut extractor = RootfsExtractor::new(&rootfs, dir, true)?;
+        read_rootfs_tables(route, &mut extractor, &index_dir);
         extractor.plan(&descriptors)?;
         placed = extractor.plan.work().is_some();
         extractor.apply(&layout, &descriptors)?;
