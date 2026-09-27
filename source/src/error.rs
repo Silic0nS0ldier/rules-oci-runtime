@@ -80,6 +80,12 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    /// A body inflated from a verified layer does not hash to what the tables
+    /// say it holds.
+    ContentMismatch {
+        layer: String,
+        offset: u64,
+    },
 }
 
 impl Error {
@@ -181,6 +187,11 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "{path} was built from {actual:?}, not {expected}; the index and the image are out of step"
+            ),
+            Error::ContentMismatch { layer, offset } => write!(
+                f,
+                "the file at offset {offset} of layer {layer} does not hash to what the image's \
+                 tables say; the index and the image are out of step"
             ),
         }
     }

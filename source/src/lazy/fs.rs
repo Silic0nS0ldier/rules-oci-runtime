@@ -16,11 +16,12 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
@@ -31,8 +32,9 @@ use fuser::{
 
 use super::source::{Scratch, Source};
 use super::tree::{Bodies, Body, Content, Kind, Node, ROOT, Special, Tree};
-use crate::error::IoContext;
+use crate::error::{Error, IoContext};
 use crate::log::log;
+use crate::store::{self, Store};
 
 /// How long the kernel may trust what it was told. Everything that changes the
 /// tree comes through here, so a longer life would only risk a stale answer to
@@ -69,6 +71,7 @@ impl Rootfs {
         uid: u32,
         gid: u32,
         recorder: Option<Arc<Recorder>>,
+        store: Option<Arc<Store>>,
     ) -> Rootfs {
         Rootfs {
             served: Arc::new(Served {
@@ -87,6 +90,10 @@ impl Rootfs {
                 recorder,
                 demand: Demand::default(),
                 waited: AtomicU64::new(0),
+                store,
+                inflated: AtomicU64::new(0),
+                failure: Mutex::new(None),
+                on_failure: OnceLock::new(),
             }),
         }
     }
@@ -141,6 +148,15 @@ pub struct Served {
     /// fetching ahead is for is this number, and unlike a clock it says the
     /// same thing on a busy host as on an idle one.
     waited: AtomicU64,
+    /// Where bodies are shared with other launches, when there is one.
+    store: Option<Arc<Store>>,
+    /// How many spans were inflated, which a warm store takes to nothing.
+    inflated: AtomicU64,
+    /// The first sign that the image's tables and its layers disagree, which
+    /// ends the run.
+    failure: Mutex<Option<Error>>,
+    /// Stops the container once there is a failure.
+    on_failure: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// The image files something opened, in the order it reached them.
@@ -231,6 +247,8 @@ impl Demand {
 struct Handle {
     file: Arc<File>,
     _backing: Option<Arc<BackingId>>,
+    /// A store object, which nothing may write through.
+    object: bool,
 }
 
 impl Served {
@@ -255,7 +273,7 @@ impl Served {
         let node = tree.get(ino).ok_or(Errno::ENOENT)?;
         match &node.kind {
             Kind::File(Content::Layer(body)) => Ok(Some((*body, node.mtime))),
-            Kind::File(Content::Backed) => Ok(None),
+            Kind::File(Content::Backed | Content::Object { .. }) => Ok(None),
             Kind::Directory { .. } => Err(Errno::EISDIR),
             _ => Err(Errno::EINVAL),
         }
@@ -276,9 +294,21 @@ impl Served {
     /// slow thing here, and holding it would stop every other request for as
     /// long as it took.
     fn fetch(&self, ino: u64) -> Result<bool, Errno> {
-        let Some((body, _)) = self.owed(ino)? else {
+        let Some((body, mtime)) = self.owed(ino)? else {
             return Ok(false);
         };
+        // Neither of these has anything to inflate.
+        if body.size == 0 {
+            self.place(ino, &[], mtime)
+                .map_err(|err| self.failed(err))?;
+            return Ok(false);
+        }
+        if let Some(object) = self.from_store(body) {
+            self.commit_object(ino, object, body.size)
+                .map_err(|err| self.failed(err))?;
+            return Ok(false);
+        }
+
         let claim = self.source.span_of(body) * self.layers + body.layer as usize;
         // The lock guards nothing of its own, so a worker that panicked while
         // holding it leaves the rest of the session usable.
@@ -292,11 +322,55 @@ impl Served {
 
         SCRATCH
             .with(|scratch| self.fetch_span(body, &mut scratch.borrow_mut()))
-            .map_err(|err| {
-                crate::log::warn(format!("could not fetch an image file: {err}"));
-                Errno::EIO
-            })?;
+            .map_err(|err| self.failed(err))?;
         Ok(true)
+    }
+
+    fn from_store(&self, body: Body) -> Option<File> {
+        self.store
+            .as_ref()?
+            .lookup(body.sha256.as_ref()?, body.size)
+    }
+
+    /// What a failed fetch tells the kernel. A body that does not hash to what
+    /// the tables say means the image's inputs are wrong, which ends the run
+    /// rather than just the read.
+    fn failed(&self, err: Error) -> Errno {
+        if !matches!(err, Error::ContentMismatch { .. }) {
+            crate::log::warn(format!("could not fetch an image file: {err}"));
+            return Errno::EIO;
+        }
+        let mut failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if failure.is_none() {
+            crate::log::warn(format!("stopping the container: {err}"));
+            *failure = Some(err);
+            drop(failure);
+            if let Some(stop) = self.on_failure.get() {
+                stop();
+            }
+        }
+        Errno::EIO
+    }
+
+    /// Says how to stop the container should the image turn out to be wrong.
+    pub fn on_failure(&self, stop: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.on_failure.set(stop);
+    }
+
+    /// Why the run has to fail, if it does.
+    pub fn take_failure(&self) -> Option<Error> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// How many spans were inflated.
+    pub fn inflated(&self) -> u64 {
+        self.inflated.load(Ordering::Relaxed)
     }
 
     /// Fetches for the container itself. What the container is waiting on is
@@ -324,6 +398,7 @@ impl Served {
 
     fn fetch_span(&self, body: Body, scratch: &mut Scratch) -> crate::error::Result<()> {
         let window = self.source.inflate(body, scratch)?;
+        self.inflated.fetch_add(1, Ordering::Relaxed);
         let owed: Vec<(u64, Body, u64)> = {
             let tree = self.read_tree().map_err(io_error)?;
             self.bodies
@@ -342,14 +417,95 @@ impl Served {
             let Ok(bytes) = self.source.bytes(body, &window, scratch) else {
                 continue;
             };
-            let staged = self.backing.join(format!(
-                "{ino}.{}.part",
-                self.next_handle.fetch_add(1, Ordering::Relaxed)
-            ));
-            Source::place(&staged, bytes, mtime)?;
-            self.commit(ino, &staged)?;
+            if let Some(object) = self.publish(body, bytes)? {
+                self.commit_object(ino, object, body.size)?;
+                continue;
+            }
+            self.place(ino, bytes, mtime)?;
         }
         Ok(())
+    }
+
+    /// Publishes a body to the store, checking it first, or `None` when there
+    /// is no store to take it.
+    fn publish(&self, body: Body, bytes: &[u8]) -> crate::error::Result<Option<File>> {
+        let (Some(store), Some(sha256)) = (&self.store, &body.sha256) else {
+            return Ok(None);
+        };
+        if !store.is_writable() || body.size == 0 {
+            return Ok(None);
+        }
+        if !store::holds(sha256, bytes) {
+            return Err(Error::ContentMismatch {
+                layer: self.source.digest(body.layer).to_string(),
+                offset: body.offset,
+            });
+        }
+        Ok(store.publish(sha256, bytes))
+    }
+
+    /// Writes a body out as the file's backing file.
+    fn place(&self, ino: u64, bytes: &[u8], mtime: u64) -> crate::error::Result<()> {
+        let staged = self.staging(ino);
+        Source::place(&staged, bytes, mtime)?;
+        self.commit(ino, &staged)
+    }
+
+    fn staging(&self, ino: u64) -> PathBuf {
+        self.backing.join(format!(
+            "{ino}.{}.part",
+            self.next_handle.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Serves a file from a store object, unless it has stopped being the
+    /// image's in the meantime.
+    fn commit_object(&self, ino: u64, file: File, size: u64) -> crate::error::Result<()> {
+        let mut tree = self.write_tree().map_err(io_error)?;
+        if let Some(Kind::File(content @ Content::Layer(_))) =
+            tree.get_mut(ino).map(|node| &mut node.kind)
+        {
+            *content = Content::Object {
+                file: Arc::new(file),
+                size,
+            };
+        }
+        Ok(())
+    }
+
+    /// The store object a file is served from, if it is.
+    fn object_of(&self, ino: u64) -> Result<Option<Arc<File>>, Errno> {
+        let tree = self.read_tree()?;
+        match &tree.get(ino).ok_or(Errno::ENOENT)?.kind {
+            Kind::File(Content::Object { file, .. }) => Ok(Some(file.clone())),
+            _ => Ok(None),
+        }
+    }
+
+    /// Gives a file served from the store a backing file of its own, which is
+    /// what anything changing it has to change. Objects are shared with every
+    /// other launch, so nothing is ever written to one.
+    fn copy_up(&self, ino: u64) -> Result<(), Errno> {
+        let Some(object) = self.object_of(ino)? else {
+            return Ok(());
+        };
+        let mtime = self.read_tree()?.get(ino).ok_or(Errno::ENOENT)?.mtime;
+        let staged = self.staging(ino);
+        let copied = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)
+            .and_then(|mut copy| {
+                clone_into(&object, &mut copy)?;
+                set_mtime(&copy, mtime);
+                Ok(())
+            });
+        if let Err(err) = copied {
+            let _ = fs::remove_file(&staged);
+            return Err(err.into());
+        }
+        self.commit(ino, &staged).map_err(|err| self.failed(err))
     }
 
     /// Puts a staged body in place, unless the file stopped being the image's
@@ -358,7 +514,7 @@ impl Served {
     fn commit(&self, ino: u64, staged: &std::path::Path) -> crate::error::Result<()> {
         let mut tree = self.write_tree().map_err(io_error)?;
         match tree.get_mut(ino).map(|node| &mut node.kind) {
-            Some(Kind::File(content @ Content::Layer(_))) => {
+            Some(Kind::File(content @ (Content::Layer(_) | Content::Object { .. }))) => {
                 fs::rename(staged, self.backing_path(ino))
                     .io_context(|| format!("placing {}", self.backing_path(ino).display()))?;
                 *content = Content::Backed;
@@ -370,16 +526,24 @@ impl Served {
         Ok(())
     }
 
-    fn open_backing(&self, ino: u64) -> Result<Arc<File>, Errno> {
+    /// What an open of `ino` reads and writes, and whether that is a store
+    /// object. One is only handed out to an open that cannot write.
+    fn open_content(&self, ino: u64, write: bool) -> Result<(Arc<File>, bool), Errno> {
         self.fetch_now(ino)?;
+        if let Some(object) = self.object_of(ino)? {
+            if !write {
+                return Ok((object, true));
+            }
+            self.copy_up(ino)?;
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(self.backing_path(ino))?;
-        Ok(Arc::new(file))
+        Ok((Arc::new(file), false))
     }
 
-    fn hold(&self, file: Arc<File>, backing: Option<Arc<BackingId>>) -> FileHandle {
+    fn hold(&self, file: Arc<File>, backing: Option<Arc<BackingId>>, object: bool) -> FileHandle {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handles
             .lock()
@@ -389,6 +553,7 @@ impl Served {
                 Handle {
                     file,
                     _backing: backing,
+                    object,
                 },
             );
         FileHandle(handle)
@@ -399,6 +564,17 @@ impl Served {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&handle.0)
+            .map(|handle| handle.file.clone())
+            .ok_or(Errno::EBADF)
+    }
+
+    /// The same, for a write, which a store object never takes.
+    fn held_for_writing(&self, handle: FileHandle) -> Result<Arc<File>, Errno> {
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&handle.0)
+            .filter(|handle| !handle.object)
             .map(|handle| handle.file.clone())
             .ok_or(Errno::EBADF)
     }
@@ -447,6 +623,7 @@ impl Served {
             Kind::Directory { .. } => (FileType::Directory, BLOCK_SIZE as u64, node.mtime),
             Kind::Symlink(target) => (FileType::Symlink, target.len() as u64, node.mtime),
             Kind::File(Content::Layer(body)) => (FileType::RegularFile, body.size, node.mtime),
+            Kind::File(Content::Object { size, .. }) => (FileType::RegularFile, *size, node.mtime),
             // The container may have changed it since it was fetched, and the
             // backing file is the only place that would show.
             Kind::File(Content::Backed) => match fs::metadata(self.backing_path(ino)) {
@@ -605,6 +782,7 @@ impl Filesystem for Rootfs {
         // owned by whoever ran it, and so does this.
         if let Some(size) = size {
             answer!(reply, self.fetch_now(ino.0));
+            answer!(reply, self.copy_up(ino.0));
             let file = answer!(
                 reply,
                 fs::OpenOptions::new()
@@ -646,17 +824,23 @@ impl Filesystem for Rootfs {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if let Some(recorder) = &self.recorder {
             recorder.saw(ino.0);
         }
-        let file = answer!(reply, self.open_backing(ino.0));
+        let write = flags.0 & libc::O_ACCMODE != libc::O_RDONLY || flags.0 & libc::O_TRUNC != 0;
+        let (file, object) = answer!(reply, self.open_content(ino.0, write));
+        // A store object is read here rather than handed to the kernel, whose
+        // one reference per inode would outlive a later copy-up.
+        if object {
+            return reply.opened(self.hold(file, None, true), FopenFlags::empty());
+        }
         match self.backing(ino.0, &file, |fd| reply.open_backing(fd)) {
             Some(backing) => {
-                let handle = self.hold(file, Some(backing.clone()));
+                let handle = self.hold(file, Some(backing.clone()), false);
                 reply.opened_passthrough(handle, FopenFlags::empty(), &backing);
             }
-            None => reply.opened(self.hold(file, None), FopenFlags::empty()),
+            None => reply.opened(self.hold(file, None, false), FopenFlags::empty()),
         }
     }
 
@@ -697,7 +881,7 @@ impl Filesystem for Rootfs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let file = answer!(reply, self.held(fh));
+        let file = answer!(reply, self.held_for_writing(fh));
         let mut written = 0;
         while written < data.len() {
             match file.write_at(&data[written..], offset + written as u64) {
@@ -841,7 +1025,7 @@ impl Filesystem for Rootfs {
         let file = Arc::new(file);
         match self.backing(ino, &file, |fd| reply.open_backing(fd)) {
             Some(backing) => {
-                let handle = self.hold(file, Some(backing.clone()));
+                let handle = self.hold(file, Some(backing.clone()), false);
                 reply.created_passthrough(
                     &TTL,
                     &attr,
@@ -855,7 +1039,7 @@ impl Filesystem for Rootfs {
                 &TTL,
                 &attr,
                 GENERATION,
-                self.hold(file, None),
+                self.hold(file, None, false),
                 FopenFlags::empty(),
             ),
         }
@@ -1087,6 +1271,60 @@ fn kind_of(node: &Node) -> FileType {
         Kind::Special(Special::Socket) => FileType::Socket,
         _ => FileType::RegularFile,
     }
+}
+
+/// Copies `from` into the empty `to`: by sharing extents where the filesystem
+/// can, in the kernel where it cannot, and through memory where neither will.
+fn clone_into(from: &File, to: &mut File) -> std::io::Result<()> {
+    // SAFETY: both descriptors are open for the duration of the call.
+    if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+    let len = from.metadata()?.len();
+    let mut copied = 0u64;
+    while copied < len {
+        let (mut at_from, mut at_to) = (copied as i64, copied as i64);
+        // SAFETY: the offsets are this function's own, and both descriptors
+        // are open.
+        let n = unsafe {
+            libc::copy_file_range(
+                from.as_raw_fd(),
+                &mut at_from,
+                to.as_raw_fd(),
+                &mut at_to,
+                (len - copied) as usize,
+                0,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        copied += n as u64;
+    }
+    if copied == len {
+        return Ok(());
+    }
+    let mut buffer = vec![0u8; 1 << 20];
+    while copied < len {
+        let n = from.read_at(&mut buffer, copied)?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        to.write_all_at(&buffer[..n], copied)?;
+        copied += n as u64;
+    }
+    Ok(())
+}
+
+fn set_mtime(file: &File, mtime: u64) {
+    let time = libc::timespec {
+        tv_sec: mtime as libc::time_t,
+        tv_nsec: 0,
+    };
+    let times = [time, time];
+    // SAFETY: the descriptor is open and `times` holds the two values
+    // futimens reads.
+    let _ = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
 }
 
 fn now() -> u64 {

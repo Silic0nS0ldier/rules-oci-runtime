@@ -42,6 +42,24 @@ impl Runc {
         command.arg("--root").arg(request.state_dir.as_std_path());
         command
     }
+
+    /// Kills the container `request` started, from wherever the run finds out
+    /// it has to stop.
+    pub fn killer(&self, request: &RunRequest<'_>) -> impl Fn() + Send + Sync + 'static {
+        let binary = self.binary.clone();
+        let state_dir = request.state_dir.to_owned();
+        let id = request.id.to_string();
+        move || {
+            let _ = Command::new(binary.as_std_path())
+                .arg("--root")
+                .arg(state_dir.as_std_path())
+                .args(["kill", &id, "KILL"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 impl ContainerRuntime for Runc {
