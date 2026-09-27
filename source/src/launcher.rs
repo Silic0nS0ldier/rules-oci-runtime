@@ -17,6 +17,9 @@ struct Config {
     runtime: String,
     #[serde(default)]
     index: Option<String>,
+    /// The resolved image of each manifest, recorded at build time.
+    #[serde(default)]
+    rootfs: Option<String>,
     /// Profiles of what this container read before, one per platform.
     #[serde(default)]
     profiles: Vec<String>,
@@ -86,6 +89,10 @@ impl Config {
             argv.push("--index".to_string());
             argv.push(runfiles.join(index).into_string());
         }
+        if let Some(rootfs) = &self.rootfs {
+            argv.push("--rootfs-tables".to_string());
+            argv.push(runfiles.join(rootfs).into_string());
+        }
         for profile in &self.profiles {
             argv.push("--profile".to_string());
             argv.push(runfiles.join(profile).into_string());
@@ -145,6 +152,19 @@ mod tests {
         assert_eq!(
             &argv[argv.len() - 2..],
             ["--index", "/tmp/rf/ws/pkg/container.zinfo"]
+        );
+    }
+
+    #[test]
+    fn a_rootfs_table_directory_is_resolved_and_passed_through() {
+        let config: Config = serde_json::from_str(
+            r#"{"layout": "l", "runtime": "r", "rootfs": "ws/pkg/container.rootfs"}"#,
+        )
+        .expect("config");
+        let argv = config.command_line("launcher", Utf8Path::new("/tmp/rf"), &[]);
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            ["--rootfs-tables", "/tmp/rf/ws/pkg/container.rootfs"]
         );
     }
 

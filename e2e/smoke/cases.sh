@@ -167,6 +167,23 @@ case_layer_indexes() {
     fail "expected an entry table per layer index, got ${tables} and ${checkpoints}"
   fi
 
+  local rootfs_path
+  rootfs_path=$(sed -n 's/.*"rootfs":"\([^"]*\)".*/\1/p' "$config")
+  if [[ -z "$rootfs_path" ]]; then
+    fail "no rootfs entry in $(cat "$config")"
+    return
+  fi
+  local rootfs_tables=0
+  for entry in "${runfiles}/${rootfs_path}"/*; do
+    case "$(basename "$entry")" in
+      [0-9a-f]*.rootfs) rootfs_tables=$((rootfs_tables + 1)) ;;
+      *) fail "unexpected rootfs table ${entry}" ;;
+    esac
+  done
+  if [[ "$rootfs_tables" -eq 0 ]]; then
+    fail "no rootfs tables in ${runfiles}/${rootfs_path}"
+  fi
+
   # The launcher must actually consume the indexes during extraction. It
   # deliberately ignores them on a single core, where they cannot help.
   if [[ "$(nproc)" -lt 2 ]]; then
@@ -177,6 +194,7 @@ case_layer_indexes() {
     fail "container failed"
   stderr=$(cat "${TEST_TMPDIR}/index.err")
   assert_contains "$stderr" "checkpoints" "layers extract via their indexes"
+  assert_contains "$stderr" "Read the resolved image" "the image is planned at build time"
 }
 
 # A zstd layer on a gzip base: compression is a property of the layer, and

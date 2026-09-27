@@ -93,16 +93,26 @@ def _runc_binary_impl(ctx):
     indexes = []
     if ctx.attr.index:
         index_dir = ctx.actions.declare_directory(ctx.label.name + ".zinfo")
+        rootfs_dir = ctx.actions.declare_directory(ctx.label.name + ".rootfs")
         ctx.actions.run(
             executable = ctx.attr._tool[DefaultInfo].files_to_run,
-            arguments = ["index", "--layout", layout.path, "--output", index_dir.path],
+            arguments = [
+                "index",
+                "--layout",
+                layout.path,
+                "--output",
+                index_dir.path,
+                "--rootfs-tables",
+                rootfs_dir.path,
+            ],
             inputs = [layout],
-            outputs = [index_dir],
+            outputs = [index_dir, rootfs_dir],
             mnemonic = "OciLayerIndex",
-            progress_message = "Indexing gzip layers of %{label}",
+            progress_message = "Indexing layers of %{label}",
         )
         content["index"] = _rlocation_path(ctx, index_dir)
-        indexes.append(index_dir)
+        content["rootfs"] = _rlocation_path(ctx, rootfs_dir)
+        indexes.extend([index_dir, rootfs_dir])
 
     profiles, checks = _profiles(ctx, layout, indexes)
     if profiles:
@@ -164,6 +174,8 @@ def _profiles(ctx, layout, indexes):
                 layout.path,
                 "--index",
                 indexes[0].path,
+                "--rootfs-tables",
+                indexes[1].path,
                 "--stamp",
                 checked.path,
             ],

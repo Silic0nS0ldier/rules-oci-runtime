@@ -1,6 +1,7 @@
 # Shared content cache
 
-Status: proposed. Nothing here is implemented yet.
+Status: in progress. Delivery step 1 (tables) is implemented; the rest is
+proposed.
 
 ## Problem
 
@@ -90,11 +91,12 @@ and every launch walks their tar headers, which first needs the whole layer
 hashed. For these layers:
 
 - Offsets point straight into the blob.
-- There is no `.zinfo`.
+- There is no `.zinfo`. The launcher makes a `Stored` index in memory
+  instead, so the span route and FUSE take these layers like any other.
 - The index action walks the headers and hashes the bodies, with nothing to
   inflate.
-- Spans are fixed-size windows over the blob (`--span`, 4 MiB by default).
-  They exist only to key claims.
+- Spans are fixed 4 MiB windows over the blob, chosen at run time since
+  nothing records them. They exist only to key claims and size work units.
 
 ### Rootfs table (`OTR1`)
 
@@ -104,37 +106,42 @@ runtime planning when present. It is produced by a new subcommand,
 
 It contains:
 
-- **Header:** magic, format version, manifest digest, platform.
-- **Layers:** the layers that still contribute at least one entry, with
-  digest and media type. A layer that is fully shadowed is left out, so it is
-  never verified, mapped or given a checkpoint index at runtime.
-- **Nodes:** ordered with parents before children, which is what
-  [`Tree::build`](../source/src/lazy/tree.rs) consumes. Each node has path,
-  kind, mode, mtime, xattr names and link target. Regular files also have:
-  - `size`, `sha256`;
-  - source `(layer index, offset)`, which is needed to inflate on a miss;
-  - a sparse flag. A sparse miss needs that layer's tar stream walked.
-- **What is dropped:** shadowed entries, whiteouts, opaque markers. Hard links
-  are resolved to their final groups, including links across layers.
-  `Unsupported` entries are kept, so warnings and `--strict-xattrs` behave as
-  they do today.
+- **Header:** magic, manifest digest, platform.
+- **Layers:** every manifest layer in order, with its digest and only the
+  entries something is placed from. A layer that is fully shadowed is empty,
+  so it can be left unverified and unmapped at runtime.
+- **Directories**, parents before children, which is what
+  [`Tree::build`](../source/src/lazy/tree.rs) consumes.
+- **Work:** per layer the files in stream order, then symlinks and hard
+  links, as indices into the layers above. Each entry keeps path, kind, mode,
+  mtime, link target and, for files, `size`, `sha256` and its offset in the
+  layer, which is needed to inflate on a miss.
+- **Extended attribute names** of every entry, shadowed ones included, so
+  warnings and `--strict-xattrs` behave as they do today.
+- **What is dropped:** shadowed entries, whiteouts, opaque markers, and
+  `Unsupported` entries (the tree never holds them).
+
+An image that only the walk can place (a sparse file, an entry resolved
+through a symlink, a hard link the plan cannot follow) gets no rootfs table,
+and is planned and walked at runtime as before. Every index, kind and path in
+a table is checked when it is read.
 
 Checkpoint indexes (`.zinfo`) stay one per compressed layer. They could be
 trimmed to checkpoints for spans that contain surviving files, because gzip
 checkpoints carry 32 KiB windows. That trimming is optional.
 
-At runtime, the launcher uses the rootfs table whose manifest digest matches
-the manifest it resolved. With no match, it uses today's path (per-layer tables
-plus `Plan::build`).
+At runtime, `--rootfs-tables DIR` names the directory, and the launcher reads
+`<manifest hex>.rootfs` for the manifest it resolved. With no such file, it
+uses today's path (per-layer tables plus `Plan::build`).
 
 ### Bazel wiring
 
 - **Phase A (no dependency on upstream):** keep one `OciLayerIndex` action per
-  image ([runc_binary.bzl](../lib/private/runc_binary.bzl)). It writes the
-  `OTE3` tables into the existing `<name>.zinfo/` directory. It also writes
-  one `OTR1` table per platform manifest into a new `<name>.rootfs/`
-  directory, which `.launch.json` names as `rootfs`. The runtime benefits land
-  here.
+  image ([runc_binary.bzl](../lib/private/runc_binary.bzl)), running
+  `index --layout ... --rootfs-tables`. It writes the `OTE3` tables into the
+  existing `<name>.zinfo/` directory, and one `OTR1` table per platform
+  manifest into a new `<name>.rootfs/` directory, which `.launch.json` names
+  as `rootfs`. The runtime benefits land here.
 - **Phase B (`ctx.actions.map_directory`):** fan out over the layout, with one
   `oci_runtime index --blob` action per file under `blobs/sha256/`, each
   writing `<hex>.zinfo` and `<hex>.entries` into `<name>.zinfo/`. A separate
@@ -168,8 +175,8 @@ plus `Plan::build`).
     no layout that works today is lost. If `map_directory` turns out not to
     work for source directories once they are accepted, drop Phase B and keep
     Phase A.
-- `OciProfileCheck` switches to checking against the rootfs table instead of
-  replanning.
+- `OciProfileCheck` passes `--rootfs-tables`, so it checks against the rootfs
+  table instead of replanning.
 
 ## The store
 
@@ -412,7 +419,7 @@ today.
 - Verify only layers that are actually read from, before the first byte from
   each is used. A launch where every file is a hit hashes no blobs, including
   uncompressed ones.
-- Layers that the rootfs table leaves out are never verified.
+- Layers the rootfs table holds no entries for are never verified.
 - On the FUSE route, a background low-priority pass may verify the
   contributing layers early, so the first miss does not pay for a full hash.
   The first inflate from a layer still waits for that layer's check. That
