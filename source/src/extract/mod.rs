@@ -33,7 +33,7 @@ use crate::zinfo;
 use pipeline::{ChunkReader, PIPELINE_DEPTH, Sink, buffer_pool, inflate_blob, inflate_indexed};
 
 pub use pipeline::{Compression, compression_of, decompressed};
-pub use plan::{Plan, Work};
+pub use plan::{Plan, Work, Xattrs};
 
 /// The window an uncompressed layer is cut into. Nothing is inflated, so this
 /// only sets how much one unit of work copies. Small under test, so that the
@@ -56,6 +56,8 @@ pub struct RootfsExtractor {
     /// Refuse an image that asks for extended attributes, rather than
     /// extracting one the container will not match.
     strict_xattrs: bool,
+    /// Where the rootfs tables are, and the manifest to look one up for.
+    rootfs_tables: Option<(Utf8PathBuf, String)>,
 }
 
 impl RootfsExtractor {
@@ -73,6 +75,7 @@ impl RootfsExtractor {
             plan: plan::Plan::default(),
             written: BTreeSet::new(),
             strict_xattrs,
+            rootfs_tables: None,
         })
     }
 
@@ -100,22 +103,47 @@ impl RootfsExtractor {
     }
 
     /// Resolves the image before extracting it, so that entries a later layer
-    /// replaces are never written. Without an entry table for every layer this
-    /// plans nothing and each layer is placed in full, as before.
+    /// replaces are never written. A rootfs table recorded for this manifest
+    /// is the plan already made; without one, the entry tables are planned
+    /// here. Without an entry table for every layer this plans nothing and
+    /// each layer is placed in full, as before.
     pub fn plan(&mut self, layers: &[Descriptor]) -> Result<()> {
-        self.plan = plan::Plan::build(self.index_dir.as_deref(), layers)?;
+        self.plan = match self.recorded_plan(layers)? {
+            Some(plan) => plan,
+            None => plan::Plan::build(self.index_dir.as_deref(), layers)?,
+        };
         if !self.plan.is_resolved() {
             return Ok(());
         }
 
         // The tables describe every layer, so this is the whole image in one
         // pass; the walk reports the same thing when there are no tables.
-        for (descriptor, table) in layers.iter().zip(self.plan.tables()) {
-            for entry in &table.entries {
-                self.report_xattrs(&descriptor.digest, &entry.path, &entry.xattrs)?;
-            }
+        for (layer, path, names) in self.plan.xattrs() {
+            self.report_xattrs(&layers[*layer as usize].digest, path, names)?;
         }
         Ok(())
+    }
+
+    /// Plans from the rootfs table recorded for `manifest` in `dir`, where
+    /// there is one.
+    pub fn use_rootfs_tables(&mut self, dir: &Utf8Path, manifest: &str) {
+        self.rootfs_tables = Some((dir.to_owned(), manifest.to_string()));
+    }
+
+    fn recorded_plan(&self, layers: &[Descriptor]) -> Result<Option<Plan>> {
+        let Some((dir, manifest)) = &self.rootfs_tables else {
+            return Ok(None);
+        };
+        let Ok(digest) = parse_digest(manifest) else {
+            return Ok(None);
+        };
+        let path = crate::sidecar::rootfs_at(dir, &digest.hex);
+        let Some(table) = crate::sidecar::read(&path, crate::rootfs::Table::read_from) else {
+            return Ok(None);
+        };
+        let plan = table.into_plan(&path, manifest, layers)?;
+        log!("Read the resolved image from {path}");
+        Ok(Some(plan))
     }
 
     /// Creates the directories the image ends up with, so that nothing placing

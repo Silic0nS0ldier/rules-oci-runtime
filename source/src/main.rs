@@ -9,6 +9,7 @@ mod launcher;
 mod lazy;
 mod log;
 mod profile;
+mod rootfs;
 mod runtime;
 mod sidecar;
 mod spec;
@@ -48,6 +49,9 @@ fn main() -> std::process::ExitCode {
         match cli.command {
             Command::Run(args) => run(*args),
             Command::Index(args) => index(args),
+            Command::Stitch(args) => {
+                stitch_layout(&args.layout, &args.index, &args.output).map(|()| 0)
+            }
             Command::Profile(args) => check_profile(&args),
         }
     });
@@ -89,6 +93,9 @@ fn run(args: RunArgs) -> Result<i32> {
 
     let rootfs = bundle.rootfs();
     let mut extractor = RootfsExtractor::new(&rootfs, args.index.as_deref(), args.strict_xattrs)?;
+    if let Some(dir) = &args.rootfs_tables {
+        extractor.use_rootfs_tables(dir, &manifest.digest);
+    }
     extractor.plan(&manifest.layers)?;
 
     let recording = recording_destination(&args, &platform)?;
@@ -337,6 +344,9 @@ fn check_profile(args: &ProfileArgs) -> Result<i32> {
         })?
         .join(format!("rules-oci-runtime-check-{}", sys::random_hex(8)?));
     let mut extractor = RootfsExtractor::new(&scratch, Some(&args.index), false)?;
+    if let Some(dir) = &args.rootfs_tables {
+        extractor.use_rootfs_tables(dir, &manifest.digest);
+    }
     let checked = extractor
         .plan(&manifest.layers)
         .and_then(|()| Ok(lazy::absent(&extractor, &manifest.layers, profile.paths())));
@@ -388,8 +398,65 @@ fn index(args: IndexArgs) -> Result<i32> {
         )?;
     } else if let Some(layout) = &args.layout {
         index_layout(layout, &args.output, args.span)?;
+        if let Some(tables) = &args.rootfs_tables {
+            stitch_layout(layout, &args.output, tables)?;
+        }
     }
     Ok(0)
+}
+
+/// Resolves every manifest in the layout from the entry tables in `index`,
+/// writing a rootfs table for each one that can be placed from a plan.
+///
+/// A manifest missing a layer's table, or one only a walk can place, gets no
+/// table and is planned (or walked) at run time as before.
+fn stitch_layout(layout: &Utf8Path, index: &Utf8Path, output: &Utf8Path) -> Result<()> {
+    let layout = Layout::open(layout)?;
+    std::fs::create_dir_all(output)
+        .map_err(|source| Error::io(format!("creating {output}"), source))?;
+
+    let mut stitched = std::collections::HashSet::new();
+    'manifests: for manifest in layout.all_manifests()? {
+        if !stitched.insert(manifest.digest.clone()) {
+            continue;
+        }
+        let mut tables = Vec::with_capacity(manifest.layers.len());
+        for layer in &manifest.layers {
+            let hex = image::parse_digest(&layer.digest)?.hex;
+            let path = sidecar::entries_at(index, &hex);
+            let Some(table) = sidecar::read(&path, entries::Table::read_from) else {
+                log!("Not resolving {}: {path} is missing", manifest.digest);
+                continue 'manifests;
+            };
+            if table.layer != layer.digest {
+                return Err(Error::MismatchedSidecar {
+                    path: path.to_string(),
+                    expected: layer.digest.clone(),
+                    actual: table.layer,
+                });
+            }
+            tables.push(table);
+        }
+        let platform = manifest
+            .platform
+            .as_ref()
+            .map(Platform::to_string)
+            .unwrap_or_default();
+        let Some(table) =
+            rootfs::Table::stitch(&manifest.digest, &platform, &manifest.layers, tables)
+        else {
+            log!(
+                "Not resolving {}: only a walk can place it",
+                manifest.digest
+            );
+            continue;
+        };
+        let hex = image::parse_digest(&manifest.digest)?.hex;
+        write_sidecar(&sidecar::rootfs_at(output, &hex), |writer| {
+            table.write_to(writer)
+        })?;
+    }
+    Ok(())
 }
 
 /// Records a blob's checkpoints and, where the tar stream can be walked, its
