@@ -1,8 +1,9 @@
 # Shared content cache
 
 Status: in progress. Delivery steps 1 (tables), 2 (store, publishing and
-FUSE), 3 (claims, on the FUSE route) and 4 (lazy verification) are
-implemented; the rest is proposed.
+FUSE), 3 (claims, on the FUSE route), 4 (lazy verification) and 6 (GC,
+brought forward so the store never only grows) are implemented; the rest is
+proposed.
 
 ## Problem
 
@@ -441,9 +442,10 @@ today.
 
 ## Garbage collection
 
-- **When:** at the end of a launch, opportunistically. Take
-  `flock(gc.lock, LOCK_EX | LOCK_NB)`; if it is held, skip. Also skip if the
-  `gc.cursor` mtime is newer than the GC interval (default 1 hour).
+- **When:** at the end of a launch, opportunistically, once the mount and the
+  bundle are gone. Take `flock(gc.lock, LOCK_EX | LOCK_NB)`; if it is held,
+  skip. Also skip if the `gc.cursor` mtime is newer than the GC interval
+  (default 1 hour).
 - **How much:** one shard per run (`objects/<cursor>`), with the cursor
   advancing, so no run walks the whole store. Runs as `SCHED_IDLE` with idle
   I/O priority. Being killed at any point is harmless.
