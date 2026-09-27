@@ -28,6 +28,7 @@ const MTIME: u64 = 1_700_000_000;
 
 const GZIP_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 const ZSTD_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+const PLAIN_LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 
@@ -68,6 +69,7 @@ struct Args {
 enum Packing {
     Gzip,
     Zstd,
+    None,
 }
 
 impl Packing {
@@ -75,6 +77,7 @@ impl Packing {
         match self {
             Packing::Gzip => GZIP_LAYER,
             Packing::Zstd => ZSTD_LAYER,
+            Packing::None => PLAIN_LAYER,
         }
     }
 }
@@ -737,6 +740,7 @@ fn build_layer(
                 .write(Hashing::new(file), Compression::new(6)),
         ),
         Packing::Zstd => Encoder::Zstd(FrameWriter::new(Hashing::new(file), frame_bytes)),
+        Packing::None => Encoder::None(Hashing::new(file)),
     };
     let mut builder = tar::Builder::new(Hashing::new(encoder));
     for entry in entries {
@@ -762,6 +766,7 @@ fn build_layer(
 enum Encoder<W: io::Write> {
     Gzip(flate2::write::GzEncoder<W>),
     Zstd(FrameWriter<W>),
+    None(W),
 }
 
 impl<W: io::Write> Encoder<W> {
@@ -769,6 +774,7 @@ impl<W: io::Write> Encoder<W> {
         match self {
             Encoder::Gzip(encoder) => encoder.finish(),
             Encoder::Zstd(writer) => writer.finish(),
+            Encoder::None(writer) => Ok(writer),
         }
     }
 }
@@ -778,6 +784,7 @@ impl<W: io::Write> io::Write for Encoder<W> {
         match self {
             Encoder::Gzip(encoder) => encoder.write(buf),
             Encoder::Zstd(writer) => writer.write(buf),
+            Encoder::None(writer) => writer.write(buf),
         }
     }
 
@@ -785,6 +792,7 @@ impl<W: io::Write> io::Write for Encoder<W> {
         match self {
             Encoder::Gzip(encoder) => encoder.flush(),
             Encoder::Zstd(writer) => writer.flush(),
+            Encoder::None(writer) => writer.flush(),
         }
     }
 }
