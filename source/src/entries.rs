@@ -12,9 +12,11 @@
 
 use std::io::{self, Read, Write};
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{Error, IoContext, Result};
 
-const MAGIC: &[u8; 4] = b"OTE2";
+const MAGIC: &[u8; 4] = b"OTE3";
 
 /// A layer carries extended attributes as one PAX record per attribute.
 const XATTR_PREFIX: &str = "SCHILY.xattr.";
@@ -111,10 +113,16 @@ pub struct Entry {
     /// empty for almost every entry. The values are not kept: nothing restores
     /// them, and this is only here so that every route can say so.
     pub xattrs: Vec<u8>,
+    /// SHA-256 of the file's contents, sparse files reassembled. Always set
+    /// for files read from a table, never for anything else.
+    pub sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Table {
+    /// Digest of the layer blob the table describes, empty until the caller
+    /// who knows it says so.
+    pub layer: String,
     pub entries: Vec<Entry>,
 }
 
@@ -124,6 +132,7 @@ impl Table {
         let context = "reading a layer's entries";
         let mut archive = tar::Archive::new(tar);
         let mut entries = Vec::new();
+        let mut buffer = vec![0u8; 256 << 10];
         for entry in archive.entries().io_context(|| context.to_string())? {
             let mut entry = entry.io_context(|| context.to_string())?;
             let xattrs = xattr_names(&mut entry).io_context(|| context.to_string())?;
@@ -131,7 +140,7 @@ impl Table {
             if entries.len() as u32 == MAX_ENTRIES {
                 return Err(Error::io(context, io::Error::other("too many entries")));
             }
-            entries.push(Entry {
+            let mut recorded = Entry {
                 kind: Kind::of(header),
                 mode: mode_of(header),
                 mtime: mtime_of(header),
@@ -143,9 +152,19 @@ impl Table {
                     .map(|link| link.into_owned())
                     .unwrap_or_default(),
                 xattrs,
-            });
+                sha256: None,
+            };
+            if recorded.kind.is_file() {
+                let digest =
+                    hash_body(&mut entry, &mut buffer).io_context(|| context.to_string())?;
+                recorded.sha256 = Some(digest);
+            }
+            entries.push(recorded);
         }
-        Ok(Table { entries })
+        Ok(Table {
+            layer: String::new(),
+            entries,
+        })
     }
 
     /// Paths dominate the table and repeat heavily between entries, so the
@@ -153,85 +172,131 @@ impl Table {
     /// become one, and the sidecar ships in a runfiles tree.
     pub fn write_to(&self, mut writer: impl Write) -> io::Result<()> {
         let mut body = Vec::new();
+        write_bytes(&mut body, self.layer.as_bytes())?;
         body.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for entry in &self.entries {
-            body.push(entry.kind.code());
-            body.extend_from_slice(&entry.mode.to_le_bytes());
-            body.extend_from_slice(&entry.mtime.to_le_bytes());
-            body.extend_from_slice(&entry.offset.to_le_bytes());
-            body.extend_from_slice(&entry.size.to_le_bytes());
-            write_bytes(&mut body, &entry.path)?;
-            write_bytes(&mut body, &entry.link)?;
-            write_bytes(&mut body, &entry.xattrs)?;
+            write_entry(&mut body, entry)?;
         }
-
-        let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&body)?;
-        let compressed = encoder.finish()?;
-
-        writer.write_all(MAGIC)?;
-        writer.write_all(&(body.len() as u64).to_le_bytes())?;
-        writer.write_all(&(compressed.len() as u64).to_le_bytes())?;
-        writer.write_all(&compressed)
+        write_framed(MAGIC, &body, &mut writer)
     }
 
-    pub fn read_from(mut reader: impl Read) -> io::Result<Self> {
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic)?;
-        if magic != *MAGIC {
-            return Err(io::Error::other("not an entry table"));
-        }
-        let plain_len = read_u64(&mut reader)?;
-        let compressed_len = read_u64(&mut reader)?;
-        // The length is what the reader trusts to size its buffer, so it is
-        // checked before anything is allocated from it.
-        if plain_len > (MAX_ENTRIES as u64) * 512 {
-            return Err(io::Error::other("implausible entry table"));
-        }
-        let mut body = Vec::with_capacity(plain_len as usize);
-        flate2::read::DeflateDecoder::new(reader.by_ref().take(compressed_len))
-            .take(plain_len + 1)
-            .read_to_end(&mut body)?;
-        if body.len() as u64 != plain_len {
-            return Err(io::Error::other("truncated entry table"));
-        }
-
+    pub fn read_from(reader: impl Read) -> io::Result<Self> {
+        let body = read_framed(MAGIC, "an entry table", reader)?;
         let mut at = 0;
+        let layer = String::from_utf8(take_bytes(&body, &mut at)?)
+            .map_err(|_| io::Error::other("the layer digest is not text"))?;
         let count = take_u32(&body, &mut at)?;
         if count > MAX_ENTRIES {
             return Err(io::Error::other("implausible entry count"));
         }
         let mut entries = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            let kind = Kind::from_code(take_u8(&body, &mut at)?)
-                .ok_or_else(|| io::Error::other("unknown entry kind"))?;
-            let mode = take_u32(&body, &mut at)?;
-            let mtime = take_u64(&body, &mut at)?;
-            let offset = take_u64(&body, &mut at)?;
-            let size = take_u64(&body, &mut at)?;
-            let path = take_bytes(&body, &mut at)?;
-            let link = take_bytes(&body, &mut at)?;
-            let xattrs = take_bytes(&body, &mut at)?;
-            entries.push(Entry {
-                kind,
-                mode,
-                mtime,
-                offset,
-                size,
-                path,
-                link,
-                xattrs,
-            });
+            entries.push(take_entry(&body, &mut at)?);
         }
         if at != body.len() {
             return Err(io::Error::other("trailing bytes in entry table"));
         }
-        Ok(Table { entries })
+        Ok(Table { layer, entries })
     }
 }
 
-fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
+/// Writes `body` deflated behind `magic` and both lengths.
+pub fn write_framed(magic: &[u8; 4], body: &[u8], mut writer: impl Write) -> io::Result<()> {
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body)?;
+    let compressed = encoder.finish()?;
+
+    writer.write_all(magic)?;
+    writer.write_all(&(body.len() as u64).to_le_bytes())?;
+    writer.write_all(&(compressed.len() as u64).to_le_bytes())?;
+    writer.write_all(&compressed)
+}
+
+/// Reads back what [`write_framed`] wrote, refusing anything else.
+pub fn read_framed(magic: &[u8; 4], what: &str, mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut found = [0u8; 4];
+    reader.read_exact(&mut found)?;
+    if found != *magic {
+        return Err(io::Error::other(format!("not {what}")));
+    }
+    let plain_len = read_u64(&mut reader)?;
+    let compressed_len = read_u64(&mut reader)?;
+    // The length is what the reader trusts to size its buffer, so it is
+    // checked before anything is allocated from it.
+    if plain_len > (MAX_ENTRIES as u64) * 512 {
+        return Err(io::Error::other(format!("implausible {what}")));
+    }
+    let mut body = Vec::with_capacity(plain_len as usize);
+    flate2::read::DeflateDecoder::new(reader.by_ref().take(compressed_len))
+        .take(plain_len + 1)
+        .read_to_end(&mut body)?;
+    if body.len() as u64 != plain_len {
+        return Err(io::Error::other(format!("truncated {what}")));
+    }
+    Ok(body)
+}
+
+/// One entry as a table stores it, shared with the rootfs table.
+pub fn write_entry(body: &mut Vec<u8>, entry: &Entry) -> io::Result<()> {
+    body.push(entry.kind.code());
+    body.extend_from_slice(&entry.mode.to_le_bytes());
+    body.extend_from_slice(&entry.mtime.to_le_bytes());
+    body.extend_from_slice(&entry.offset.to_le_bytes());
+    body.extend_from_slice(&entry.size.to_le_bytes());
+    write_bytes(body, &entry.path)?;
+    write_bytes(body, &entry.link)?;
+    write_bytes(body, &entry.xattrs)?;
+    if entry.kind.is_file() {
+        let digest = entry
+            .sha256
+            .ok_or_else(|| io::Error::other("a file entry has no content hash"))?;
+        body.extend_from_slice(&digest);
+    }
+    Ok(())
+}
+
+pub fn take_entry(body: &[u8], at: &mut usize) -> io::Result<Entry> {
+    let kind = Kind::from_code(take_u8(body, at)?)
+        .ok_or_else(|| io::Error::other("unknown entry kind"))?;
+    let mode = take_u32(body, at)?;
+    let mtime = take_u64(body, at)?;
+    let offset = take_u64(body, at)?;
+    let size = take_u64(body, at)?;
+    let path = take_bytes(body, at)?;
+    let link = take_bytes(body, at)?;
+    let xattrs = take_bytes(body, at)?;
+    let sha256 = match kind.is_file() {
+        true => Some(take_array(body, at)?),
+        false => None,
+    };
+    Ok(Entry {
+        kind,
+        mode,
+        mtime,
+        offset,
+        size,
+        path,
+        link,
+        xattrs,
+        sha256,
+    })
+}
+
+fn hash_body(body: &mut impl Read, buffer: &mut [u8]) -> io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    loop {
+        match body.read(buffer) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buffer[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+pub fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     let len = u16::try_from(bytes.len())
         .map_err(|_| io::Error::other("path or link name is too long to record"))?;
     out.extend_from_slice(&len.to_le_bytes());
@@ -294,13 +359,23 @@ fn short(what: &str) -> io::Error {
     io::Error::other(format!("entry table ends inside {what}"))
 }
 
-fn take_u8(body: &[u8], at: &mut usize) -> io::Result<u8> {
+fn take_array(body: &[u8], at: &mut usize) -> io::Result<[u8; 32]> {
+    let bytes = body
+        .get(*at..*at + 32)
+        .ok_or_else(|| short("a content hash"))?
+        .try_into()
+        .expect("thirty-two bytes");
+    *at += 32;
+    Ok(bytes)
+}
+
+pub fn take_u8(body: &[u8], at: &mut usize) -> io::Result<u8> {
     let byte = *body.get(*at).ok_or_else(|| short("an entry"))?;
     *at += 1;
     Ok(byte)
 }
 
-fn take_u32(body: &[u8], at: &mut usize) -> io::Result<u32> {
+pub fn take_u32(body: &[u8], at: &mut usize) -> io::Result<u32> {
     let bytes = body
         .get(*at..*at + 4)
         .ok_or_else(|| short("an entry"))?
@@ -310,7 +385,7 @@ fn take_u32(body: &[u8], at: &mut usize) -> io::Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn take_u64(body: &[u8], at: &mut usize) -> io::Result<u64> {
+pub fn take_u64(body: &[u8], at: &mut usize) -> io::Result<u64> {
     let bytes = body
         .get(*at..*at + 8)
         .ok_or_else(|| short("an entry"))?
@@ -320,7 +395,7 @@ fn take_u64(body: &[u8], at: &mut usize) -> io::Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn take_bytes(body: &[u8], at: &mut usize) -> io::Result<Vec<u8>> {
+pub fn take_bytes(body: &[u8], at: &mut usize) -> io::Result<Vec<u8>> {
     let len = {
         let bytes = body
             .get(*at..*at + 2)
@@ -425,6 +500,28 @@ mod tests {
             "the offset names the body in the uncompressed stream"
         );
         assert_eq!(table.entries[2].link, b"dir/file");
+        assert_eq!(
+            file.sha256,
+            Some(Sha256::digest(b"hello").into()),
+            "a file is hashed as its contents"
+        );
+        assert_eq!(table.entries[0].sha256, None, "a directory has no contents");
+    }
+
+    #[test]
+    fn the_layer_a_table_describes_survives_serialisation() {
+        let mut table = Table::build(&sample()[..]).expect("table");
+        table.layer = format!("sha256:{}", "ab".repeat(32));
+        let mut bytes = Vec::new();
+        table.write_to(&mut bytes).expect("write");
+        assert_eq!(Table::read_from(&bytes[..]).expect("read"), table);
+    }
+
+    #[test]
+    fn a_file_without_a_content_hash_is_not_written() {
+        let mut table = Table::build(&sample()[..]).expect("table");
+        table.entries[1].sha256 = None;
+        assert!(table.write_to(&mut Vec::new()).is_err());
     }
 
     /// The plan keys its tree on these paths, and `d/` would sort inside its

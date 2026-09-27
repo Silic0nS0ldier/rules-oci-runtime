@@ -23,6 +23,7 @@ use camino::Utf8Path;
 use ref_cast::RefCast;
 
 use crate::entries::{Entry, Kind, Table};
+use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::image::{Descriptor, parse_digest};
 use crate::log::log;
@@ -124,23 +125,31 @@ impl Plan {
     /// Every layer has to be accounted for: one missing table means unknown
     /// entries, and an entry that is not known about cannot be shown to be
     /// safely skippable. Planning is an optimisation, so falling back to
-    /// placing everything is always available.
-    pub fn build(index_dir: Option<&Utf8Path>, layers: &[Descriptor]) -> Plan {
+    /// placing everything is always available. A table built from some other
+    /// layer is not a missing one, though: it means the inputs are wrong.
+    pub fn build(index_dir: Option<&Utf8Path>, layers: &[Descriptor]) -> Result<Plan> {
         let Some(dir) = index_dir else {
-            return Plan::default();
+            return Ok(Plan::default());
         };
         let mut tables = Vec::with_capacity(layers.len());
         for layer in layers {
             let Ok(digest) = parse_digest(&layer.digest) else {
-                return Plan::default();
+                return Ok(Plan::default());
             };
             let path = crate::sidecar::entries_at(dir, &digest.hex);
             match crate::sidecar::read(&path, Table::read_from) {
+                Some(table) if table.layer != layer.digest => {
+                    return Err(Error::MismatchedSidecar {
+                        path: path.to_string(),
+                        expected: layer.digest.clone(),
+                        actual: table.layer,
+                    });
+                }
                 Some(table) => tables.push(table),
-                None => return Plan::default(),
+                None => return Ok(Plan::default()),
             }
         }
-        Plan::resolve(layers, tables)
+        Ok(Plan::resolve(layers, tables))
     }
 
     fn resolve(layers: &[Descriptor], mut tables: Vec<Table>) -> Plan {
@@ -841,6 +850,7 @@ mod tests {
             path: path.as_bytes().to_vec(),
             link: Vec::new(),
             xattrs: Vec::new(),
+            sha256: None,
         }
     }
 
@@ -868,7 +878,10 @@ mod tests {
     }
 
     fn layer(entries: Vec<Entry>) -> Table {
-        Table { entries }
+        Table {
+            entries,
+            ..Table::default()
+        }
     }
 
     /// The paths the plan would create as directories, for readability.
@@ -883,6 +896,7 @@ mod tests {
     fn table(paths: &[&str]) -> Table {
         Table {
             entries: paths.iter().map(|p| file(p)).collect(),
+            ..Table::default()
         }
     }
 
@@ -1010,7 +1024,7 @@ mod tests {
 
     #[test]
     fn an_absent_table_plans_nothing() {
-        let plan = Plan::build(None, &[descriptor(0)]);
+        let plan = Plan::build(None, &[descriptor(0)]).expect("plan");
         assert!(!plan.is_shadowed(&descriptor(0).digest, b"anything"));
     }
 

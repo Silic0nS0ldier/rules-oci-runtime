@@ -73,6 +73,13 @@ pub enum Error {
         path: String,
         message: String,
     },
+    /// A sidecar describes a different layer or manifest from the one it sits
+    /// beside, which means the inputs are wrong rather than merely missing.
+    MismatchedSidecar {
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl Error {
@@ -167,6 +174,14 @@ impl fmt::Display for Error {
                 "cannot serve the image: {reason}; pass --rootfs=auto to extract it instead"
             ),
             Error::Profile { path, message } => write!(f, "profile {path} {message}"),
+            Error::MismatchedSidecar {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{path} was built from {actual:?}, not {expected}; the index and the image are out of step"
+            ),
         }
     }
 }

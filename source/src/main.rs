@@ -17,6 +17,7 @@ mod zinfo;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
+use sha2::Digest;
 
 use crate::bundle::Bundle;
 use crate::cli::{Cli, Command, IndexArgs, ProfileArgs, RootfsMode, RunArgs};
@@ -394,14 +395,15 @@ fn index(args: IndexArgs) -> Result<i32> {
 /// Records a blob's checkpoints and, where the tar stream can be walked, its
 /// entries.
 ///
-/// `media_type` is what the manifest calls the layer. A blob indexed on its
-/// own has no manifest to ask, so its format is taken from the bytes.
+/// `descriptor` is what the manifest says of the layer. A blob indexed on its
+/// own has no manifest to ask, so its format is taken from the bytes and its
+/// digest from hashing them.
 fn index_blob(
     blob: &Utf8Path,
     checkpoints: &Utf8Path,
     entries: &Utf8Path,
     span: u64,
-    media_type: Option<&str>,
+    descriptor: Option<&image::Descriptor>,
 ) -> Result<()> {
     let file =
         std::fs::File::open(blob).map_err(|source| Error::io(format!("opening {blob}"), source))?;
@@ -415,9 +417,9 @@ fn index_blob(
         other => other,
     };
 
-    let compression = match media_type {
-        Some(media_type) => extract::compression_of(media_type)
-            .ok_or_else(|| Error::UnsupportedMediaType(media_type.to_string()))?,
+    let compression = match descriptor {
+        Some(descriptor) => extract::compression_of(&descriptor.media_type)
+            .ok_or_else(|| Error::UnsupportedMediaType(descriptor.media_type.clone()))?,
         None => sniff(bytes).ok_or_else(|| {
             Error::io(
                 format!("{blob} is not gzip or zstd"),
@@ -435,6 +437,16 @@ fn index_blob(
     let index = zinfo::Index::build(flavor, bytes, span).map_err(named)?;
     write_sidecar(checkpoints, |writer| index.write_to(writer))?;
 
+    // The table names the layer it describes, so that one left beside another
+    // layer is refused rather than trusted.
+    let layer = match descriptor {
+        Some(descriptor) => {
+            image::verify(descriptor, bytes)?;
+            descriptor.digest.clone()
+        }
+        None => format!("sha256:{}", image::hex_encode(&sha2::Sha256::digest(bytes))),
+    };
+
     // A second pass rather than a second job for the decompressor: the entry
     // walk wants the tar stream in order, and the checkpoint pass keeps none
     // of it.
@@ -443,7 +455,10 @@ fn index_blob(
     // the stream itself; it just does not get planned. So the table is left
     // out rather than failing the build over it.
     match entries::Table::build(extract::decompressed(compression, bytes)) {
-        Ok(table) => write_sidecar(entries, |writer| table.write_to(writer)),
+        Ok(mut table) => {
+            table.layer = layer;
+            write_sidecar(entries, |writer| table.write_to(writer))
+        }
         Err(err) => {
             log::warn(format!("not recording the entries of {blob}: {err}"));
             Ok(())
@@ -498,7 +513,7 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
                 blob,
                 sidecar::checkpoints_at(output, &hex),
                 sidecar::entries_at(output, &hex),
-                layer.media_type.clone(),
+                layer.clone(),
             ));
         }
     }
@@ -519,10 +534,10 @@ fn index_layout(layout: &Utf8Path, output: &Utf8Path, span: u64) -> Result<()> {
             scope.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((blob, checkpoints, entries, media_type)) = work.get(i) else {
+                    let Some((blob, checkpoints, entries, descriptor)) = work.get(i) else {
                         break;
                     };
-                    let result = index_blob(blob, checkpoints, entries, span, Some(media_type));
+                    let result = index_blob(blob, checkpoints, entries, span, Some(descriptor));
                     *results[i].lock().expect("index result") = Some(result);
                 }
             });
