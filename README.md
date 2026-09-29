@@ -98,10 +98,23 @@ A served file's bytes are kept in a store under
 the image, or of any image holding the same file, reads them from there rather
 than inflating them again. Nothing in the store is ever written to: a container
 writing to a file gets its own copy first. The store is only used when it
-belongs to the caller alone and is not on NFS, and a scope that cannot write to
-it, such as Bazel's `linux-sandbox`, still reads from it (pass
-`--sandbox_writable_path` with the path to let it write). `--cache=off` leaves
-it alone, and `--verbose` reports how much each launch got out of it.
+belongs to the caller alone and is not on NFS. `--cache=off` leaves it alone,
+and `--verbose` reports how much each launch got out of it.
+
+Bazel's `linux-sandbox` mounts the home directory read-only, so a sandboxed
+test reads the store but never adds to it, and one with no store yet does
+without. To let sandboxed tests share, make the directory once and let the
+sandbox write to it; Bazel refuses a writable path that does not exist, and the
+flag leaves test cache keys alone:
+
+```sh
+mkdir -p -m 700 ~/.cache/rules_oci_runtime
+```
+
+```
+# ~/.bazelrc (the path is absolute and per user)
+test --sandbox_writable_path=/home/<you>/.cache/rules_oci_runtime
+```
 
 See [docs/content-cache.md](docs/content-cache.md) for the design.
 

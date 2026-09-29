@@ -484,9 +484,15 @@ When the store turns out to be read-only, log a one-line hint naming the
 `--sandbox_writable_path` flag. Recommended flags belong in the user's
 `~/.bazelrc`, since the path is absolute and per-user.
 
-Today the launcher cannot run inside `linux-sandbox` at all, because it needs
-nested user namespaces (see the `no-sandbox` tags in the e2e modules). That
-is a separate problem from this design.
+Writability is found by opening `claims` for writing: `linux-sandbox` mounts
+the home directory read-only, where making a directory that already exists
+answers `EEXIST` rather than `EROFS`. `--sandbox_writable_path` only takes a
+directory that exists, so the parent of `v1` has to be made before the first
+sandboxed test; it is not part of the test's cache key.
+
+The launcher does run inside `linux-sandbox` where the host lets the sandbox's
+user namespace nest another, as the dev container does, served over FUSE. The
+e2e modules still run as `no-sandbox`.
 
 ## Observability
 
