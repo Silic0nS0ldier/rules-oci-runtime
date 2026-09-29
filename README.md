@@ -116,6 +116,9 @@ mkdir -p -m 700 ~/.cache/rules_oci_runtime
 test --sandbox_writable_path=/home/<you>/.cache/rules_oci_runtime
 ```
 
+Spell the path out: Bazel does not expand `~` here, and a path it cannot find
+leaves the store read-only without saying why unless `--verbose` is passed.
+
 See [docs/content-cache.md](docs/content-cache.md) for the design.
 
 ### Fetching ahead
