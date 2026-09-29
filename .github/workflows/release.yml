@@ -24,6 +24,8 @@ jobs:
       # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: ./.github/actions/artifacts
+        with:
+          training-image: full
       - uses: actions/upload-artifact@v7
         if: always()
         with:

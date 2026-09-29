@@ -49,3 +49,26 @@ launcher_binary = rule(
     cfg = _profiled,
     doc = "The launcher, built against `//pgo:profile` when one is configured.",
 )
+
+def _llvm_profdata_impl(ctx):
+    # type: (ctx) -> list
+    toolchain = ctx.toolchains["@rules_rust//rust:toolchain_type"]
+    executable = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.symlink(
+        output = executable,
+        target_file = toolchain.llvm_profdata,
+        is_executable = True,
+    )
+    return [DefaultInfo(
+        executable = executable,
+        # It finds `libLLVM` relative to itself.
+        runfiles = ctx.runfiles(files = [toolchain.llvm_profdata] + toolchain.llvm_lib),
+    )]
+
+# A profile has to be merged by the LLVM of the `rustc` that reads it.
+llvm_profdata = rule(
+    implementation = _llvm_profdata_impl,
+    executable = True,
+    toolchains = ["@rules_rust//rust:toolchain_type"],
+    doc = "The `llvm-profdata` shipped with the Rust toolchain.",
+)
