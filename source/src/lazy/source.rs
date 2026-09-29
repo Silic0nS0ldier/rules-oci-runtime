@@ -219,7 +219,7 @@ pub struct Window {
 /// Timestamps are cosmetic, so a failure is not worth failing a read over.
 fn set_mtime(file: &fs::File, mtime: u64) {
     let time = libc::timespec {
-        tv_sec: mtime as libc::time_t,
+        tv_sec: mtime as _,
         tv_nsec: 0,
     };
     let times = [time, time];

@@ -16,6 +16,9 @@ local_path_override(
 bazel_dep(name = "rules_oci", version = "2.3.0")
 bazel_dep(name = "rules_shell", version = "0.8.0")
 
+# The toolchains the launcher is built with, symlinked from `source/`.
+include("//:toolchains.MODULE.bazel")
+
 # Writes the `.tar.zst` layer `oci_image` turns into a zstd blob.
 bazel_dep(name = "tar.bzl", version = "0.10.9")
 

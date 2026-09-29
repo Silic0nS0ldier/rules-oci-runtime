@@ -73,7 +73,12 @@ oci.pull(
     ],
     tag = "3.22.2",
 )
-use_repo(oci, "alpine")
+use_repo(
+    oci,
+    "alpine",
+    "alpine_linux_amd64",
+    "alpine_linux_arm64_v8",
+)
 EOF
 
     cat >"${consumer}/BUILD.bazel" <<'EOF'

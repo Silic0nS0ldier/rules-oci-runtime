@@ -52,3 +52,10 @@ runs:
         cache-save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         bazelisk-cache: true
         repository-cache: false
+    # setup-bazel pins one output base, which every module in a job would then take
+    # turns at: each restarts the server and rematerialises the repositories of the
+    # module before it. Its caches here do not live in the output base, so let Bazel
+    # derive one per workspace.
+    - name: Output base per workspace
+      shell: bash
+      run: sed -i '/^startup --output_base=/d' ~/.bazelrc

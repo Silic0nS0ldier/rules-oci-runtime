@@ -133,7 +133,7 @@ fn open_exclusive(dst: &Path, mode: u32) -> io::Result<fs::File> {
 /// failure is not worth failing the run over.
 fn set_mtime(file: &fs::File, mtime: u64) {
     let time = libc::timespec {
-        tv_sec: mtime as libc::time_t,
+        tv_sec: mtime as _,
         tv_nsec: 0,
     };
     let times = [time, time];
@@ -147,7 +147,7 @@ fn set_symlink_mtime(path: &Path, mtime: u64) {
         return;
     };
     let time = libc::timespec {
-        tv_sec: mtime as libc::time_t,
+        tv_sec: mtime as _,
         tv_nsec: 0,
     };
     let times = [time, time];
