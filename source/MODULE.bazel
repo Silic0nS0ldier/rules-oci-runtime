@@ -80,6 +80,16 @@ register_toolchains("@llvm//toolchain:all", dev_dependency = True)
 # `abi_to_constraints` is commented out), so an unconstrained musl toolchain also
 # matches the glibc host and gets picked for exec configuration tools, which then
 # fail to link against the glibc C toolchain.
+#
+# @llvm puts `--unwindlib=none` and `-rtlib=compiler-rt` on every link action, but rustc
+# also passes `-nodefaultlibs` (and, for the static musl links, `-no-pie` where clang has
+# no use for it), so the clang driver never claims them and reports each as unused, which
+# rustc's `linker_messages` lint then echoes for every Rust link. Every triple of both
+# sets links through @llvm, so the flag applies to all of them.
+# TODO Drop once @llvm gates these behind a `cc_feature` that @rules_rust, which adds
+# the flags that make them redundant, can switch off rather than mute the diagnostic.
+_UNUSED_LINK_ARGS = ["-Clink-arg=-Wno-unused-command-line-argument"]
+
 rust_dev = use_extension(
     "@rules_rust//rust:extensions.bzl",
     "rust",
@@ -89,6 +99,8 @@ rust_dev.repository_set(
     name = "rust_linux_x86_64",
     edition = "2024",
     exec_triple = "x86_64-unknown-linux-gnu",
+    extra_exec_rustc_flags = _UNUSED_LINK_ARGS,
+    extra_rustc_flags = _UNUSED_LINK_ARGS,
     sha256s = _RUST_SHA256S,
     target_compatible_with = [
         "@platforms//cpu:x86_64",
@@ -111,6 +123,8 @@ rust_dev.repository_set(
     name = "rust_linux_aarch64",
     edition = "2024",
     exec_triple = "aarch64-unknown-linux-gnu",
+    extra_exec_rustc_flags = _UNUSED_LINK_ARGS,
+    extra_rustc_flags = _UNUSED_LINK_ARGS,
     sha256s = _RUST_SHA256S,
     target_compatible_with = [
         "@platforms//cpu:x86_64",
