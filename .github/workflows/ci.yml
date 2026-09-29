@@ -51,19 +51,15 @@ jobs:
       - uses: stefanzweifel/git-auto-commit-action@v6
       - id: get_commit
         run: echo "COMMIT_HASH=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
-  test:
-    name: Test ${{ matrix.name }}
+  # One job, so a run restores from and publishes to the Actions cache once
+  # rather than once per module. Steps carry on past a failure so every module
+  # is reported on, and the last step fails the job.
+  build_and_test:
+    name: Build and test
     # `renovate_tasks` is skipped on most runs, and a skip propagates down the
     # `needs` chain unless a status function is used.
     if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
     needs: renovate_tasks
-    strategy:
-      matrix:
-        include:
-          - module: "."
-            name: root
-          - module: source
-            name: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -71,45 +67,7 @@ jobs:
           ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
       - uses: ./.github/actions/bazel
         with:
-          name: ${{ matrix.name }}
-      - run: bazel test //...
-        working-directory: ${{ matrix.module }}
-      - uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: test-logs-${{ matrix.name }}
-          path: ${{ matrix.module }}/.bazel/testlogs/**/test.log
-          include-hidden-files: true
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: bazel-profiles-${{ matrix.name }}
-          path: ${{ runner.temp }}/*.profile.gz
-          if-no-files-found: ignore
-  # The end to end modules are kept apart from the unit tests: they reach the
-  # network for an image and for `umoci`, they run outside the Bazel sandbox,
-  # and they need user namespaces. A flake in one should not be read as the
-  # launcher being broken.
-  e2e:
-    name: E2E ${{ matrix.name }}
-    if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
-    needs: renovate_tasks
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - module: e2e/smoke
-            name: smoke
-          - module: e2e/conformance
-            name: conformance
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
-      - uses: ./.github/actions/bazel
-        with:
-          name: e2e-${{ matrix.name }}
+          name: build_and_test
       # A rootless container is a user namespace, which Ubuntu confines by
       # default. Older images have no such knob, hence the check.
       - name: Permit unprivileged user namespaces
@@ -117,29 +75,72 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - run: bazel test //...
-        working-directory: ${{ matrix.module }}
+      # Every module writes its own profile, rather than overwriting the last.
+      - name: Test root
+        id: test_root
+        continue-on-error: true
+        run: bazel test //... --profile="${RUNNER_TEMP}/root.test.profile.gz"
       - uses: actions/upload-artifact@v7
-        if: failure()
+        if: steps.test_root.outcome == 'failure'
         with:
-          name: test-logs-e2e-${{ matrix.name }}
-          path: ${{ matrix.module }}/.bazel/testlogs/**/test.log
+          name: test-logs-root
+          path: .bazel/testlogs/**/test.log
           include-hidden-files: true
+      - name: Test source
+        id: test_source
+        continue-on-error: true
+        run: bazel test //... --profile="${RUNNER_TEMP}/source.test.profile.gz"
+        working-directory: source
+      - uses: actions/upload-artifact@v7
+        if: steps.test_source.outcome == 'failure'
+        with:
+          name: test-logs-source
+          path: source/.bazel/testlogs/**/test.log
+          include-hidden-files: true
+      # The end to end modules reach the network for an image and for `umoci`,
+      # run outside the Bazel sandbox, and need user namespaces. They are steps
+      # of their own so a flake in one is not read as the launcher being broken.
+      - name: E2E smoke
+        id: e2e_smoke
+        continue-on-error: true
+        run: bazel test //... --profile="${RUNNER_TEMP}/e2e-smoke.test.profile.gz"
+        working-directory: e2e/smoke
+      - uses: actions/upload-artifact@v7
+        if: steps.e2e_smoke.outcome == 'failure'
+        with:
+          name: test-logs-e2e-smoke
+          path: e2e/smoke/.bazel/testlogs/**/test.log
+          include-hidden-files: true
+      - name: E2E conformance
+        id: e2e_conformance
+        continue-on-error: true
+        run: bazel test //... --profile="${RUNNER_TEMP}/e2e-conformance.test.profile.gz"
+        working-directory: e2e/conformance
+      - uses: actions/upload-artifact@v7
+        if: steps.e2e_conformance.outcome == 'failure'
+        with:
+          name: test-logs-e2e-conformance
+          path: e2e/conformance/.bazel/testlogs/**/test.log
+          include-hidden-files: true
+      # Publishes the same assets a release does, as workflow artifacts, so a
+      # change can be tried out before it is released.
+      - name: Release assets
+        id: artifacts
+        continue-on-error: true
+        uses: ./.github/actions/artifacts
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: bazel-profiles-e2e-${{ matrix.name }}
+          name: bazel-profiles
           path: ${{ runner.temp }}/*.profile.gz
           if-no-files-found: ignore
-  # Publishes the same assets a release does, as workflow artifacts, so a change
-  # can be tried out before it is released.
-  artifacts:
-    name: Artifacts
-    if: ${{ !cancelled() && needs.renovate_tasks.result != 'failure' }}
-    needs: renovate_tasks
-    uses: $/.github/workflows/artifacts.yml
-    with:
-      ref: ${{ needs.renovate_tasks.outputs.commit_hash }}
+      - if: >
+          steps.test_root.outcome == 'failure' ||
+          steps.test_source.outcome == 'failure' ||
+          steps.e2e_smoke.outcome == 'failure' ||
+          steps.e2e_conformance.outcome == 'failure' ||
+          steps.artifacts.outcome == 'failure'
+        run: exit 1
   devcontainer:
     name: Devcontainer ${{ matrix.arch }}
     strategy:

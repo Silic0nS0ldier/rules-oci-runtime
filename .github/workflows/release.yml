@@ -14,7 +14,22 @@ permissions:
 jobs:
   artifacts:
     name: Artifacts
-    uses: $/.github/workflows/artifacts.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/bazel
+        with:
+          name: artifacts
+      # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, which
+      # denies runc the CAP_SYS_ADMIN it needs to unshare the mount namespace.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: ./.github/actions/artifacts
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bazel-profiles-artifacts
+          path: ${{ runner.temp }}/*.profile.gz
+          if-no-files-found: ignore
   publish:
     name: Publish
     needs: artifacts
