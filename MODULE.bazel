@@ -31,3 +31,8 @@ register_toolchains("//launcher:all")
 # is built by the `rules_oci_runtime_source` module, which is tested separately.
 bazel_dep(name = "stardoc", version = "0.8.1", dev_dependency = True)
 bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)
+
+# Development only: a hermetic C toolchain, see `.bazelrc`.
+bazel_dep(name = "llvm", version = "0.8.23", dev_dependency = True)
+
+register_toolchains("@llvm//toolchain:all", dev_dependency = True)

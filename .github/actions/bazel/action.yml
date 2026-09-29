@@ -44,9 +44,6 @@ runs:
           common --experimental_remote_downloader_local_fallback
           common --experimental_remote_downloader_propagate_credentials
           common --noslim_profile
-          # The runner's gcc finds only gold, which rustc warns is deprecated, as lld is
-          # installed versioned (`ld.lld-18`). clang finds the lld beside it.
-          common --repo_env=CC=clang
           mod --profile=${{ runner.temp }}/${{ inputs.name }}.mod.profile.gz
           build --profile=${{ runner.temp }}/${{ inputs.name }}.build.profile.gz
           build --experimental_profile_include_target_label
