@@ -126,6 +126,12 @@ impl Store {
         }
         match Store::open_at(root.clone(), writable) {
             Ok(store) => Some(store),
+            // A scope that can neither make the store nor see one is ordinary,
+            // and every sandboxed test would otherwise say so.
+            Err(reason) if !root.exists() => {
+                log!("Not using the content cache at {root}: {reason}");
+                None
+            }
             Err(reason) => {
                 warning!("not using the content cache at {root}: {reason}");
                 None
@@ -160,8 +166,21 @@ impl Store {
             return Err("it is on NFS, which cannot be trusted with it".to_string());
         }
 
-        if writable && let Err(err) = make_dir(root.as_raw_fd(), OBJECTS) {
-            log!("The content cache at {root_path} cannot be written: {err}");
+        // Making a directory that exists answers EEXIST even on a read-only
+        // mount, so only opening something for writing says whether it can be.
+        let written = make_dir(root.as_raw_fd(), OBJECTS).and_then(|()| {
+            open_beneath(
+                root.as_raw_fd(),
+                CLAIMS,
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+                0o600,
+            )
+        });
+        if writable && let Err(err) = written {
+            log!(
+                "The content cache at {root_path} is read-only here ({err}); under Bazel's \
+                 sandbox, --sandbox_writable_path={root_path} makes it writable"
+            );
             writable = false;
         }
         let objects = open_beneath(root.as_raw_fd(), OBJECTS, libc::O_DIRECTORY, 0)
@@ -867,6 +886,34 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).expect("chmod");
         assert!(Store::open(CacheMode::Auto, Some(&root)).is_none());
+        let _ = crate::fsutil::force_remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn a_store_this_scope_cannot_write_to_is_read_only() {
+        // Permissions do not stop root, which is the only way to test this
+        // without a read-only mount.
+        if crate::sys::euid() == 0 {
+            return;
+        }
+        let root = scratch("unwritable");
+        let sha = named(b"hello");
+        Store::open(CacheMode::Auto, Some(&root))
+            .expect("store")
+            .publish(&sha, b"hello")
+            .expect("published");
+        std::fs::remove_file(root.join(CLAIMS)).expect("claims");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+        let store = Store::open(CacheMode::Auto, Some(&root)).expect("store");
+        assert!(
+            !store.is_writable(),
+            "a store whose directories exist is not writable for that"
+        );
+        assert!(store.lookup(&sha, 5).is_some(), "it is still read");
+        assert!(store.bundles().is_none());
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         let _ = crate::fsutil::force_remove_dir_all(root.as_std_path());
     }
 

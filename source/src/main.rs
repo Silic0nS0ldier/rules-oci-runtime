@@ -97,13 +97,18 @@ fn run(args: RunArgs) -> Result<i32> {
     let in_store = store
         .as_ref()
         .filter(|_| !args.keep_bundle)
-        .and_then(|store| store.bundles());
-    let bundle = Bundle::create(
-        in_store.as_deref().unwrap_or(&temp_dir),
-        &id,
-        args.keep_bundle,
-        in_store.is_some(),
-    )?;
+        .and_then(|store| store.bundles())
+        .and_then(|dir| match Bundle::create(&dir, &id, false, true) {
+            Ok(bundle) => Some(bundle),
+            Err(err) => {
+                log!("Not keeping the bundle in the content cache: {err}");
+                None
+            }
+        });
+    let bundle = match in_store {
+        Some(bundle) => bundle,
+        None => Bundle::create(&temp_dir, &id, args.keep_bundle, false)?,
+    };
     log!("Using {} for the container bundle", bundle.dir());
 
     let rootfs = bundle.rootfs();
