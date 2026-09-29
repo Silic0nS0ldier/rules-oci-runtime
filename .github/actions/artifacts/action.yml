@@ -5,17 +5,39 @@ name: Release assets
 description: Builds the launcher binaries and the ruleset archive, and uploads them as artifacts
 # Expects Bazel set up and unprivileged user namespaces permitted, as the
 # archive check runs a container.
+inputs:
+  training-image:
+    description: "The `bench_image --profile` the launcher's PGO profile is recorded on: `full` for a release, `small` to check the pipeline works"
+    required: true
 runs:
   using: composite
   steps:
+    # Recorded afresh every time, so the profile can never describe an older
+    # launcher or toolchain than the one it is built into.
+    - name: Profile launcher
+      id: pgo
+      shell: bash
+      working-directory: source
+      env:
+        TRAINING_IMAGE: ${{ inputs.training-image }}
+      run: |
+        profile="$(pgo/generate.sh --image "${TRAINING_IMAGE}" --output-dir "${RUNNER_TEMP}/pgo")"
+        echo "path=${profile}" >>"${GITHUB_OUTPUT}"
+    - uses: actions/upload-artifact@v7
+      with:
+        name: launcher-profile
+        path: ${{ steps.pgo.outputs.path }}
+        if-no-files-found: error
     # The C toolchain cross compiles, so one host builds both.
     - name: Build launchers
       shell: bash
       working-directory: source
+      env:
+        PGO_PROFILE: ${{ steps.pgo.outputs.path }}
       run: |
         for arch in amd64 arm64; do
           bazel build --config="release_linux_${arch}" \
-            --//pgo:profile="${PWD}/pgo/oci_runtime.profdata" //:oci_runtime \
+            --//pgo:profile="${PGO_PROFILE}" //:oci_runtime \
             --remote_download_outputs=toplevel \
             --profile="${RUNNER_TEMP}/launcher-${arch}.build.profile.gz"
           install -D -m 0755 .bazel/bin/oci_runtime "../artifacts/oci_runtime.${arch}"

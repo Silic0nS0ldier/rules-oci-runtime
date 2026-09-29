@@ -85,71 +85,42 @@ profile is meant to drive to zero.
 
 ## Profile-guided optimisation
 
-Release launchers are built against `pgo/oci_runtime.profdata`, which is
-committed. Most of the launcher's time is inside `zlib-rs`, and the profile
-tells LLVM which way its branches actually go: it takes about 15% of the
-instructions out of `inflate`.
+Release launchers are built against a profile recorded by the release
+workflow itself, from the launcher and toolchain it is about to ship, so it
+never drifts from the code it describes. Most of the launcher's time is inside
+`zlib-rs`, and the profile tells LLVM which way its branches actually go: it
+takes about 15% of the instructions out of `inflate`.
+
+`pgo/generate.sh` builds an instrumented launcher, trains it on both routes
+(with sidecars and without) against a `bench_image` layout, merges the data
+with the `llvm-profdata` shipped beside the toolchain's `rustc`, and prints
+the path of the result:
+
+```
+profile="$(pgo/generate.sh --output-dir ~/.cache/rules_oci_runtime_pgo)"
+bazel build --config=release --//pgo:profile="$profile" //:oci_runtime
+```
+
+The release trains on `--image full`, the default. CI passes `--image small`,
+which is enough to prove the pipeline works without the release's cost; the
+profile each run used is kept as its `launcher-profile` artifact.
 
 `rustc` resolves the path itself, from a working directory that is neither the
-workspace nor stable, so it has to be absolute and the caller supplies it:
+workspace nor stable, so it has to be absolute. Bazel sees only the path, not
+what is in the file, so the file is named for its contents: a profile
+rewritten in place would be a cache hit on the old one. Keep it out of `/tmp`,
+which the sandbox hides.
 
-```
-bazel build --config=release \
-    --//pgo:profile=$PWD/pgo/oci_runtime.profdata //:oci_runtime
-```
+Leave the flag out and the launcher still builds, just slower. The flag travels
+by a transition attached to `//:oci_runtime`, so it reaches every crate the
+launcher links and nothing else: the benchmark tools are not built against a
+profile that does not describe them.
 
-Leave it out and the launcher still builds, just slower. The flag travels by a
-transition attached to `//:oci_runtime`, so it reaches every crate the launcher
-links and nothing else: the benchmark tools are not built against a profile
-that does not describe them.
-
-Regenerate the profile when the extraction path changes shape, and whenever
-the Rust toolchain changes: a new `rustc` mangles its symbols afresh, so a
-profile made by the old one stops matching (1.97.1 to 1.98.1 took unmatched
-functions from 325 to 1224). A stale profile is not wrong -- it just stops
-paying for the functions it no longer describes, and
-`-pgo-warn-missing-function`, which the transition always passes, says which
-those are. A fresh one leaves a few dozen on amd64, code training never
-reaches such as the served route and `Debug` impls; arm64 leaves around a
-thousand, as the profile is recorded on x86_64.
-
-```
-# 1. Instrument. Delete the old data first: `.profraw` files are updated in
-#    place, so one left over from another binary poisons the merge. Copy the
-#    binary out, the next build points `.bazel/bin` elsewhere.
-rm -rf /tmp/pgo-data
-bazel build --config=release \
-    --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols \
-    --@rules_rust//rust/settings:extra_rustc_flag=-Cprofile-generate=/tmp/pgo-data \
-    //:oci_runtime
-cp .bazel/bin/oci_runtime /tmp/oci_runtime.instr
-
-# 2. Train, on both routes: with sidecars and without. `--rootfs=extract`
-#    because, given sidecars, a host with FUSE would otherwise serve the image
-#    and extract nothing.
-bazel build //:bench_image
-.bazel/bin/bench_image --output /tmp/bench-full --profile full
-/tmp/oci_runtime.instr index --layout /tmp/bench-full --output /tmp/idx-full
-for index in "--index /tmp/idx-full" ""; do
-    /tmp/oci_runtime.instr run --layout /tmp/bench-full $index \
-        --rootfs=extract --runtime /nonexistent/runc --keep-bundle
-done
-
-# 3. Merge with the `llvm-profdata` shipped beside the toolchain's rustc. The
-#    others in `external` (`@llvm`'s, `rust_host_tools`') can be another LLVM.
-profdata=("$(bazel info output_base)"/external/rules_rust++rust+*__stable_tools/lib/rustlib/*/bin/llvm-profdata)
-"$profdata" --version  # LLVM version ...-rust-<the pinned version>
-"$profdata" merge -o pgo/oci_runtime.profdata /tmp/pgo-data/*.profraw
-
-# 4. Check. Bazel sees only the path, not what is in the file, so a rewritten
-#    profile at the same path is a cache hit. Point it at a copy it has not seen
-#    (not under /tmp, which the sandbox hides) and confirm it recompiled.
-cp pgo/oci_runtime.profdata ~/.cache/pgo-check-$(date +%s).profdata
-bazel build --config=release \
-    --//pgo:profile=$(ls -t ~/.cache/pgo-check-*.profdata | head -1) \
-    //:oci_runtime > /tmp/pgo-check.log 2>&1
-grep -c 'Compiling Rust bin oci_runtime' /tmp/pgo-check.log  # 0 means cached
-grep -c 'no profile data available' /tmp/pgo-check.log
-```
+`-pgo-warn-missing-function`, which the transition always passes, names the
+functions the profile has no data for. A fresh one leaves a few dozen on amd64,
+code training never reaches such as the served route and `Debug` impls; arm64
+leaves around a thousand, as the profile is recorded on x86_64. Many more means
+the profile stopped describing the launcher -- a new `rustc` mangles its
+symbols afresh, for one.
 
 The instrumented binary is much slower than either; never benchmark it.

@@ -20,8 +20,8 @@ build:release_common --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbo
 # the workspace nor stable, so it has to be absolute -- and an rc file cannot
 # spell one. The caller supplies it, and README.md says how it is made:
 #
-#   bazel build --config=release \
-#       --//pgo:profile=$PWD/pgo/oci_runtime.profdata //:oci_runtime
+#   bazel build --config=release --//pgo:profile=/abs/launcher.<digest>.profdata \
+#       //:oci_runtime
 #
 # Without it the launcher still builds; it is simply the slower one.
 

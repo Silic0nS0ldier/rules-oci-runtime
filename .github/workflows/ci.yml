@@ -123,11 +123,15 @@ jobs:
           path: e2e/conformance/.bazel/testlogs/**/test.log
           include-hidden-files: true
       # Publishes the same assets a release does, as workflow artifacts, so a
-      # change can be tried out before it is released.
+      # change can be tried out before it is released. The launcher is trained
+      # on a small image: enough to prove the profile is generated and taken
+      # up, without the release's cost.
       - name: Release assets
         id: artifacts
         continue-on-error: true
         uses: ./.github/actions/artifacts
+        with:
+          training-image: small
       - uses: actions/upload-artifact@v7
         if: always()
         with:
