@@ -10,10 +10,10 @@ common --@llvm//config:experimental_stub_libgcc_s=True
 
 # Optimised, statically linked launcher binaries, published as release artifacts
 # and consumed by the prebuilt launcher toolchain.
-build:release --compilation_mode=opt
-build:release --@rules_rust//rust/settings:lto=fat
-build:release --@rules_rust//rust/settings:codegen_units=1
-build:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
+build:release_common --compilation_mode=opt
+build:release_common --@rules_rust//rust/settings:lto=fat
+build:release_common --@rules_rust//rust/settings:codegen_units=1
+build:release_common --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
 
 # Profile-guided optimisation. `//pgo:profile` reaches every crate the launcher
 # links, by a transition that stops at the launcher, so nothing else in the
@@ -30,17 +30,18 @@ build:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
 
 # Even with a musl target platform the glibc toolchains remain applicable, as
 # rules_rust does not constrain toolchains by libc. Prioritise musl explicitly.
-build:release --extra_toolchains=@rust_toolchains//:rust_linux_x86_64__x86_64-unknown-linux-musl__stable
-build:release --extra_toolchains=@rust_toolchains//:rust_linux_x86_64__aarch64-unknown-linux-musl__stable
-build:release --extra_toolchains=@rust_toolchains//:rust_linux_aarch64__x86_64-unknown-linux-musl__stable
-build:release --extra_toolchains=@rust_toolchains//:rust_linux_aarch64__aarch64-unknown-linux-musl__stable
+build:release_common --extra_toolchains=@rust_toolchains//:rust_linux_x86_64__x86_64-unknown-linux-musl__stable
+build:release_common --extra_toolchains=@rust_toolchains//:rust_linux_x86_64__aarch64-unknown-linux-musl__stable
+build:release_common --extra_toolchains=@rust_toolchains//:rust_linux_aarch64__x86_64-unknown-linux-musl__stable
+build:release_common --extra_toolchains=@rust_toolchains//:rust_linux_aarch64__aarch64-unknown-linux-musl__stable
 
 # Either target platform builds from either host, the C toolchain cross compiles.
-# The last `--platforms` wins, so amd64 is merely the default.
+# `release_common` names no platform, as a config that sets `--platforms` twice
+# draws a warning; amd64 is merely the default.
+build:release --config=release_common
 build:release --platforms=@llvm//platforms:linux_x86_64_musl
 
 build:release_linux_amd64 --config=release
-build:release_linux_amd64 --platforms=@llvm//platforms:linux_x86_64_musl
 
-build:release_linux_arm64 --config=release
+build:release_linux_arm64 --config=release_common
 build:release_linux_arm64 --platforms=@llvm//platforms:linux_aarch64_musl
